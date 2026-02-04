@@ -1,0 +1,13 @@
+[FACULTY CONFLICT SUMMARY]
+========================================================================
+
+Faculty: Animesh Chaturvedi
+  Period: PreMid  (Total conflicts: 0)
+  Period: PostMid  (Total conflicts: 1)
+    1. Friday 14:15:00-15:45:00 (POST) -> CS304_DSAI-A-Sem3, DS303_DSAI-A-Sem5
+
+Faculty: Prabhu Prasad B M
+  Period: PreMid  (Total conflicts: 0)
+  Period: PostMid  (Total conflicts: 1)
+    1. Tuesday 14:15:00-15:15:00 (POST) -> CS264_CSE-A-Sem3, CS264_CSE-B-Sem3
+

@@ -1,0 +1,74 @@
+=== PHASE 1: DATA VALIDATION & STATISTICS ===
+
+Total Courses Loaded: 177
+Filtered Courses (Odd Semesters, CSE/DSAI/ECE): 177
+
+=== CORE COURSES ===
+Total Unique Core Courses: 48
+  - Semester 1: 18 courses
+  - Semester 3: 19 courses
+  - Semester 5: 11 courses
+  - Semester 7: 0 courses
+
+=== ELECTIVE COURSES ===
+Total Elective Courses: 129
+  - Semester 1: 27 electives
+  - Semester 3: 27 electives
+  - Semester 5: 30 electives
+  - Semester 7: 45 electives
+
+=== COMBINED COURSES (Core, <=2 Credits, Single Instructor) ===
+Total Combined Courses: 24
+  Sem 1: MA161 (Statistics, 2cr, Ramesh Athe), DS161 (Introduction to Programming, 2cr, Abdul Wahid), MA162 (Probability, 2cr, Chinmayananda), EC161 (Digital Design, 2cr, Prakash Pawar), MA161 (Statistics, 2cr, Ramesh Athe), DS161 (Introduction to Programming, 2cr, Abdul Wahid), MA162 (Probability, 2cr, Chinmayananda), EC161 (Digital Design, 2cr, Prakash Pawar), MA161 (Statistics, 2cr, Ramesh Athe), DS161 (Introduction to Programming, 2cr, Girish Revadigar), MA162 (Probability, 2cr, Chinmayananda), EC161 (Digital Design, 2cr, Prakash Pawar)
+  Sem 3: MA261 (Differential Equations, 2cr, Anand B), MA262 (Multivariable Calculus, 2cr, Somen B), CS261 (Operating systems, 2cr, Suvadip Hazra), MA262 (Multivariable Calculus, 2cr, Somen B), MA261 (Differential Equations, 2cr, Anand B), DA261 (Statistical Programming, 2cr, Ramesh Athe), MA262 (Multivariable Calculus, 2cr, Somen B), MA261 (Differential Equations, 2cr, Anand B), EC303 (Random Processes, 2cr, Chinmayananda), EC264 (Semiconductor Devices, 2cr, Pankaj), EC262 (Analog Electronics, 2cr, Rajesh Kumar)
+  Sem 5: HS101 (Environmental Studies, 2cr, TBD)
+
+=== NON-COMBINED COURSES ===
+Total: 24
+
+1. >2 Credits with 1 Faculty:
+   - HS161 (English Language, 3 credits, Instructor: Rajesh N S)
+   - CS264 (Computer Networks, 4 credits, Instructor: Prabhu Prasad B M)
+   - CS161 (Problem Solving, 4 credits, Instructor: Animesh Roy)
+   - HS123 (Economics/IET, 3 credits, Instructor: Anushree Kini)
+   - DA262 (Data Handling, 3 credits, Instructor: Siddharth)
+   - CS304 (Artificial Intelligence, 4 credits, Instructor: Animesh Chaturvedi)
+   - CS307 (Machine Learning, 4 credits, Instructor: Utkarsh K)
+   - DS302 (Computer Communication, 5 credits, Instructor: Shirshendu Layek)
+   - DS303 (Algorithms and Data Structures, 4 credits, Instructor: Animesh Chaturvedi)
+   - CS307 (Machine Learning, 4 credits, Instructor: Siddharth)
+   - CS161 (Problem Solving, 4 credits, Instructor: Manjunath K V)
+   - HS123 (Economics/IET, 3 credits, Instructor: Anushree Kini)
+   - EC301 (Digital Signal Processing, 4 credits, Instructor: Sibasankar Padhy)
+   - EC302 (Introduction to VLSI Design, 4 credits, Instructor: Jagadish D.N)
+   - CS263 (Introduction to Algorithms, 4 credits, Instructor: Jagdish R.B)
+   - HS201 (Happiness & Wellbeing, 3 credits, Instructor: Chandrika Kamat)
+   - EC304 (Signals & Systems, 3 credits, Instructor: Somen B)
+   - CS307 (Machine Learning, 4 credits, Instructor: Deepak K T)
+
+2. >2 Credits with 2+ Faculties:
+   - CS161 (Problem Solving, 4 credits, Instructors: Sunil P V, Sunil C K, Animesh Roy)
+   - CS262 (Software design, 3 credits, Instructors: Sunil P V, Vivekraj)
+   - CS263 (Design & Analysis of Algorithms, 4 credits, Instructors: Malay, Pramod)
+   - CS309 (Statistics for CS, 4 credits, Instructors: Sunil C K, Pavan Kumar)
+   - CS303 (Computer Networks, 5 credits, Instructors: Animesh Roy, Dibyajyothi)
+   - CS304 (Artificial Intelligence, 4 credits, Instructors: Krishnendu, Girish)
+
+3. Core <=2 Credits (Not Combined):
+
+=== CLASSROOMS ===
+Total Rooms: 29
+  - large classrooms: 2 (capacity: 116 each)
+  - Auditoriums: 1 (capacity: 240 each)
+  - classrooms: 17 (capacity: 96 each)
+  - Hardware Labs: 2 (capacity: 40 each)
+  - Software Labs: 4 (capacity: 40 each)
+  - Research Scholar Labs: 2 (capacity: 40 each)
+  - classroom without projectors: 1 (capacity: 78 each)
+  - 240+ seater: C004 (for combined classes)
+
+=== VALIDATION CHECKS ===
+[OK] All courses have valid semester ([1, 3, 5, 7]): PASS
+[OK] All courses have credits assigned: PASS
+[OK] All courses have instructors: PASS
+[OK] Combined courses identified correctly: PASS
