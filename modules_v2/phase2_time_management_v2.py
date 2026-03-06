@@ -13,10 +13,11 @@ from typing import List, Dict, Tuple
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from utils.data_models import TimeSlot, TimeBlock, DayScheduleGrid
+from config.schedule_config import WORKING_DAYS
 
 def generate_base_time_slots() -> List[TimeSlot]:
     """Generate 15-minute base slots from 9:00 AM to 6:00 PM for all days"""
-    days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+    days = WORKING_DAYS
     all_slots = []
     
     for day in days:

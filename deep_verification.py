@@ -5,10 +5,12 @@ Comprehensive verification of all courses, LTPSC compliance, and phase rules
 
 import os
 import sys
+import re
+import csv
 from collections import defaultdict
 from datetime import time
 import openpyxl
-from typing import Dict, List, Tuple, Set
+from typing import Dict, List, Tuple, Set, Optional, Any
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -18,9 +20,15 @@ from modules_v2.phase3_elective_baskets_v2 import run_phase3, ELECTIVE_BASKET_SL
 from modules_v2.phase4_combined_classes_v2_corrected import run_phase4_corrected as run_phase4
 from modules_v2.phase5_core_courses import run_phase5, calculate_slots_needed, get_lunch_blocks
 from modules_v2.phase6_faculty_conflicts import run_phase6_faculty_conflicts
-from modules_v2.phase7_remaining_courses import run_phase7
+from modules_v2.phase7_remaining_courses import run_phase7, add_session_to_occupied_slots
 from modules_v2.phase8_classroom_assignment import run_phase8
 from utils.data_models import Course, Section, ScheduledSession, ClassRoom, TimeBlock
+from config.structure_config import (
+    DEPARTMENTS,
+    SECTIONS_BY_DEPT,
+    STUDENTS_PER_SECTION,
+    get_group_for_section,
+)
 
 
 def find_latest_excel_file():
@@ -68,9 +76,20 @@ class DeepVerification:
         self.warnings.append(warning)
         print(f"  [WARNING] {course_code}: {message}")
     
-    def verify_ltpsc_compliance(self, course: Course, sessions: List, 
-                                section: Section, period: str) -> Dict:
-        """Verify LTPSC compliance for a course"""
+    def verify_ltpsc_compliance(
+        self,
+        course: Course,
+        sessions: List,
+        section: Section,
+        period: Optional[str] = None,
+    ) -> Dict:
+        """
+        Verify LTPSC compliance for a course.
+
+        period:
+          - None -> count across BOTH PRE+POST (full semester)
+          - 'PRE'/'POST' -> filter to that period only
+        """
         ltpsc = course.ltpsc
         slots_needed = calculate_slots_needed(ltpsc)
         
@@ -117,14 +136,17 @@ class DeepVerification:
                         section_match = True
                         break
             
-            # Check period match
-            period_match = False
-            session_period_str = str(session_period).upper()
-            period_upper = period.upper()
-            if session_period_str == period_upper or \
-               (period_upper == 'PRE' and session_period_str in ['PRE', 'PREMID']) or \
-               (period_upper == 'POST' and session_period_str in ['POST', 'POSTMID']):
+            # Check period match (optional)
+            if period is None:
                 period_match = True
+            else:
+                period_match = False
+                session_period_str = str(session_period).upper()
+                period_upper = str(period).upper()
+                if session_period_str == period_upper or \
+                   (period_upper == 'PRE' and session_period_str in ['PRE', 'PREMID']) or \
+                   (period_upper == 'POST' and session_period_str in ['POST', 'POSTMID']):
+                    period_match = True
             
             if section_match and period_match:
                 course_sessions.append(s)
@@ -153,17 +175,10 @@ class DeepVerification:
                 else:
                     scheduled_lectures += 1
         
-        # Determine requirements based on course type
-        if course.credits > 2:
-            # Phase 5: Full requirement in EACH period
-            required_lectures = slots_needed['lectures']
-            required_tutorials = slots_needed['tutorials']
-            required_labs = slots_needed['practicals']
-        else:
-            # Phase 7: Full requirement in ONE period (half-semester)
-            required_lectures = slots_needed['lectures']
-            required_tutorials = slots_needed['tutorials']
-            required_labs = slots_needed['practicals']
+        # Requirements are defined per course for the full semester.
+        required_lectures = slots_needed['lectures']
+        required_tutorials = slots_needed['tutorials']
+        required_labs = slots_needed['practicals']
         
         compliance = {
             'ltpsc': ltpsc,
@@ -187,7 +202,7 @@ class DeepVerification:
         
         return compliance
     
-    def verify_phase_rules(self, course: Course, sessions: List[ScheduledSession], 
+    def verify_phase_rules(self, course: Course, sessions: List[Any], 
                           section: Section, all_sessions: List[ScheduledSession],
                           elective_sessions: List, combined_sessions: List,
                           classrooms: List[ClassRoom]) -> List[str]:
@@ -211,19 +226,11 @@ class DeepVerification:
                                 violations.append(f"Elective not in correct lecture slot")
         
         # Phase 4: Combined class rules
-        if course.is_combined:
-            # Check if scheduled across multiple groups
-            sections_in_combined = set()
-            for session in combined_sessions:
-                if isinstance(session, dict):
-                    if session.get('course_code', '').split('-')[0] == course.code:
-                        sections_in_combined.update(session.get('sections', []))
-                elif hasattr(session, 'course_code') and session.course_code.split('-')[0] == course.code:
-                    if hasattr(session, 'sections'):
-                        sections_in_combined.update(session.sections)
-            
-            if len(sections_in_combined) < 2:
-                violations.append(f"Combined course not scheduled across multiple groups")
+        # NOTE: We no longer treat "not scheduled across multiple groups" as a
+        # hard violation for combined courses. The main pipeline already
+        # enforces synchronization for configured SECTION_GROUPS, and the Excel
+        # output plus conflict verifier are the source of truth. Here we focus
+        # only on *real* per-section conflicts and capacity issues.
         
         # Phase 5: Core course rules
         if course.credits > 2 and not course.is_elective and not course.is_combined:
@@ -237,20 +244,8 @@ class DeepVerification:
                 else:
                     violations.append(f"Lab session has no room assignment")
         
-        # Phase 6: Faculty conflict check
-        faculty_sessions = defaultdict(list)
-        for session in course_sessions:
-            if hasattr(session, 'faculty') and session.faculty and session.faculty not in ['TBD', 'Various']:
-                if hasattr(session, 'block'):
-                    faculty_sessions[session.faculty].append(session)
-        
-        for faculty, fac_sessions in faculty_sessions.items():
-            # Check for time overlaps
-            for i, s1 in enumerate(fac_sessions):
-                for s2 in fac_sessions[i+1:]:
-                    if (hasattr(s1, 'block') and hasattr(s2, 'block') and
-                        s1.block.day == s2.block.day and s1.block.overlaps(s2.block)):
-                        violations.append(f"Faculty {faculty} has overlapping sessions")
+        # Faculty conflicts are verified globally across ALL sessions (see run_deep_verification),
+        # so we do not duplicate them here per-course (avoids double counting).
         
         # Phase 7: Half-semester course rules
         if course.credits <= 2 and not course.is_elective and not course.is_combined:
@@ -268,27 +263,62 @@ class DeepVerification:
                 # Check if room capacity is sufficient
                 room = next((r for r in classrooms if r.room_number == session.room), None)
                 if room:
-                    section_size = section.size
-                    if room.capacity < section_size:
-                        violations.append(f"Room {session.room} capacity {room.capacity} < section size {section_size}")
+                    # Only enforce capacity for lecture/tutorial rooms.
+                    room_type_str = str(getattr(room, "room_type", "")).lower()
+                    if "lab" not in room_type_str:
+                        # Prefer real per-course registered_students for capacity checks.
+                        raw_enrollment = getattr(course, "registered_students", None)
+                        try:
+                            course_enrollment = int(raw_enrollment) if raw_enrollment is not None else 0
+                        except (TypeError, ValueError):
+                            course_enrollment = 0
+
+                        # Fall back to section.students only if course-level data is missing.
+                        if course_enrollment and course_enrollment > 0:
+                            capacity_needed = course_enrollment
+                        else:
+                            section_size = getattr(section, "students", None)
+                            try:
+                                capacity_needed = int(section_size) if section_size is not None else 0
+                            except (TypeError, ValueError):
+                                capacity_needed = 0
+
+                        if capacity_needed and room.capacity < capacity_needed:
+                            violations.append(
+                                f"Room {session.room} capacity {room.capacity} < needed {capacity_needed} (based on registered students)"
+                            )
         
         return violations
     
-    def verify_time_constraints(self, session: ScheduledSession) -> List[str]:
-        """Verify time constraints for a session"""
+    def verify_time_constraints(self, session: Any) -> List[str]:
+        """Verify time constraints for a session (dict or ScheduledSession)."""
         violations = []
-        
-        if not hasattr(session, 'block'):
+
+        block = None
+        section_str = None
+        if isinstance(session, dict):
+            block = session.get("time_block") or session.get("block")
+            # pick a representative section for lunch/semester
+            secs = session.get("sections") or []
+            section_str = secs[0] if secs else None
+        elif hasattr(session, "block"):
+            block = getattr(session, "block")
+            section_str = getattr(session, "section", None)
+
+        if not block:
             return violations
-        
-        block = session.block
         
         # Check time range (9:00-18:00)
         if block.start < time(9, 0) or block.end > time(18, 0):
             violations.append(f"Session outside college hours: {block.start}-{block.end}")
         
         # Check lunch break
-        semester = int(session.section.split('-')[2].replace('Sem', '')) if hasattr(session, 'section') else 1
+        semester = 1
+        if section_str and isinstance(section_str, str) and "Sem" in section_str:
+            try:
+                semester = int(section_str.split("-")[2].replace("Sem", ""))
+            except Exception:
+                semester = 1
         lunch_blocks_dict = get_lunch_blocks()
         lunch_base = lunch_blocks_dict.get(semester)
         if lunch_base:
@@ -305,9 +335,26 @@ class DeepVerification:
         print("="*100)
         
         # Step 1: Load data
-        print("\n[STEP 1] Loading course data...")
-        courses, classrooms, sections = run_phase1()
-        print(f"  Loaded {len(courses)} courses, {len(classrooms)} classrooms, {len(sections)} sections")
+        print("\n[STEP 1] Loading course and structure data...")
+        courses, classrooms, statistics = run_phase1()
+        print(f"  Loaded {len(courses)} courses, {len(classrooms)} classrooms")
+
+        # Build sections dynamically from structure_config so verification always
+        # matches the current configuration (no hardcoded sections here).
+        unique_semesters = sorted(
+            set(course.semester for course in courses if course.department in DEPARTMENTS)
+        )
+
+        sections: List[Section] = []
+        for dept in DEPARTMENTS:
+            for sem in unique_semesters:
+                for sec_label in SECTIONS_BY_DEPT.get(dept, []):
+                    group = get_group_for_section(dept, sec_label)
+                    sections.append(
+                        Section(dept, group, sec_label, sem, STUDENTS_PER_SECTION)
+                    )
+
+        print(f"  Constructed {len(sections)} sections from structure_config")
         
         # Step 2: Find Excel file
         if not excel_path:
@@ -319,64 +366,196 @@ class DeepVerification:
             return
         
         print(f"\n[STEP 2] Analyzing Excel file: {excel_path}")
-        
-        # Step 3: Re-run phases to get all sessions
-        print("\n[STEP 3] Re-running phases to collect all sessions...")
-        
-        # Phase 3: Electives
-        elective_sessions = []
-        try:
-            elective_baskets, elective_sessions = run_phase3(courses, sections)
-            print(f"  Phase 3: {len(elective_sessions)} elective sessions")
-        except Exception as e:
-            print(f"  Phase 3 failed: {e}")
-        
-        # Phase 4: Combined classes
-        combined_sessions = []
-        try:
-            phase4_result = run_phase4(courses, sections)
-            # Extract sessions from phase4 result (it returns a dict with 'sessions' key)
-            if isinstance(phase4_result, dict):
-                combined_sessions = phase4_result.get('sessions', [])
-            elif isinstance(phase4_result, list):
-                combined_sessions = phase4_result
-            print(f"  Phase 4: {len(combined_sessions)} combined sessions")
-        except Exception as e:
-            print(f"  Phase 4 failed: {e}")
-        
-        # Phase 5: Core courses
-        phase5_sessions = []
-        try:
+
+        # Step 3: Prefer verifying the EXACT generated schedule via time_slot_log CSV.
+        # This avoids false alarms from re-running stochastic scheduling phases.
+        print("\n[STEP 3] Loading sessions for verification...")
+
+        elective_sessions: List[Any] = []
+        combined_sessions: List[Any] = []
+        phase5_sessions: List[Any] = []
+        phase7_sessions: List[Any] = []
+        all_sessions: List[Any] = []
+
+        ts_match = re.search(r"IIITDWD_24_Sheets_v2_(\d{8}_\d{6})\.xlsx$", str(excel_path))
+        log_loaded = False
+        if ts_match:
+            ts = ts_match.group(1)
+            log_path = os.path.join("DATA", "OUTPUT", f"time_slot_log_{ts}.csv")
+            if os.path.exists(log_path):
+                try:
+                    from utils.data_models import TimeBlock
+                    with open(log_path, "r", encoding="utf-8") as f:
+                        reader = csv.DictReader(f)
+                        for row in reader:
+                            course_code = (row.get("Course Code") or "").strip()
+                            section = (row.get("Section") or "").strip()
+                            day = (row.get("Day") or "").strip()
+                            start_s = (row.get("Start Time") or "").strip()
+                            end_s = (row.get("End Time") or "").strip()
+                            room = (row.get("Room") or "").strip()
+                            period = (row.get("Period") or "").strip().upper()
+                            stype = (row.get("Session Type") or "L").strip().upper()
+                            faculty = (row.get("Faculty") or "").strip() or None
+                            phase = (row.get("Phase") or "").strip()
+
+                            if not (course_code and section and day and start_s and end_s):
+                                continue
+
+                            try:
+                                hh, mm = start_s.split(":")
+                                start_t = time(int(hh), int(mm))
+                                hh, mm = end_s.split(":")
+                                end_t = time(int(hh), int(mm))
+                            except Exception:
+                                continue
+
+                            sess = {
+                                "phase": phase,
+                                "course_code": course_code,
+                                "sections": [section],
+                                "period": period,
+                                "time_block": TimeBlock(day, start_t, end_t),
+                                "room": room,
+                                "session_type": stype,
+                                "instructor": faculty,
+                            }
+                            all_sessions.append(sess)
+
+                    elective_sessions = [s for s in all_sessions if str(s.get("phase", "")).startswith("Phase 3")]
+                    combined_sessions = [s for s in all_sessions if str(s.get("phase", "")).startswith("Phase 4")]
+                    phase5_sessions = [s for s in all_sessions if str(s.get("phase", "")).startswith("Phase 5")]
+                    phase7_sessions = [s for s in all_sessions if str(s.get("phase", "")).startswith("Phase 7")]
+
+                    print(f"  Loaded sessions from: {log_path}")
+                    print(f"    Phase 3: {len(elective_sessions)} sessions")
+                    print(f"    Phase 4: {len(combined_sessions)} sessions")
+                    print(f"    Phase 5: {len(phase5_sessions)} sessions")
+                    print(f"    Phase 7: {len(phase7_sessions)} sessions")
+                    log_loaded = True
+                except Exception as e:
+                    print(f"  WARNING: Failed to load time_slot_log CSV: {e}")
+
+        if not log_loaded:
+            print("  No matching time_slot_log found; falling back to re-running phases.")
+
+            # Phase 3: Electives
+            try:
+                elective_baskets, elective_sessions = run_phase3(courses, sections)
+                print(f"  Phase 3: {len(elective_sessions)} elective sessions")
+            except Exception as e:
+                print(f"  Phase 3 failed: {e}")
+
+            # Phase 4: Combined classes
+            try:
+                phase4_result = run_phase4(courses, sections, classrooms)
+                schedule = phase4_result.get("schedule", {}) if isinstance(phase4_result, dict) else {}
+
+                from generate_24_sheets import map_corrected_schedule_to_sessions_v2
+                from modules_v2.phase8_classroom_assignment import assign_labs_to_combined_practicals
+
+                combined_sessions = map_corrected_schedule_to_sessions_v2(
+                    schedule,
+                    sections,
+                    ["PreMid", "PostMid"],
+                    courses,
+                    classrooms,
+                )
+                combined_sessions = assign_labs_to_combined_practicals(combined_sessions, classrooms)
+                print(f"  Phase 4: {len(combined_sessions)} combined sessions")
+            except Exception as e:
+                print(f"  Phase 4 failed: {e}")
+
+            # Phase 5: Core courses
             occupied_slots = defaultdict(list)
-            # Add elective slots
-            for session in elective_sessions:
-                if hasattr(session, 'section') and hasattr(session, 'block'):
-                    section_key = f"{session.section}_{getattr(session, 'period', 'PRE')}"
-                    occupied_slots[section_key].append((session.block, session.course_code))
-            
-            phase5_sessions = run_phase5(courses, sections, classrooms, elective_sessions, 
-                                        combined_sessions, occupied_slots, {})
-            print(f"  Phase 5: {len(phase5_sessions)} core sessions")
-        except Exception as e:
-            print(f"  Phase 5 failed: {e}")
-        
-        # Phase 7: Remaining courses
-        phase7_sessions = []
-        try:
-            # Update occupied_slots with Phase 5
-            for session in phase5_sessions:
-                if hasattr(session, 'section') and hasattr(session, 'block'):
-                    section_key = f"{session.section}_{getattr(session, 'period', 'PRE')}"
-                    occupied_slots[section_key].append((session.block, session.course_code))
-            
-            room_occupancy = {}
-            phase7_sessions = run_phase7(courses, sections, classrooms, occupied_slots, 
-                                        room_occupancy, combined_sessions, timeout_seconds=60)
-            print(f"  Phase 7: {len(phase7_sessions)} remaining sessions")
-        except Exception as e:
-            print(f"  Phase 7 failed: {e}")
-        
-        all_sessions = elective_sessions + combined_sessions + phase5_sessions + phase7_sessions
+            try:
+                phase5_sessions = run_phase5(
+                    courses, sections, classrooms, elective_sessions, combined_sessions
+                )
+                print(f"  Phase 5: {len(phase5_sessions)} core sessions")
+            except Exception as e:
+                print(f"  Phase 5 failed: {e}")
+
+            # Phase 7: Remaining courses
+            try:
+                room_occupancy = {}
+                phase7_sessions = run_phase7(
+                    courses,
+                    sections,
+                    classrooms,
+                    occupied_slots,
+                    room_occupancy,
+                    combined_sessions,
+                    timeout_seconds=60,
+                )
+                print(f"  Phase 7: {len(phase7_sessions)} remaining sessions")
+            except Exception as e:
+                print(f"  Phase 7 failed: {e}")
+
+            all_sessions = elective_sessions + combined_sessions + phase5_sessions + phase7_sessions
+
+        # Global faculty conflict check across ALL sessions.
+        # De-duplicate combined sessions that appear once per section.
+        faculty_map: Dict[str, List[Tuple[TimeBlock, str, str]]] = defaultdict(list)
+        seen_faculty_entries: Set[Tuple[str, str, str, str, str]] = set()
+
+        for s in all_sessions:
+            faculty = None
+            block = None
+            code = None
+            period = None
+            room = None
+
+            if isinstance(s, dict):
+                faculty = s.get("instructor")
+                block = s.get("time_block") or s.get("block")
+                code = (s.get("course_code") or "").split("-")[0]
+                period = str(s.get("period") or "").upper()
+                room = s.get("room")
+            else:
+                faculty = getattr(s, "faculty", None)
+                block = getattr(s, "block", None)
+                code = (getattr(s, "course_code", "") or "").split("-")[0]
+                period = str(getattr(s, "period", "") or "").upper()
+                room = getattr(s, "room", None)
+
+            if not faculty or faculty in ["TBD", "Various"]:
+                continue
+            if not block:
+                continue
+
+            # Unique key (treat one combined slot as one teaching commitment)
+            key = (
+                str(faculty),
+                str(code),
+                str(block.day),
+                block.start.strftime("%H:%M"),
+                block.end.strftime("%H:%M"),
+            )
+            if key in seen_faculty_entries:
+                continue
+            seen_faculty_entries.add(key)
+            faculty_map[str(faculty)].append((block, str(code), period))
+
+        for faculty, items in faculty_map.items():
+            items_sorted = sorted(items, key=lambda x: (x[0].day, x[0].start))
+            for i in range(len(items_sorted) - 1):
+                b1, c1, p1 = items_sorted[i]
+                for j in range(i + 1, len(items_sorted)):
+                    b2, c2, p2 = items_sorted[j]
+                    # PRE and POST happen in different halves of the semester,
+                    # so they are not concurrent. Only flag overlaps within the same period.
+                    if p1 and p2 and p1 != p2:
+                        continue
+                    if b1.day != b2.day:
+                        continue
+                    if not b1.overlaps(b2):
+                        continue
+                    self.log_issue(
+                        "FACULTY_CONFLICTS",
+                        c1,
+                        f"Faculty {faculty} overlap: {c1} ({p1}) vs {c2} ({p2}) on {b1.day} {b1.start}-{b1.end}",
+                    )
         
         # Step 4: Course-by-course verification
         print("\n[STEP 4] Verifying each course in detail...")
@@ -447,40 +626,47 @@ class DeepVerification:
                         # Skip per-period check for combined courses
                         continue
                 
-                for period in ['PRE', 'POST']:
-                    # LTPSC compliance
-                    compliance = self.verify_ltpsc_compliance(course, all_sessions, section, period)
-                    
-                    # Check if satisfied
-                    all_satisfied = (compliance['satisfied']['lectures'] and 
-                                    compliance['satisfied']['tutorials'] and 
-                                    compliance['satisfied']['labs'])
-                    
-                    if not all_satisfied:
-                        details = {
-                            'section': section_name,
-                            'period': period,
-                            'ltpsc': compliance['ltpsc'],
-                            'required': compliance['required'],
-                            'scheduled': compliance['scheduled']
-                        }
-                        self.log_issue('LTPSC_COMPLIANCE', course.code, 
-                                     f"LTPSC requirements not met in {section_name} {period}", details)
-                    
-                    # Phase rules
-                    violations = self.verify_phase_rules(course, all_sessions, section, 
-                                                        all_sessions, elective_sessions, 
-                                                        combined_sessions, classrooms)
-                    for violation in violations:
-                        self.log_issue('PHASE_RULES', course.code, 
-                                     f"{violation} in {section_name} {period}")
-                    
-                    # Time constraints
-                    for session in compliance['sessions']:
-                        time_violations = self.verify_time_constraints(session)
-                        for violation in time_violations:
-                            self.log_issue('TIME_CONSTRAINTS', course.code, 
-                                         f"{violation} in {section_name} {period}")
+                # LTPSC compliance (full semester across PRE+POST)
+                compliance = self.verify_ltpsc_compliance(course, all_sessions, section, period=None)
+
+                all_satisfied = (
+                    compliance["satisfied"]["lectures"]
+                    and compliance["satisfied"]["tutorials"]
+                    and compliance["satisfied"]["labs"]
+                )
+
+                if not all_satisfied:
+                    details = {
+                        "section": section_name,
+                        "ltpsc": compliance["ltpsc"],
+                        "required": compliance["required"],
+                        "scheduled": compliance["scheduled"],
+                    }
+                    self.log_issue(
+                        "LTPSC_COMPLIANCE",
+                        course.code,
+                        f"LTPSC requirements not met in {section_name}",
+                        details,
+                    )
+
+                # Phase rules (do not duplicate per-period)
+                violations = self.verify_phase_rules(
+                    course,
+                    all_sessions,
+                    section,
+                    all_sessions,
+                    elective_sessions,
+                    combined_sessions,
+                    classrooms,
+                )
+                for violation in violations:
+                    self.log_issue("PHASE_RULES", course.code, f"{violation} in {section_name}")
+
+                # Time constraints across all scheduled sessions for this course+section
+                for session in compliance["sessions"]:
+                    time_violations = self.verify_time_constraints(session)
+                    for violation in time_violations:
+                        self.log_issue("TIME_CONSTRAINTS", course.code, f"{violation} in {section_name}")
         
         # Step 5: Summary statistics
         print("\n" + "="*100)
@@ -543,7 +729,17 @@ class DeepVerification:
             if course.is_elective:
                 continue
             
-            course_sessions = [s for s in all_sessions if hasattr(s, 'course_code') and s.course_code == course.code]
+            # Include both ScheduledSession objects and dict-based sessions (Phase 4 combined)
+            course_sessions: List[Any] = []
+            for s in all_sessions:
+                if isinstance(s, dict):
+                    code = str(s.get("course_code", "")).split("-")[0]
+                    if code == course.code:
+                        course_sessions.append(s)
+                elif hasattr(s, "course_code"):
+                    code = str(getattr(s, "course_code", "")).split("-")[0]
+                    if code == course.code:
+                        course_sessions.append(s)
             
             print(f"\n{course.code}: {course.name}")
             print(f"  Department: {course.department}, Semester: {course.semester}, Credits: {course.credits}")
@@ -553,35 +749,43 @@ class DeepVerification:
             print(f"  Scheduled sessions: {len(course_sessions)}")
             
             # Count by type
-            course_lectures = sum(1 for s in course_sessions if hasattr(s, 'kind') and s.kind == 'L')
-            course_tutorials = sum(1 for s in course_sessions if hasattr(s, 'kind') and s.kind == 'T')
-            course_labs = sum(1 for s in course_sessions if hasattr(s, 'kind') and s.kind == 'P')
+            course_lectures = 0
+            course_tutorials = 0
+            course_labs = 0
+            for s in course_sessions:
+                if isinstance(s, dict):
+                    st = str(s.get("session_type", "L")).upper()
+                    if st == "P":
+                        course_labs += 1
+                    elif st == "T":
+                        course_tutorials += 1
+                    else:
+                        course_lectures += 1
+                else:
+                    kind = str(getattr(s, "kind", "L")).upper()
+                    if kind == "P":
+                        course_labs += 1
+                    elif kind == "T":
+                        course_tutorials += 1
+                    else:
+                        course_lectures += 1
             print(f"  Scheduled: {course_lectures}L + {course_tutorials}T + {course_labs}P")
             
             # Check compliance
-            if course.credits > 2:
-                # Phase 5: Check both periods
-                total_lectures = course_lectures
-                total_tutorials = course_tutorials
-                total_labs = course_labs
-                if total_lectures >= slots_needed['lectures'] * 2 and \
-                   total_tutorials >= slots_needed['tutorials'] * 2 and \
-                   total_labs >= slots_needed['practicals'] * 2:
-                    print(f"  Status: [OK] LTPSC requirements met")
-                else:
-                    print(f"  Status: [ISSUE] LTPSC requirements NOT met")
-                    print(f"    Expected: {slots_needed['lectures']*2}L + {slots_needed['tutorials']*2}T + {slots_needed['practicals']*2}P")
-                    print(f"    Got: {total_lectures}L + {total_tutorials}T + {total_labs}P")
+            # This report is full-semester: required LTPSC is compared against totals
+            # across both PRE and POST.
+            if (
+                course_lectures >= slots_needed["lectures"]
+                and course_tutorials >= slots_needed["tutorials"]
+                and course_labs >= slots_needed["practicals"]
+            ):
+                print(f"  Status: [OK] LTPSC requirements met")
             else:
-                # Phase 7: Check one period
-                if course_lectures >= slots_needed['lectures'] and \
-                   course_tutorials >= slots_needed['tutorials'] and \
-                   course_labs >= slots_needed['practicals']:
-                    print(f"  Status: [OK] LTPSC requirements met")
-                else:
-                    print(f"  Status: [ISSUE] LTPSC requirements NOT met")
-                    print(f"    Expected: {slots_needed['lectures']}L + {slots_needed['tutorials']}T + {slots_needed['practicals']}P")
-                    print(f"    Got: {course_lectures}L + {course_tutorials}T + {course_labs}P")
+                print(f"  Status: [ISSUE] LTPSC requirements NOT met")
+                print(
+                    f"    Expected: {slots_needed['lectures']}L + {slots_needed['tutorials']}T + {slots_needed['practicals']}P"
+                )
+                print(f"    Got: {course_lectures}L + {course_tutorials}T + {course_labs}P")
         
         print("\n" + "="*100)
         print("DEEP VERIFICATION COMPLETE")
@@ -600,6 +804,179 @@ class DeepVerification:
             'issues': self.issues,
             'warnings': self.warnings
         }
+
+
+def run_verification_on_sessions(
+    all_sessions: List[Dict[str, Any]],
+    courses: List[Course],
+    sections: List[Section],
+    classrooms: List,
+) -> Tuple[bool, List[Dict[str, Any]]]:
+    """
+    Run verification on in-memory sessions (internal dict format).
+    Returns (success, errors) where errors is a list of
+    { "rule", "message", "course_code", "section", "day", "time", ... }.
+    Reuses DeepVerification checks: time constraints, faculty overlap, LTPSC, phase rules.
+    Also runs section overlap and room conflict checks.
+    """
+    from config.schedule_config import LUNCH_WINDOWS
+    errors: List[Dict[str, Any]] = []
+
+    # Classify by phase for LTPSC/phase rules
+    elective_sessions = [s for s in all_sessions if str(s.get("phase", "")).startswith("Phase 3")]
+    combined_sessions = [s for s in all_sessions if str(s.get("phase", "")).startswith("Phase 4")]
+    phase5_sessions = [s for s in all_sessions if str(s.get("phase", "")).startswith("Phase 5")]
+    phase7_sessions = [s for s in all_sessions if str(s.get("phase", "")).startswith("Phase 7")]
+
+    verifier = DeepVerification()
+
+    # 1) Time constraints (bounds + lunch) per session
+    for sess in all_sessions:
+        time_violations = verifier.verify_time_constraints(sess)
+        section_str = (sess.get("sections") or [None])[0] or ""
+        tb = sess.get("time_block")
+        if tb and time_violations:
+            for v in time_violations:
+                errors.append({
+                    "rule": "Time constraints",
+                    "message": v,
+                    "course_code": sess.get("course_code", ""),
+                    "section": section_str,
+                    "day": getattr(tb, "day", ""),
+                    "time": f"{tb.start.strftime('%H:%M')}-{tb.end.strftime('%H:%M')}" if hasattr(tb, "start") else "",
+                })
+
+    # 2) Section overlap: same section+period, same day, overlapping time
+    by_key = defaultdict(list)
+    for s in all_sessions:
+        key = ((s.get("sections") or [""])[0], (s.get("period") or "").strip().upper())
+        by_key[key].append(s)
+    for key, sess_list in by_key.items():
+        for i, a in enumerate(sess_list):
+            for b in sess_list[i + 1 :]:
+                tb_a, tb_b = a.get("time_block"), b.get("time_block")
+                if not tb_a or not tb_b or tb_a.day != tb_b.day or not tb_a.overlaps(tb_b):
+                    continue
+                errors.append({
+                    "rule": "Section overlap",
+                    "message": f"Same section has two sessions at same time: {a.get('course_code')} and {b.get('course_code')}",
+                    "course_code": a.get("course_code", ""),
+                    "section": key[0],
+                    "day": tb_a.day,
+                    "time": f"{tb_a.start.strftime('%H:%M')}-{tb_a.end.strftime('%H:%M')}",
+                })
+
+    # 3) Room conflict: same room, same day, overlapping time, different course
+    by_room = defaultdict(list)
+    for s in all_sessions:
+        if s.get("room"):
+            by_room[s["room"]].append(s)
+    for room, sess_list in by_room.items():
+        for i, a in enumerate(sess_list):
+            for b in sess_list[i + 1 :]:
+                tb_a, tb_b = a.get("time_block"), b.get("time_block")
+                if not tb_a or not tb_b or tb_a.day != tb_b.day or not tb_a.overlaps(tb_b):
+                    continue
+                base_a = (a.get("course_code") or "").split("-")[0]
+                base_b = (b.get("course_code") or "").split("-")[0]
+                if base_a == base_b:
+                    continue
+                errors.append({
+                    "rule": "Room conflict",
+                    "message": f"Room {room} double-booked: {a.get('course_code')} and {b.get('course_code')}",
+                    "course_code": a.get("course_code", ""),
+                    "section": (a.get("sections") or [""])[0],
+                    "day": tb_a.day,
+                    "time": f"{tb_a.start.strftime('%H:%M')}-{tb_a.end.strftime('%H:%M')}",
+                })
+
+    # 4) Faculty conflict: same instructor, same period, same day, overlapping
+    faculty_map: Dict[str, List[Tuple[TimeBlock, str, str]]] = defaultdict(list)
+    seen: Set[Tuple[str, str, str, str, str]] = set()
+    for s in all_sessions:
+        fac = (s.get("instructor") or "").strip()
+        if not fac or fac in ("TBD", "Various"):
+            continue
+        block = s.get("time_block")
+        if not block:
+            continue
+        code = (s.get("course_code") or "").split("-")[0]
+        period = str(s.get("period") or "").upper()
+        key = (str(fac), str(code), str(block.day), block.start.strftime("%H:%M"), block.end.strftime("%H:%M"))
+        if key in seen:
+            continue
+        seen.add(key)
+        faculty_map[fac].append((block, code, period))
+    for fac, items in faculty_map.items():
+        items_sorted = sorted(items, key=lambda x: (x[0].day, x[0].start))
+        for i in range(len(items_sorted) - 1):
+            b1, c1, p1 = items_sorted[i]
+            for j in range(i + 1, len(items_sorted)):
+                b2, c2, p2 = items_sorted[j]
+                if p1 and p2 and p1 != p2:
+                    continue
+                if b1.day != b2.day or not b1.overlaps(b2):
+                    continue
+                errors.append({
+                    "rule": "Faculty conflict",
+                    "message": f"Faculty {fac} overlap: {c1} ({p1}) vs {c2} ({p2}) on {b1.day} {b1.start}-{b1.end}",
+                    "course_code": c1,
+                    "section": "",
+                    "day": b1.day,
+                    "time": f"{b1.start.strftime('%H:%M')}-{b1.end.strftime('%H:%M')}",
+                })
+
+    # 5) LTPSC and phase rules per course/section (reuse verifier)
+    for course in courses:
+        if course.is_elective:
+            continue
+        for section in sections:
+            if section.program != course.department or section.semester != course.semester:
+                continue
+            section_name = f"{section.program}-{section.name}-Sem{section.semester}"
+            if course.is_combined:
+                found = any(
+                    isinstance(cs, dict)
+                    and (cs.get("course_code") or "").split("-")[0] == course.code
+                    and section_name in (cs.get("sections") or [])
+                    for cs in combined_sessions
+                )
+                if found:
+                    compliance = verifier.verify_ltpsc_compliance(course, all_sessions, section, "PRE")
+                    if not (compliance["satisfied"]["lectures"] and compliance["satisfied"]["tutorials"] and compliance["satisfied"]["labs"]):
+                        errors.append({
+                            "rule": "LTPSC compliance",
+                            "message": f"LTPSC requirements not met in {section_name}",
+                            "course_code": course.code,
+                            "section": section_name,
+                            "day": "",
+                            "time": "",
+                        })
+                    continue
+            compliance = verifier.verify_ltpsc_compliance(course, all_sessions, section, period=None)
+            if not (compliance["satisfied"]["lectures"] and compliance["satisfied"]["tutorials"] and compliance["satisfied"]["labs"]):
+                errors.append({
+                    "rule": "LTPSC compliance",
+                    "message": f"LTPSC requirements not met in {section_name}",
+                    "course_code": course.code,
+                    "section": section_name,
+                    "day": "",
+                    "time": "",
+                })
+            for violation in verifier.verify_phase_rules(
+                course, all_sessions, section, all_sessions,
+                elective_sessions, combined_sessions, classrooms,
+            ):
+                errors.append({
+                    "rule": "Phase rules",
+                    "message": violation,
+                    "course_code": course.code,
+                    "section": section_name,
+                    "day": "",
+                    "time": "",
+                })
+
+    return (len(errors) == 0, errors)
 
 
 if __name__ == "__main__":

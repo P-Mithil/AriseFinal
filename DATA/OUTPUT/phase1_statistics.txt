@@ -61,9 +61,9 @@ Total Rooms: 29
   - large classrooms: 2 (capacity: 116 each)
   - Auditoriums: 1 (capacity: 240 each)
   - classrooms: 17 (capacity: 96 each)
-  - Hardware Labs: 2 (capacity: 40 each)
-  - Software Labs: 4 (capacity: 40 each)
-  - Research Scholar Labs: 2 (capacity: 40 each)
+  - Hardware Labs: 2 (capacity: 45 each)
+  - Software Labs: 4 (capacity: 45 each)
+  - Research Scholar Labs: 2 (capacity: 45 each)
   - classroom without projectors: 1 (capacity: 78 each)
   - 240+ seater: C004 (for combined classes)
 

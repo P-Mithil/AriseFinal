@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.so
+
+# Node
+node_modules/
+
+# IDE / editor
+.cursor/
+.vscode/
+*.swp
+*.swo
+
+# Generated output (timetables, logs)
+DATA/OUTPUT/
+
+# Optional: keep INPUT data tracked
+# DATA/INPUT/*.xlsx

@@ -24,8 +24,21 @@ import pandas as pd
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font
 
+from config.schedule_config import WORKING_DAYS
 
-DAYS: List[str] = ["Mon", "Tue", "Wed", "Thu", "Fri"]
+
+DAY_ABBR_MAP = {
+    "Monday": "Mon",
+    "Tuesday": "Tue",
+    "Wednesday": "Wed",
+    "Thursday": "Thu",
+    "Friday": "Fri",
+    "Saturday": "Sat",
+    "Sunday": "Sun",
+}
+
+
+DAYS: List[str] = [DAY_ABBR_MAP.get(d, d[:3]) for d in WORKING_DAYS]
 TIME_SLOTS: List[str] = ["7:30-9:00", "18:00-19:30"]
 
 

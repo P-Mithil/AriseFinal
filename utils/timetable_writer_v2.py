@@ -16,6 +16,7 @@ from openpyxl.utils import get_column_letter
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from utils.data_models import DayScheduleGrid, TimeBlock
+from config.schedule_config import WORKING_DAYS
 
 def extract_department_from_section(section: str) -> str:
     """
@@ -278,7 +279,7 @@ class TimetableWriterV2:
         title_cell.fill = self.colors['header']
         
         # Add days
-        days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+        days = list(WORKING_DAYS)
         current_row = 3
         
         for day in days:
@@ -1291,31 +1292,101 @@ class TimetableWriterV2:
                 from modules_v2.phase5_core_courses import calculate_slots_needed
                 slots_needed = calculate_slots_needed(ltpsc)
                 # Use LTPSC values directly - no hardcoded course-specific adjustments
-                # CRITICAL: For combined courses, requirements are PER PERIOD
-                # So we need to check if scheduled meets requirement for THIS period
                 required_lectures = slots_needed['lectures']
                 required_tutorials = slots_needed['tutorials']
                 required_labs = slots_needed['practicals']
                 
-                # Count scheduled slots - use THIS PERIOD ONLY for satisfaction check
-                # Combined courses should have full requirement in EACH period
+                # Per-period counts (for this sheet only) come from grid_sessions.
+                # For full-semester satisfaction, we recompute TOTALS dynamically
+                # from all sessions (combined + Phase 5 + Phase 7) for this
+                # specific section across BOTH PreMid and PostMid.
                 course_ltpsc = getattr(course_obj, 'ltpsc', '')
                 course_unique_key = f"{course_code}_{course_ltpsc}"
                 
-                # Try to get counts by unique key first, then fall back to base code
-                # Use course_counts_period (this period only) for satisfaction check
-                counts_period = course_counts_period.get(course_unique_key, 
-                                                        course_counts_period.get(course_code, 
-                                                        {'total': 0, 'lectures': 0, 'tutorials': 0, 'labs': 0}))
+                counts_period = course_counts_period.get(
+                    course_unique_key,
+                    course_counts_period.get(course_code, {'total': 0, 'lectures': 0, 'tutorials': 0, 'labs': 0}),
+                )
                 scheduled_lectures = counts_period['lectures']
                 scheduled_tutorials = counts_period['tutorials']
                 scheduled_labs = counts_period['labs']
+
+                # Recompute TOTALS across all periods using raw sessions.
+                total_lectures = 0
+                total_tutorials = 0
+                total_labs = 0
+
+                section_key = f"{section}-Sem{semester}"
+
+                # 1) Combined sessions (Phase 4)
+                if combined_sessions:
+                    for sess in combined_sessions:
+                        if not isinstance(sess, dict):
+                            continue
+                        sess_code = str(sess.get("course_code", "")).split("-")[0]
+                        if sess_code != course_code:
+                            continue
+                        sess_sections = sess.get("sections", [])
+                        if section_key not in sess_sections:
+                            continue
+                        sess_type = sess.get("session_type", "L")
+                        if sess_type == "P":
+                            total_labs += 1
+                        elif sess_type == "T":
+                            total_tutorials += 1
+                        else:
+                            total_lectures += 1
+
+                # 2) Phase 5 sessions (core >2 credits)
+                if phase5_sessions:
+                    for sess in phase5_sessions:
+                        if getattr(sess, "section", "") != section_key:
+                            continue
+                        sess_code = str(getattr(sess, "course_code", "")).split("-")[0]
+                        if sess_code != course_code:
+                            continue
+                        kind = getattr(sess, "kind", "L")
+                        if kind == "P":
+                            total_labs += 1
+                        elif kind == "T":
+                            total_tutorials += 1
+                        else:
+                            total_lectures += 1
+
+                # 3) Phase 7 sessions (remaining <=2 credits)
+                if phase7_sessions:
+                    for sess in phase7_sessions:
+                        if getattr(sess, "section", "") != section_key:
+                            continue
+                        sess_code = str(getattr(sess, "course_code", "")).split("-")[0]
+                        if sess_code != course_code:
+                            continue
+                        kind = getattr(sess, "kind", "L")
+                        if kind == "P":
+                            total_labs += 1
+                        elif kind == "T":
+                            total_tutorials += 1
+                        else:
+                            total_lectures += 1
                 
-                # CRITICAL: For combined courses, check if we have the full requirement in THIS period
-                # Combined courses need full requirement in EACH period (PreMid and PostMid)
-                lectures_satisfied = scheduled_lectures >= required_lectures
-                tutorials_satisfied = scheduled_tutorials >= required_tutorials
-                labs_satisfied = scheduled_labs >= required_labs
+                # Strict check: TOTAL scheduled (all phases, both periods) must meet LTPSC
+                lectures_satisfied = total_lectures >= required_lectures
+                tutorials_satisfied = total_tutorials >= required_tutorials
+                labs_satisfied = total_labs >= required_labs
+
+                # DEBUG: log verification details for troubleshooting UNSATISFIED rows
+                try:
+                    debug_section = f"{section}-Sem{semester}"
+                    debug_period = period
+                    print(
+                        f"DEBUG_VERIFY: section={debug_section} period={debug_period} "
+                        f"course={course_code} ltpsc={ltpsc} "
+                        f"required=(L={required_lectures},T={required_tutorials},P={required_labs}) "
+                        f"total_scheduled=(L={total_lectures},T={total_tutorials},P={total_labs}) "
+                        f"period_scheduled=(L={scheduled_lectures},T={scheduled_tutorials},P={scheduled_labs})"
+                    )
+                except Exception:
+                    pass
                 
                 # Determine status - check each component separately
                 # Special case: If all requirements are 0, mark as satisfied if scheduled is also 0
@@ -1539,17 +1610,24 @@ class TimetableWriterV2:
                 
                 # Try to get counts by unique key first, then fall back to base code
                 # Use course_counts_period (this period only) for requirement checking
-                counts_period = course_counts_period.get(course_unique_key, 
-                                                        course_counts_period.get(course_code, 
-                                                        {'total': 0, 'lectures': 0, 'tutorials': 0, 'labs': 0}))
+                counts_period = course_counts_period.get(
+                    course_unique_key,
+                    course_counts_period.get(
+                        course_code,
+                        {'total': 0, 'lectures': 0, 'tutorials': 0, 'labs': 0},
+                    ),
+                )
                 scheduled_lectures = counts_period['lectures']
                 scheduled_tutorials = counts_period['tutorials']
                 scheduled_labs = counts_period['labs']
-                
-                # Use LTPSC values directly - no hardcoded course-specific adjustments
-                # LTPSC already contains the correct lab/tutorial requirements
-                
-                # Determine status - check each component separately
+
+                # Use LTPSC values directly - no hardcoded course-specific adjustments.
+                # LTPSC already contains the correct lab/tutorial requirements.
+
+                # ----------------------------------------------------------------------------------
+                # 1) PERIOD-LEVEL CHECKS (used only for informational per-period counts)
+                # ----------------------------------------------------------------------------------
+                # Determine status components for THIS PERIOD first.
                 # For Phase 7: Only check if scheduled in this period (might be in other period)
                 if not is_phase5:
                     # Phase 7: Check if scheduled in this period, if not, might be in other period
@@ -1582,19 +1660,76 @@ class TimetableWriterV2:
                         tutorials_satisfied = scheduled_tutorials >= required_tutorials
                         labs_satisfied = scheduled_labs >= required_labs
                 else:
-                    # Phase 5: Full requirement must be in this period
+                    # Phase 5: previously required full LTPSC in *each* period.
+                    # Now we treat LTPSC as FULL-SEMESTER: per-period counts are informational only.
                     lectures_satisfied = scheduled_lectures >= required_lectures
                     tutorials_satisfied = scheduled_tutorials >= required_tutorials
                     labs_satisfied = scheduled_labs >= required_labs
-                
-                # Special case: If all requirements are 0, mark as satisfied if scheduled is also 0
+
+                # ----------------------------------------------------------------------------------
+                # 2) FULL-SEMESTER TOTALS (authoritative for SATISFIED / UNSATISFIED)
+                # ----------------------------------------------------------------------------------
+                total_lectures = 0
+                total_tutorials = 0
+                total_labs = 0
+
+                # Aggregate across all relevant sessions (Phase 5 and Phase 7)
+                if phase5_sessions:
+                    for session in phase5_sessions:
+                        if (
+                            hasattr(session, 'course_code')
+                            and session.course_code == course_code
+                            and hasattr(session, 'section')
+                            and session.section == f"{section}-Sem{semester}"
+                        ):
+                            kind = getattr(session, 'kind', 'L')
+                            if kind == 'P':
+                                total_labs += 1
+                            elif kind == 'T':
+                                total_tutorials += 1
+                            else:
+                                total_lectures += 1
+
+                if phase7_sessions:
+                    for session in phase7_sessions:
+                        if (
+                            hasattr(session, 'course_code')
+                            and session.course_code == course_code
+                            and hasattr(session, 'section')
+                            and session.section == f"{section}-Sem{semester}"
+                        ):
+                            kind = getattr(session, 'kind', 'L')
+                            if kind == 'P':
+                                total_labs += 1
+                            elif kind == 'T':
+                                total_tutorials += 1
+                            else:
+                                total_lectures += 1
+
+                # Special case: If all requirements are 0, mark as satisfied if TOTAL scheduled is also 0
                 if required_lectures == 0 and required_tutorials == 0 and required_labs == 0:
-                    if scheduled_lectures == 0 and scheduled_tutorials == 0 and scheduled_labs == 0:
+                    if total_lectures == 0 and total_tutorials == 0 and total_labs == 0:
                         status = 'SATISFIED'
+                        lectures_satisfied = True
+                        tutorials_satisfied = True
+                        labs_satisfied = True
                     else:
                         status = 'UNSATISFIED'
+                        lectures_satisfied = False
+                        tutorials_satisfied = False
+                        labs_satisfied = False
                 else:
-                    status = 'SATISFIED' if (lectures_satisfied and tutorials_satisfied and labs_satisfied) else 'UNSATISFIED'
+                    lectures_total_ok = total_lectures >= required_lectures
+                    tutorials_total_ok = total_tutorials >= required_tutorials
+                    labs_total_ok = total_labs >= required_labs
+
+                    status = 'SATISFIED' if (lectures_total_ok and tutorials_total_ok and labs_total_ok) else 'UNSATISFIED'
+
+                    # Align component flags with FULL-SEMESTER totals so that time_slot_issues
+                    # only report real LTPSC shortages, not per-period placement quirks.
+                    lectures_satisfied = lectures_total_ok
+                    tutorials_satisfied = tutorials_total_ok
+                    labs_satisfied = labs_total_ok
                 
                 # Get room assignment from room_assignments (Phase 8)
                 # Key format: (course_code, section, period)

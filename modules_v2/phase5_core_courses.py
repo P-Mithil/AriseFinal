@@ -10,6 +10,7 @@ from datetime import time, datetime, timedelta
 from collections import defaultdict
 
 from utils.data_models import Course, Section, ClassRoom, ScheduledSession, TimeBlock, section_has_time_conflict
+from config.schedule_config import WORKING_DAYS, DAY_START_TIME, DAY_END_TIME, LUNCH_WINDOWS
 from modules_v2.phase2_time_management_v2 import get_lunch_blocks, generate_base_time_slots
 from utils.time_slot_logger import get_logger
 from utils.session_rules_validator import SessionRulesValidator
@@ -493,79 +494,66 @@ def check_elective_conflict(day: str, start: time, end: time, semester: int) -> 
             return True  # Conflict found
     return False  # No conflict
 
-def generate_dynamic_time_slots(semester: int, start_hour: int = 9, end_hour: int = 18) -> List[TimeBlock]:
+def generate_dynamic_time_slots(semester: int, start_hour: Optional[int] = None, end_hour: Optional[int] = None) -> List[TimeBlock]:
     """
     Dynamically generate time slots based on:
-    - Available time window (default 9:00-18:00)
-    - Lunch break times (semester-specific, only hardcoded exception)
+    - Available time window (from config DAY_START_TIME/DAY_END_TIME unless overridden)
+    - Lunch break times from config LUNCH_WINDOWS
     - 15-minute intervals
     - Multiple session durations (1h, 1.5h, 2h)
     """
+
+    # Resolve working window from config if not explicitly overridden
+    if start_hour is None:
+        start_hour = DAY_START_TIME.hour
+    if end_hour is None:
+        end_hour = DAY_END_TIME.hour
+
+    # Lunch window from config
+    lunch_window = LUNCH_WINDOWS.get(semester, (time(12, 30), time(13, 30)))
+    lunch_start, lunch_end = lunch_window
     
-    # Lunch times (only hardcoded exception as per requirements)
-    lunch_blocks = {
-        1: (time(12, 30), time(13, 30)),  # Sem 1: 12:30-13:30
-        3: (time(12, 45), time(13, 45)),  # Sem 3: 12:45-13:45
-        5: (time(13, 0), time(14, 0))     # Sem 5: 13:00-14:00
-    }
-    lunch_start, lunch_end = lunch_blocks.get(semester, (time(12, 30), time(13, 30)))
-    
-    days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']
+    days = WORKING_DAYS
     base_slots = []
-    
-    # Generate slots efficiently - only create practical slots (not every 15 min)
-    # Morning slots (before lunch): 9:00, 9:15, 10:30, 10:45, 11:00
-    # Afternoon slots (after lunch): 14:00, 14:15, 15:00, 15:15, 15:45, 16:00, 16:30, 17:00
-    
-    morning_start_times = [
-        time(9, 0), time(9, 15), time(10, 30), time(10, 45), time(11, 0)
-    ]
-    afternoon_start_times = [
-        time(14, 0), time(14, 15), time(15, 0), time(15, 15), time(15, 45), 
-        time(16, 0), time(16, 30), time(17, 0)
-    ]
-    
+
+    # Build full 15-minute grid between start_hour and end_hour
+    work_start_dt = datetime.combine(datetime.min, time(start_hour, 0))
+    work_end_dt = datetime.combine(datetime.min, time(end_hour, 0))
+
+    # For each day, create:
+    # - All 1.5h lecture candidates at every 15-min start that fully fits before lunch / end of day
+    # - All 1h tutorial candidates at every 15-min start that fully fits before lunch / end of day
+    # - All 2h practical candidates at every 15-min start that fully fits after lunch / before end of day
     for day in days:
-        # Morning 1.5h lecture slots
-        for start in morning_start_times:
-            if start < lunch_start:
-                end_dt = datetime.combine(datetime.min, start) + timedelta(minutes=90)
-                end = end_dt.time()
-                if end <= lunch_start:
-                    base_slots.append(TimeBlock(day, start, end))
-        
-        # Morning 1h tutorial slots
-        for start in morning_start_times:
-            if start < lunch_start:
-                end_dt = datetime.combine(datetime.min, start) + timedelta(minutes=60)
-                end = end_dt.time()
-                if end <= lunch_start:
-                    base_slots.append(TimeBlock(day, start, end))
-        
-        # Afternoon 1.5h lecture slots
-        for start in afternoon_start_times:
-            if start >= lunch_end:
-                end_dt = datetime.combine(datetime.min, start) + timedelta(minutes=90)
-                end = end_dt.time()
-                if end.hour <= end_hour:
-                    base_slots.append(TimeBlock(day, start, end))
-        
-        # Afternoon 1h tutorial slots
-        for start in afternoon_start_times:
-            if start >= lunch_end:
-                end_dt = datetime.combine(datetime.min, start) + timedelta(minutes=60)
-                end = end_dt.time()
-                if end.hour <= end_hour:
-                    base_slots.append(TimeBlock(day, start, end))
-        
-        # Afternoon 2h practical slots
-        for start in afternoon_start_times:
-            if start >= lunch_end:
-                end_dt = datetime.combine(datetime.min, start) + timedelta(minutes=120)
-                end = end_dt.time()
-                if end.hour <= end_hour:
-                    base_slots.append(TimeBlock(day, start, end))
-    
+        current_dt = work_start_dt
+        while current_dt < work_end_dt:
+            start = current_dt.time()
+
+            # 1.5h lecture candidates (both morning and afternoon, as long as they don't cross lunch)
+            lecture_end_dt = current_dt + timedelta(minutes=90)
+            lecture_end = lecture_end_dt.time()
+            # Must finish before end of working day
+            if lecture_end_dt <= work_end_dt:
+                # Do not allow lectures that overlap the lunch window
+                if not (start < lunch_end and lecture_end > lunch_start):
+                    base_slots.append(TimeBlock(day, start, lecture_end))
+
+            # 1h tutorial candidates (both morning and afternoon, as long as they don't cross lunch)
+            tutorial_end_dt = current_dt + timedelta(minutes=60)
+            tutorial_end = tutorial_end_dt.time()
+            if tutorial_end_dt <= work_end_dt:
+                if not (start < lunch_end and tutorial_end > lunch_start):
+                    base_slots.append(TimeBlock(day, start, tutorial_end))
+
+            # 2h practical candidates (only after lunch, and must not cross end of day)
+            practical_end_dt = current_dt + timedelta(minutes=120)
+            practical_end = practical_end_dt.time()
+            if current_dt.time() >= lunch_end and practical_end_dt <= work_end_dt:
+                base_slots.append(TimeBlock(day, start, practical_end))
+
+            # Move to next 15-minute start
+            current_dt += timedelta(minutes=15)
+
     return base_slots
 
 def get_available_time_slots(semester: int, occupied_slots: Dict[str, List[TimeBlock]], 
@@ -577,16 +565,8 @@ def get_available_time_slots(semester: int, occupied_slots: Dict[str, List[TimeB
     lunch_rejected = 0
     overlap_rejected = 0
     
-    # Generate time slots dynamically (no hardcoded values except lunch)
-    base_slots = generate_dynamic_time_slots(semester, start_hour=9, end_hour=18)
-    
-    # Lunch times
-    lunch_blocks = {
-        1: TimeBlock("Monday", time(12, 30), time(13, 30)),
-        3: TimeBlock("Monday", time(12, 45), time(13, 45)),
-        5: TimeBlock("Monday", time(13, 0), time(14, 0))
-    }
-    lunch_block = lunch_blocks.get(semester, TimeBlock("Monday", time(12, 30), time(13, 30)))
+    # Generate time slots dynamically using config-driven day window and lunch
+    base_slots = generate_dynamic_time_slots(semester)
     
     # DYNAMIC: Shuffle slots for variety
     shuffled_slots = base_slots.copy()
@@ -594,16 +574,10 @@ def get_available_time_slots(semester: int, occupied_slots: Dict[str, List[TimeB
     
     available_slots = []
     for slot in shuffled_slots:
-        # Check lunch conflicts - use overlaps_with_lunch method
-        lunch_conflict = False
-        # Create lunch block for this day
-        day_lunch = TimeBlock(slot.day, lunch_block.start, lunch_block.end)
-        if slot.overlaps(day_lunch):
-                lunch_conflict = True
-                lunch_rejected += 1
-                rejected_slots.append((slot, 'LUNCH_CONFLICT'))
-        
-        if lunch_conflict:
+        # Check lunch conflicts using overlaps_with_lunch (config-driven)
+        if slot.overlaps_with_lunch(semester):
+            lunch_rejected += 1
+            rejected_slots.append((slot, 'LUNCH_CONFLICT'))
             continue
         
         # CRITICAL: Check elective basket conflict
@@ -814,6 +788,10 @@ def schedule_course_sessions(course: Course, section: Section, period: str,
         # CRITICAL: Check elective basket conflict for adjusted block
         if check_elective_conflict(slot.day, slot.start, lecture_end, course.semester):
             continue  # Skip this slot to avoid elective conflict
+
+        # CRITICAL: Check section-level time conflicts with other courses (all phases)
+        if section_has_time_conflict(occupied_slots, section.label, period, lecture_block):
+            continue  # Skip this slot - overlaps with another course in this section/period
         
         # CRITICAL: Check faculty availability (prevent conflicts during scheduling)
         if all_sessions and assigned_faculty and assigned_faculty != 'TBD':
@@ -877,8 +855,11 @@ def schedule_course_sessions(course: Course, section: Section, period: str,
                 continue
 
             lecture_block = TimeBlock(slot.day, slot.start, lecture_end)
-
+            
             if check_elective_conflict(slot.day, slot.start, lecture_end, course.semester):
+                continue
+
+            if section_has_time_conflict(occupied_slots, section.label, period, lecture_block):
                 continue
 
             # Check faculty availability
@@ -933,8 +914,11 @@ def schedule_course_sessions(course: Course, section: Section, period: str,
                 continue
 
             lecture_block = TimeBlock(slot.day, slot.start, lecture_end)
-
+            
             if check_elective_conflict(slot.day, slot.start, lecture_end, course.semester):
+                continue
+
+            if section_has_time_conflict(occupied_slots, section.label, period, lecture_block):
                 continue
 
             # Check faculty availability
@@ -1002,6 +986,9 @@ def schedule_course_sessions(course: Course, section: Section, period: str,
         # CRITICAL: Check elective basket conflict for adjusted block
         if check_elective_conflict(slot.day, slot.start, tutorial_end, course.semester):
             continue  # Skip this slot to avoid elective conflict
+
+        if section_has_time_conflict(occupied_slots, section.label, period, tutorial_slot):
+            continue
         
         # CRITICAL: Check faculty availability (prevent conflicts during scheduling)
         if all_sessions and assigned_faculty and assigned_faculty != 'TBD':
@@ -1061,8 +1048,11 @@ def schedule_course_sessions(course: Course, section: Section, period: str,
                 continue
 
             tutorial_slot = TimeBlock(slot.day, slot.start, tutorial_end)
-
+            
             if check_elective_conflict(slot.day, slot.start, tutorial_end, course.semester):
+                continue
+
+            if section_has_time_conflict(occupied_slots, section.label, period, tutorial_slot):
                 continue
 
             # CRITICAL: Check faculty availability (prevent conflicts during scheduling)
@@ -1137,6 +1127,9 @@ def schedule_course_sessions(course: Course, section: Section, period: str,
         # CRITICAL: Check elective basket conflict for adjusted block
         if check_elective_conflict(slot.day, slot.start, practical_end, course.semester):
             continue  # Skip this slot to avoid elective conflict
+
+        if section_has_time_conflict(occupied_slots, section.label, period, practical_slot):
+            continue
         
         # CRITICAL: Check if practical slot would overlap with lunch
         # Get semester lunch time
@@ -1210,8 +1203,11 @@ def schedule_course_sessions(course: Course, section: Section, period: str,
     
     return sessions
 
+from modules_v2.phase7_remaining_courses import add_session_to_occupied_slots
+
+
 def run_phase5(courses: List[Course], sections: List[Section], classrooms: List[ClassRoom],
-               elective_sessions: List[ScheduledSession], 
+               elective_sessions: List[ScheduledSession],
                combined_sessions: List[ScheduledSession]) -> List[ScheduledSession]:
     """Run Phase 5: Schedule core courses with credits > 2"""
     
@@ -1249,36 +1245,14 @@ def run_phase5(courses: List[Course], sections: List[Section], classrooms: List[
         key = (course.semester, course.department)
         courses_by_sem_dept[key].append(course)
     
-    # Create occupied slots map from existing sessions
+    # Create occupied slots map from existing sessions (electives + combined)
     occupied_slots = defaultdict(list)
-    
-    # Phase 4 occupied slots are already included in combined_sessions
-    # No need for additional occupied_slots conversion
-    
-    # Add elective sessions
-    for session in elective_sessions:
-        if hasattr(session, 'section') and hasattr(session, 'period'):
-            key = f"{session.section}_{session.period}"
-            course_code = getattr(session, 'course_code', 'ELECTIVE')
-            occupied_slots[key].append((session.block, course_code))
-    
-    # Add combined sessions
-    for session in combined_sessions:
-        if isinstance(session, dict):
-            # Combined sessions are dictionaries
-            session_sections = session.get('sections', [])
-            session_period = session.get('period', '')
-            session_block = session.get('time_block')
-            course_code = session.get('course_code', 'COMBINED')
-            if session_block:
-                # Add to occupied slots for each section
-                for section in session_sections:
-                    key = f"{section}_{session_period}"
-                    occupied_slots[key].append((session_block, course_code))
-        elif hasattr(session, 'section') and hasattr(session, 'period'):
-            key = f"{session.section}_{session.period}"
-            course_code = getattr(session, 'course_code', 'COMBINED')
-            occupied_slots[key].append((session.block, course_code))
+
+    for session in elective_sessions or []:
+        add_session_to_occupied_slots(session, occupied_slots)
+
+    for session in combined_sessions or []:
+        add_session_to_occupied_slots(session, occupied_slots)
     
     all_phase5_sessions = []
     
@@ -1592,7 +1566,7 @@ def detect_and_resolve_faculty_conflicts(all_sessions: List,
             lunch_base = lunch_blocks_dict.get(semester)
             lunch_blocks = []
             if lunch_base:
-                for day in ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']:
+                for day in WORKING_DAYS:
                     lunch_blocks.append(TimeBlock(day, lunch_base.start, lunch_base.end))
             
             # Find alternative slot with multiple attempts
@@ -1806,7 +1780,7 @@ def detect_and_resolve_section_overlaps(
                     lunch_base = lunch_blocks_dict.get(sem)
                     lunch_blocks = []
                     if lunch_base:
-                        for d in ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']:
+                        for d in WORKING_DAYS:
                             lunch_blocks.append(TimeBlock(d, lunch_base.start, lunch_base.end))
                     if is_slot_available(candidate, other_view, movable, occupied_slots, lunch_blocks):
                         new_slot = candidate
@@ -1855,8 +1829,8 @@ def find_alternative_slot(session: ScheduledSession,
                          attempt: int = 0) -> Optional[TimeBlock]:
     """Find alternative time slot with expanded search and multiple strategies"""
     
-    # Get available days (Monday-Friday)
-    days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']
+    # Get available days from configuration
+    days = WORKING_DAYS
     
     # Get semester for lunch check
     semester = int(session.section.split('-')[2].replace('Sem', ''))
@@ -1865,7 +1839,7 @@ def find_alternative_slot(session: ScheduledSession,
     # Create lunch blocks for all days
     lunch_blocks = []
     if lunch_base:
-        for day in ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']:
+        for day in WORKING_DAYS:
             lunch_blocks.append(TimeBlock(day, lunch_base.start, lunch_base.end))
     
     # Calculate duration based on session type (preserve original duration)

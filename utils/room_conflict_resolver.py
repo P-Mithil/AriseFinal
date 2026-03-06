@@ -8,6 +8,7 @@ from collections import defaultdict
 from datetime import time
 
 from utils.data_models import TimeBlock, ScheduledSession, ClassRoom
+from config.schedule_config import WORKING_DAYS
 from modules_v2.phase8_classroom_assignment import (
     detect_room_conflicts,
     check_room_conflict,
@@ -393,7 +394,7 @@ def _try_reschedule(
     lunch_base = lunch_blocks_dict.get(semester)
     lunch_blocks = []
     if lunch_base:
-        for day in ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]:
+        for day in WORKING_DAYS:
             lunch_blocks.append(TimeBlock(day, lunch_base.start, lunch_base.end))
     for slot in available_slots[:max_slot_attempts]:
         if not slot or not hasattr(slot, "day"):
@@ -638,6 +639,24 @@ def resolve_room_conflicts(
     remaining = detect_room_conflicts(
         phase5_sessions, phase7_sessions, combined_sessions, elective_sessions, classrooms
     )
-    if remaining:
-        print(f"  WARNING: {len(remaining)} room conflict(s) remain after {max_passes} passes.")
-    return resolved_count, remaining
+
+    # Treat same-course multi-section use of a large room as acceptable:
+    # ignore conflicts where the base course codes match.
+    filtered_remaining = []
+    for c in remaining or []:
+        c1 = (c.get("course1") or "").split("-")[0]
+        c2 = (c.get("course2") or "").split("-")[0]
+        if c1 == c2:
+            continue
+        filtered_remaining.append(c)
+
+    if filtered_remaining:
+        print(f"  WARNING: {len(filtered_remaining)} room conflict(s) remain after {max_passes} passes.")
+    else:
+        if remaining:
+            print(
+                "  Note: remaining same-course multi-section uses of the same room "
+                "are treated as non-conflicting."
+            )
+
+    return resolved_count, filtered_remaining

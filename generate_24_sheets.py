@@ -15,9 +15,10 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from utils.data_models import DayScheduleGrid, TimeBlock, Section
 from utils.timetable_writer_v2 import TimetableWriterV2
-from utils.faculty_timetable_writer import (
-    write_faculty_timetables,
-)
+from config.schedule_config import WORKING_DAYS, DAY_START_TIME, DAY_END_TIME
+from config.structure_config import DEPARTMENTS, SECTIONS_BY_DEPT, STUDENTS_PER_SECTION, get_group_for_section
+from utils.faculty_timetable_writer import write_faculty_timetables
+from utils.classroom_timetable_writer import write_classroom_timetables
 from utils.faculty_conflict_resolver import resolve_all_faculty_conflicts
 from modules_v2.phase1_data_validation_v2 import run_phase1
 from modules_v2.phase3_elective_baskets_v2 import run_phase3
@@ -136,7 +137,22 @@ def identify_course_sync_type(course_code: str, semester: int, courses: List[Cou
         return 'standard'
 
 def map_corrected_schedule_to_sessions(schedule: Dict, sections: List[Section], periods: List[str], courses: List = None, classrooms: List = None) -> List[dict]:
-    """Convert corrected phase4 schedule format to session format with dynamic synchronization"""
+    """
+    Convert corrected Phase 4 schedule format to session dicts.
+
+    NOTE: Phase 4 behavior (grouping + period choices) is fully encoded in the Phase 4
+    schedule slots. The mapping must trust those slots 1:1 to avoid introducing
+    cross-group remapping bugs.
+    """
+    return map_corrected_schedule_to_sessions_v2(
+        schedule=schedule,
+        sections=sections,
+        periods=periods,
+        courses=courses,
+        classrooms=classrooms,
+    )
+
+    # Legacy implementation below (kept for reference only; unreachable).
     from modules_v2.phase4_combined_classes_v2_corrected import calculate_slots_from_ltpsc
     sessions = []
     
@@ -189,16 +205,16 @@ def map_corrected_schedule_to_sessions(schedule: Dict, sections: List[Section], 
             else:
                 return f"{course_code}-LAB"  # Practical
         
-        # DYNAMIC SYNCHRONIZATION: Identify course type and apply appropriate sync logic
+        # Legacy dynamic synchronization (no longer used for Phase 4 mapping).
+        # Kept only for backward compatibility; current pipeline uses
+        # map_corrected_schedule_to_sessions_v2 instead.
         # PreMid courses: Apply dynamic synchronization based on course type
         for i, course_code in enumerate(premid_courses):
             course_obj = premid_course_objects[i]
             slots_info = calculate_slots_from_ltpsc(course_obj.ltpsc)
             
-            # Dynamically identify synchronization type
+            # Dynamically identify synchronization type (legacy)
             sync_type = identify_course_sync_type(course_code, semester, courses or [], sections)
-            if semester == 3:  # Debug for Semester 3 courses
-                print(f"DEBUG: {course_code} (PreMid) - Sync type: {sync_type}")
             
             # Filter slots by course code
             course_slots = []
@@ -358,20 +374,13 @@ def map_corrected_schedule_to_sessions(schedule: Dict, sections: List[Section], 
                         'session_type': session_type
                     })
         
-        # PostMid courses: Apply dynamic synchronization based on course type
+        # PostMid courses: Apply dynamic synchronization based on course type (legacy)
         for i, course_code in enumerate(postmid_courses):
             course_obj = postmid_course_objects[i]
             slots_info = calculate_slots_from_ltpsc(course_obj.ltpsc)
             
-            # Dynamically identify synchronization type
+            # Dynamically identify synchronization type (legacy)
             sync_type = identify_course_sync_type(course_code, semester, courses or [], sections)
-            # Debug logging for all courses (no hardcoded semester checks)
-            print(f"DEBUG: {course_code} (PostMid) - Sync type: {sync_type}")
-            if sync_type == 'cross_group':
-                print(f"  -> CSE will get in POST, DSAI/ECE will get in PRE (opposite periods)")
-                print(f"  -> Cross-group sync: If CSE has {course_code} in PostMid, DSAI/ECE get it in PreMid (same time slots)")
-            elif sync_type == 'within_group_cse':
-                print(f"  -> CSE-A will get in POST, CSE-B will get in PRE (opposite periods)")
             
             # Filter slots by course code
             course_slots = []
@@ -542,6 +551,153 @@ def map_corrected_schedule_to_sessions(schedule: Dict, sections: List[Section], 
                 print(f"DEBUG {course_code}: Created {len(unique_slots)} unique sessions - L:{session_count.get('L', 0)}, T:{session_count.get('T', 0)}, P:{session_count.get('P', 0)}")
                 print(f"DEBUG {course_code}: Expected - L:{slots_info['lectures']}, T:{slots_info['tutorials']}, P:{slots_info['practicals']}")
     
+    return sessions
+
+
+def map_corrected_schedule_to_sessions_v2(
+    schedule: Dict,
+    sections: List[Section],
+    periods: List[str],
+    courses: List = None,
+    classrooms: List = None,
+) -> List[dict]:
+    """
+    New mapping for Phase 4 combined classes.
+
+    This helper TRUSTS the Phase 4 schedule completely:
+    - It does not swap PreMid/PostMid between groups.
+    - It does not infer grouping from departments.
+    - It simply flattens Phase 4 slots into session dicts, 1:1.
+    """
+    sessions: List[dict] = []
+
+    # Prepare lab rooms (for practicals that do not already specify a lab)
+    lab_rooms = []
+    if classrooms:
+        lab_rooms = [
+            r
+            for r in classrooms
+            if hasattr(r, "room_type") and "lab" in str(r.room_type).lower()
+        ]
+
+    def get_lab_room_for_practical(default_room: str) -> str:
+        if lab_rooms:
+            room = lab_rooms[0]
+            return getattr(room, "room_number", str(room))
+        return default_room or "L105"
+
+    for semester, sem_data in schedule.items():
+        premid = sem_data.get("premid", {}) or {}
+        postmid = sem_data.get("postmid", {}) or {}
+
+        premid_course_objects = premid.get("course_objects", []) or []
+        postmid_course_objects = postmid.get("course_objects", []) or []
+        premid_slots = premid.get("slots", []) or []
+        postmid_slots = postmid.get("slots", []) or []
+
+        default_room_premid = premid.get("room", "C004")
+        default_room_postmid = postmid.get("room", "C004")
+
+        # Index course objects by (code, semester)
+        course_map: Dict[tuple, object] = {}
+        for obj in list(premid_course_objects) + list(postmid_course_objects):
+            code = getattr(obj, "code", None)
+            if code:
+                course_map[(code, semester)] = obj
+
+        def course_obj_for(code: str):
+            return course_map.get((code, semester))
+
+        def add_slot_list(slot_list, period_flag: str, default_room: str) -> None:
+            """
+            Map a list of Phase 4 slots into sessions.
+            Primary expected format:
+              (course_code, day, start, end, session_type, section, room)
+            Older variants are handled defensively.
+            """
+            for slot in slot_list:
+                if not slot:
+                    continue
+
+                course_code = None
+                day = None
+                start = None
+                end = None
+                session_type = "L"
+                section_ref = None
+                room = default_room
+
+                if len(slot) >= 7 and isinstance(slot[0], str):
+                    course_code, day, start, end, session_type, section_ref, room = slot[:7]
+                elif len(slot) == 6:
+                    if isinstance(slot[0], str):
+                        # (course_code, day, start, end, session_type, section)
+                        course_code, day, start, end, session_type, section_ref = slot
+                        room = default_room
+                    else:
+                        # (day, start, end, session_type, section, room)
+                        day, start, end, session_type, section_ref, room = slot
+                elif len(slot) == 5:
+                    # (day, start, end, session_type, section)
+                    day, start, end, session_type, section_ref = slot
+                    room = default_room
+                elif len(slot) == 4:
+                    # (day, start, end, session_type)
+                    day, start, end, session_type = slot
+                    room = default_room
+                elif len(slot) >= 3:
+                    # (day, start, end)
+                    day, start, end = slot[:3]
+                    session_type = "L"
+                    room = default_room
+
+                if course_code is None:
+                    continue  # cannot safely map
+
+                # Resolve section label
+                if hasattr(section_ref, "label"):
+                    section_label = section_ref.label
+                else:
+                    section_label = str(section_ref) if section_ref is not None else ""
+
+                # Determine display code
+                if session_type == "T":
+                    display_code = f"{course_code}-TUT"
+                elif session_type == "P":
+                    display_code = f"{course_code}-LAB"
+                else:
+                    display_code = course_code
+
+                # Ensure practicals use a lab room
+                if session_type == "P":
+                    room = room or get_lab_room_for_practical(default_room)
+
+                course_obj = course_obj_for(course_code)
+                instructor = (
+                    course_obj.instructors[0]
+                    if course_obj and getattr(course_obj, "instructors", None)
+                    else "TBD"
+                )
+
+                time_block = TimeBlock(day, start, end)
+
+                sessions.append(
+                    {
+                        "course_code": display_code,
+                        "sections": [section_label] if section_label else [],
+                        "period": period_flag,
+                        "day": day,
+                        "time_block": time_block,
+                        "room": room,
+                        "instructor": instructor,
+                        "course_obj": course_obj,
+                        "session_type": session_type,
+                    }
+                )
+
+        add_slot_list(premid_slots, "PRE", default_room_premid)
+        add_slot_list(postmid_slots, "POST", default_room_postmid)
+
     return sessions
 
 # ============================================================================
@@ -1673,7 +1829,79 @@ def create_integrated_schedule(
                 else:
                     # Different courses or same course+type - check course requirements before removing
                     # (cand_would_break and existing_would_break already defined above)
-                    
+                    #
+                    # CRITICAL: Phase 4 combined classes must NEVER lose their synchronized slots to
+                    # lower-priority Phase 5/7 core sessions for the same section/day/period.
+                    # Combined sessions come from the user-driven Phase 4 logic and encode grouping.
+                    # If a combined session and a non-combined session overlap in time, we must:
+                    #   - Try to reschedule the non-combined session first.
+                    #   - If rescheduling fails, drop the non-combined one and keep the combined.
+                    cand_is_combined = (cand[2] == 3)
+                    existing_is_combined = (existing[2] == 3)
+                    if cand_is_combined != existing_is_combined:
+                        # Exactly one of these is a Phase 4 combined session
+                        combined_session = cand if cand_is_combined else existing
+                        other_session = existing if cand_is_combined else cand
+                        other_is_existing = not cand_is_combined  # True if existing is the non-combined one
+
+                        # Optional tracing to understand MA161/DS161 behaviour for specific sections
+                        if _course_matches_trace(combined_session[1], base_course_code(combined_session[1]), traced) or \
+                           _course_matches_trace(other_session[1], base_course_code(other_session[1]), traced):
+                            trace_log(
+                                f"OVERLAP [{day}]: COMBINED_vs_CORE combined={combined_session[1]} other={other_session[1]} (combined_wins)"
+                            )
+
+                        # Try to reschedule the non-combined session first
+                        rescheduled_other = try_reschedule_session(
+                            other_session,
+                            [s for s in final_sessions if s != existing] if other_is_existing else final_sessions,
+                            deduped,
+                            semester,
+                            section_name,
+                            period_code,
+                            day,
+                            base_course_code,
+                            final_sessions_all_days=(final_sessions_all_days or []),
+                            course_requirements=course_requirements,
+                            is_required=True,
+                        )
+
+                        if rescheduled_other:
+                            # Successfully rescheduled the non-combined session
+                            if other_is_existing:
+                                final_sessions.remove(existing)
+                                final_sessions.append(rescheduled_other)
+                            else:
+                                # Candidate was rescheduled; update cand and continue checks
+                                cand = rescheduled_other
+                                rescheduled = True
+                            # Do not mark overlap; keep both with new times
+                            continue
+
+                        # Rescheduling failed. Keep the combined session and drop the non-combined one.
+                        if other_is_existing:
+                            log_rescheduling_conflict(
+                                existing[1],
+                                existing[0],
+                                "Dropped lower-priority core session overlapping Phase 4 combined slot",
+                                [],
+                                "REMOVED",
+                            )
+                            final_sessions.remove(existing)
+                            # We can now keep cand (combined) without marking overlap
+                            continue
+                        else:
+                            # Other is the candidate (core) - drop candidate and keep existing combined
+                            log_rescheduling_conflict(
+                                cand[1],
+                                cand[0],
+                                "Dropped lower-priority core candidate overlapping Phase 4 combined slot",
+                                [],
+                                "REMOVED",
+                            )
+                            overlaps = True
+                            break
+
                     # If removing candidate would break requirements, try harder to keep it
                     if cand_would_break and not existing_would_break:
                         # Candidate is required, existing is not - try to reschedule existing
@@ -2375,17 +2603,13 @@ def generate_24_sheets():
                                  if course.department in ['CSE', 'DSAI', 'ECE']))
     print(f"Detected semesters from data: {unique_semesters}")
     
-    # Create sections based on the data
+    # Create sections based on the data & config
     sections = []
-    for dept in ["CSE", "DSAI", "ECE"]:
+    for dept in DEPARTMENTS:
         for sem in unique_semesters:
-            if dept == "CSE":
-                sections.extend([
-                    Section(dept, 1, "A", sem, 30),
-                    Section(dept, 1, "B", sem, 30)
-                ])
-            else:
-                sections.append(Section(dept, 2, "A", sem, 30))
+            for sec_label in SECTIONS_BY_DEPT.get(dept, []):
+                group = get_group_for_section(dept, sec_label)
+                sections.append(Section(dept, group, sec_label, sem, STUDENTS_PER_SECTION))
     
     # Step 2: Run Phase 3 - Elective basket scheduling
     print("\nStep 2: Running Phase 3 - Elective basket scheduling...")
@@ -2423,24 +2647,17 @@ def generate_24_sheets():
     print("="*80)
     phase7_sessions = []
     try:
-        from modules_v2.phase7_remaining_courses import run_phase7
+        from modules_v2.phase7_remaining_courses import run_phase7, add_session_to_occupied_slots
         import time
         
         # Build occupied_slots from all previous phases
         occupied_slots = {}
         for session in elective_sessions + phase5_sessions:
-            section_key = f"{session.section}_{session.period}"
-            if section_key not in occupied_slots:
-                occupied_slots[section_key] = []
-            occupied_slots[section_key].append((session.block, session.course_code))
+            add_session_to_occupied_slots(session, occupied_slots)
         
         # Add combined sessions
         for session in combined_sessions:
-            for section in session['sections']:
-                section_key = f"{section}_{session['period']}"
-                if section_key not in occupied_slots:
-                    occupied_slots[section_key] = []
-                occupied_slots[section_key].append((session['time_block'], session['course_code']))
+            add_session_to_occupied_slots(session, occupied_slots)
         
         # Run Phase 7 with 60 second timeout
         phase7_start = time.time()
@@ -2483,8 +2700,8 @@ def generate_24_sheets():
         from modules_v2.phase9_elective_room_assignment import run_phase9
         all_sessions_for_phase9 = elective_sessions + combined_sessions + phase5_sessions + phase7_sessions
         elective_assignments = run_phase9(
-            courses, all_sessions_for_phase9, room_assignments, classrooms, 
-            registered_students=80, all_courses=courses
+            courses, all_sessions_for_phase9, room_assignments, classrooms,
+            all_courses=courses
         )
     except Exception as e:
         print(f"WARNING: Phase 9 failed. Continuing without elective assignments. Reason: {e}")
@@ -2810,11 +3027,64 @@ def generate_24_sheets():
     else:
         print("[OK] All time slots are within 9:00-18:00")
     
+    # Step 6.75: Final classroom conflict resolution after all rescheduling
+    print("\nStep 6.75: Final classroom conflict check after all rescheduling...")
+    try:
+        from modules_v2.phase8_classroom_assignment import detect_room_conflicts
+        from utils.room_conflict_resolver import resolve_room_conflicts
+
+        # Elective room sessions list may have been built earlier; fetch if present
+        elective_sessions_for_rooms = locals().get("elective_sessions_with_rooms", None)
+
+        final_room_conflicts = detect_room_conflicts(
+            phase5_sessions,
+            phase7_sessions,
+            combined_sessions,
+            elective_sessions_for_rooms,
+            classrooms,
+        )
+        if final_room_conflicts:
+            print(
+                f"  Found {len(final_room_conflicts)} room conflict(s) after "
+                "faculty/section moves; resolving again..."
+            )
+            _, remaining_final = resolve_room_conflicts(
+                phase5_sessions,
+                phase7_sessions,
+                combined_sessions,
+                elective_sessions_for_rooms,
+                classrooms,
+                max_passes=5,
+            )
+            room_conflicts_after = detect_room_conflicts(
+                phase5_sessions,
+                phase7_sessions,
+                combined_sessions,
+                elective_sessions_for_rooms,
+                classrooms,
+            )
+            if room_conflicts_after:
+                print(
+                    f"  WARNING: {len(room_conflicts_after)} room conflict(s) "
+                    "remain after final pass."
+                )
+            else:
+                print("  [OK] 0 classroom conflicts after final pass.")
+        else:
+            print("  [OK] No classroom conflicts after rescheduling.")
+    except Exception as e:
+        print(f"WARNING: Final classroom conflict check failed: {e}")
+        import traceback
+        traceback.print_exc()
+    
     # Step 7: Create timetable with all sessions
     print("\nStep 7: Creating 24 sheets with all sessions...")
     
     # Define sections, semesters, and periods
-    section_names = ["CSE-A", "CSE-B", "DSAI-A", "ECE-A"]
+    section_names = []
+    for dept in DEPARTMENTS:
+        for sec_label in SECTIONS_BY_DEPT.get(dept, []):
+            section_names.append(f"{dept}-{sec_label}")
     semesters = unique_semesters  # Use dynamically extracted semesters
     periods = ["PreMid", "PostMid"]
     
@@ -2845,7 +3115,7 @@ def generate_24_sheets():
                 title_cell.fill = writer.colors['header']
                 
                 # Add days with integrated schedules
-                days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+                days = list(WORKING_DAYS)
                 current_row = 3
                 accumulated_final_sessions = []  # Cross-day finalized sessions for rescheduling
                 grid_sessions_dict = {}  # {day: [(TimeBlock, course_display), ...]}
@@ -2893,6 +3163,55 @@ def generate_24_sheets():
                 )
                 print("[OK] Done")
     
+    # Create dedicated C004 (240-seater) timetable sheets for quick visual inspection
+    print("Creating C004 room timetable sheets (PreMid/PostMid)...")
+    for period_name, period_flag in [("PreMid", "PRE"), ("PostMid", "POST")]:
+        sheet_title = f"C004 {period_name}"
+        sheet = writer.workbook.create_sheet(title=sheet_title)
+
+        # Set column widths
+        sheet.column_dimensions["A"].width = 18
+        for col in range(2, 20):
+            col_letter = writer.workbook.worksheets[0].cell(row=1, column=col).column_letter
+            sheet.column_dimensions[col_letter].width = 14
+
+        # Title
+        title_cell = sheet["A1"]
+        title_cell.value = f"C004 240-Seater Timetable {period_name}"
+        title_cell.font = writer.header_font
+        title_cell.fill = writer.colors["header"]
+
+        days = list(WORKING_DAYS)
+        current_row = 3
+
+        # Build a day grid from combined_sessions for this room/period
+        for day in days:
+            grid = DayScheduleGrid(day, 1)  # semester value is only used for lunch; not critical here
+
+            for sess in combined_sessions:
+                if not isinstance(sess, dict):
+                    continue
+                if sess.get("room") != "C004":
+                    continue
+                if sess.get("period") != period_flag:
+                    continue
+                tb = sess.get("time_block")
+                if not tb or getattr(tb, "day", None) != day:
+                    continue
+
+                display_code = sess.get("course_code", "")
+                sections = sess.get("sections", [])
+                short_secs = sorted({str(s).split("-Sem")[0] for s in sections})
+                if short_secs:
+                    course_label = f"{display_code} ({', '.join(short_secs)})"
+                else:
+                    course_label = display_code
+
+                grid.add_session(tb, course_label)
+
+            current_row = writer.write_day_schedule(sheet, day, grid, current_row)
+            current_row += 1
+
     # Create summary sheet
     print("Creating summary sheet...")
     writer.create_summary_sheet(courses)
@@ -2943,9 +3262,36 @@ def generate_24_sheets():
         import traceback
         traceback.print_exc()
 
-    # Note: Faculty conflict summary is now included in the faculty timetables Excel workbook (SUMMARY sheet)
-    
-    return output_path
+    # Classroom-wise outputs: per-room timetables + clash summary
+    try:
+        classroom_tt_path = os.path.join(
+            os.path.dirname(output_path),
+            f"classroom_timetables_{timestamp}.xlsx",
+        )
+        print(f"\nCreating per-classroom timetables at: {classroom_tt_path}")
+
+        # Include elective room assignments as real sessions for per-room view.
+        room_all_sessions = list(all_sessions)
+        try:
+            room_all_sessions += list(elective_sessions_with_rooms or [])
+        except NameError:
+            # Fallback if elective_sessions_with_rooms is not defined
+            pass
+
+        ct_written = write_classroom_timetables(room_all_sessions, classroom_tt_path)
+        if ct_written:
+            print(f"[OK] Classroom timetables written to: {ct_written}")
+        else:
+            print("[OK] No classroom timetables written (no room sessions found).")
+    except Exception as e:
+        print(f"WARNING: Failed to create classroom timetables. Reason: {e}")
+        import traceback
+        traceback.print_exc()
+
+    # Note: Faculty conflict summary is included in the faculty timetables workbook (SUMMARY sheet),
+    # and room clash information is included in the classroom timetables workbook (SUMMARY sheet).
+
+    return output_path, timestamp
 
 def main():
     """Main function to generate 24 sheets"""
@@ -2959,7 +3305,7 @@ def main():
     print()
     
     try:
-        output_file = generate_24_sheets()
+        output_file, _ = generate_24_sheets()
         
         print("\n" + "=" * 70)
         # Save rescheduling conflict log if any conflicts occurred

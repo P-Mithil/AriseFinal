@@ -16,6 +16,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils.data_models import Course, Section, TimeBlock, ScheduledSession, DayScheduleGrid
 from utils.time_slot_logger import get_logger
 from collections import defaultdict
+from config.schedule_config import WORKING_DAYS, DAY_START_TIME, DAY_END_TIME
 
 # Dynamic elective basket slots - will be calculated based on constraints
 ELECTIVE_BASKET_SLOTS = {}
@@ -92,11 +93,12 @@ def calculate_dynamic_elective_slots(occupied_slots: Optional[Dict[str, List[Tim
     
     slots = {}
     lunch_blocks = get_lunch_blocks()
-    # ALL weekdays available - dynamically choose best 3 days
-    all_days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+    # ALL configured working days available - dynamically choose best 3 days
+    all_days = list(WORKING_DAYS)
     
-    # Define time windows (9:00 AM - 6:00 PM)
-    start_hour, end_hour = 9, 18
+    # Define time window from global config (e.g., 09:00–18:00)
+    start_base = DAY_START_TIME
+    end_base = DAY_END_TIME
     
     # Durations needed for elective sessions
     lecture_duration = 90  # 1.5 hours in minutes
@@ -109,19 +111,19 @@ def calculate_dynamic_elective_slots(occupied_slots: Optional[Dict[str, List[Tim
         """
         if not days:
             days = []
-        # Deduplicate while preserving order
+        # Deduplicate while preserving order and constrained to configured working days
         deduped: List[str] = []
         for d in days:
             if d in all_days and d not in deduped:
                 deduped.append(d)
-        # Fill with remaining days
+        # Fill with remaining working days
         for d in all_days:
             if d not in deduped:
                 deduped.append(d)
             if len(deduped) >= 3:
                 break
-        # As a last resort, repeat (should never happen given all_days length 5)
-        while len(deduped) < 3:
+        # As a last resort, repeat (should never happen given all_days length >= 3)
+        while len(deduped) < 3 and all_days:
             deduped.append(all_days[0])
         return deduped[:3]
     
@@ -136,28 +138,31 @@ def calculate_dynamic_elective_slots(occupied_slots: Optional[Dict[str, List[Tim
         except (ValueError, AttributeError):
             return 1  # Default fallback
     
-    def find_available_slot(day: str, duration_minutes: int, group_key: str, 
-                           used_slots: List[TimeBlock], min_gap_minutes: int = 30, 
-                           relaxed: bool = False) -> Optional[TimeBlock]:
-        """Find an available time slot on a given day"""
+    def find_available_slot(
+        day: str,
+        duration_minutes: int,
+        group_key: str,
+        used_slots: List[TimeBlock],
+        min_gap_minutes: int = 30,
+        relaxed: bool = False,
+    ) -> Optional[TimeBlock]:
+        """Find an available time slot on a given day using 15-min grid."""
         semester = extract_semester_from_group(group_key)
-        current_time = time(start_hour, 0)
-        
-        while current_time.hour < end_hour:
-            # Calculate end time
-            end_dt = datetime.combine(datetime.min, current_time)
-            end_dt = end_dt.replace(hour=current_time.hour, minute=current_time.minute)
-            from datetime import timedelta
-            end_dt += timedelta(minutes=duration_minutes)
-            
-            if end_dt.hour >= end_hour:
+        current_dt = datetime.combine(datetime.min, start_base)
+        end_of_day_dt = datetime.combine(datetime.min, end_base)
+
+        while current_dt < end_of_day_dt:
+            end_dt = current_dt + timedelta(minutes=duration_minutes)
+            if end_dt > end_of_day_dt:
                 break
-            
-            candidate_block = TimeBlock(day, current_time, end_dt.time())
+
+            start_t = current_dt.time()
+            end_t = end_dt.time()
+            candidate_block = TimeBlock(day, start_t, end_t)
             
             # Check lunch conflict
             if candidate_block.overlaps_with_lunch(semester):
-                current_time = time(current_time.hour + 1, 0) if current_time.minute > 0 else time(current_time.hour, 30)
+                current_dt += timedelta(minutes=15)
                 continue
             
             # Check conflicts with already used slots (with buffer)
@@ -184,17 +189,10 @@ def calculate_dynamic_elective_slots(occupied_slots: Optional[Dict[str, List[Tim
             
             if not has_conflict:
                 return candidate_block
-            
+
             # Move to next 15-minute interval
-            if current_time.minute == 0:
-                current_time = time(current_time.hour, 15)
-            elif current_time.minute == 15:
-                current_time = time(current_time.hour, 30)
-            elif current_time.minute == 30:
-                current_time = time(current_time.hour, 45)
-            else:
-                current_time = time(current_time.hour + 1, 0)
-        
+            current_dt += timedelta(minutes=15)
+
         return None
     
     def extract_semester_from_group(group_key: str) -> int:
@@ -215,18 +213,39 @@ def calculate_dynamic_elective_slots(occupied_slots: Optional[Dict[str, List[Tim
         Returns: (selected_days, lecture_1_slot)
         """
         semester = extract_semester_from_group(group_key)
-        # Try different day combinations to find best fit
-        day_combinations = [
-            ["Monday", "Wednesday", "Friday"],
-            ["Tuesday", "Thursday", "Friday"],
-            ["Monday", "Tuesday", "Wednesday"],
-            ["Wednesday", "Thursday", "Friday"],
-            ["Monday", "Thursday", "Friday"],
-            ["Tuesday", "Wednesday", "Friday"],
-            ["Monday", "Tuesday", "Friday"],
-            ["Monday", "Wednesday", "Thursday"],
-            ["Tuesday", "Wednesday", "Thursday"],
+        # Try different day combinations to find best fit, expressed by indices so that
+        # configured WORKING_DAYS automatically propagate (e.g., Mon-Thu+Sat).
+        day_combinations_indices = [
+            [0, 2, 4],  # pattern similar to Mon/Wed/Fri
+            [1, 3, 4],  # Tue/Thu/Fri style
+            [0, 1, 2],
+            [2, 3, 4],
+            [0, 3, 4],
+            [1, 2, 4],
+            [0, 1, 4],
+            [0, 2, 3],
+            [1, 2, 3],
         ]
+        day_combinations: List[List[str]] = []
+        max_index = len(all_days) - 1
+        for idx_combo in day_combinations_indices:
+            combo_days: List[str] = []
+            for idx in idx_combo:
+                if 0 <= idx <= max_index:
+                    day_name = all_days[idx]
+                    if day_name not in combo_days:
+                        combo_days.append(day_name)
+            if len(combo_days) >= 3:
+                day_combinations.append(combo_days[:3])
+        if not day_combinations and all_days:
+            # Fallback: simple rolling windows over all_days
+            for i in range(len(all_days)):
+                window = [
+                    all_days[i],
+                    all_days[(i + 1) % len(all_days)],
+                    all_days[(i + 2) % len(all_days)],
+                ]
+                day_combinations.append(window)
         
         # Shuffle to try different combinations
         random.shuffle(day_combinations)
@@ -282,8 +301,8 @@ def calculate_dynamic_elective_slots(occupied_slots: Optional[Dict[str, List[Tim
             # Found valid combination!
             return ensure_three_days(days), lecture_1
         
-        # If no combination works, fall back to Mon/Wed/Fri and try harder
-        days = ["Monday", "Wednesday", "Friday"]
+        # If no combination works, fall back to first three working days and try harder
+        days = ensure_three_days(all_days[:3])
         lecture_1 = find_available_slot(days[0], lecture_duration, group_key, all_allocated_slots)
         if not lecture_1:
             # Try any day for lecture 1
@@ -297,15 +316,14 @@ def calculate_dynamic_elective_slots(occupied_slots: Optional[Dict[str, List[Tim
                 # Last resort: try with relaxed overlap checking (no buffer, direct overlaps only)
                 for day in all_days:
                     # Try with relaxed mode (no gap requirements)
-                    current_time = time(start_hour, 0)
-                    while current_time.hour < end_hour:
-                        end_dt = datetime.combine(datetime.min, current_time)
-                        end_dt = end_dt.replace(hour=current_time.hour, minute=current_time.minute)
-                        from datetime import timedelta
-                        end_dt += timedelta(minutes=lecture_duration)
-                        if end_dt.hour >= end_hour:
+                    current_dt = datetime.combine(datetime.min, start_base)
+                    end_of_day_dt = datetime.combine(datetime.min, end_base)
+                    while current_dt < end_of_day_dt:
+                        end_dt = current_dt + timedelta(minutes=lecture_duration)
+                        if end_dt > end_of_day_dt:
                             break
-                        candidate_block = TimeBlock(day, current_time, end_dt.time())
+                        start_t = current_dt.time()
+                        candidate_block = TimeBlock(day, start_t, end_dt.time())
                         semester = extract_semester_from_group(group_key)
                         if not candidate_block.overlaps_with_lunch(semester):
                             # Check only direct overlaps (no buffer)
@@ -325,14 +343,7 @@ def calculate_dynamic_elective_slots(occupied_slots: Optional[Dict[str, List[Tim
                                 break
                         if lecture_1:
                             break
-                        if current_time.minute == 0:
-                            current_time = time(current_time.hour, 15)
-                        elif current_time.minute == 15:
-                            current_time = time(current_time.hour, 30)
-                        elif current_time.minute == 30:
-                            current_time = time(current_time.hour, 45)
-                        else:
-                            current_time = time(current_time.hour + 1, 0)
+                        current_dt += timedelta(minutes=15)
                     if lecture_1:
                         break
                 if not lecture_1:
@@ -1021,21 +1032,14 @@ if __name__ == "__main__":
     print("Testing Phase 3 with sample data...")
     courses, classrooms, statistics = run_phase1()
     
-    # Create sample sections
-    sections = [
-        Section("CSE", 1, "A", 1, 30),
-        Section("CSE", 1, "B", 1, 30),
-        Section("DSAI", 2, "A", 1, 30),
-        Section("ECE", 2, "A", 1, 30),
-        Section("CSE", 1, "A", 3, 30),
-        Section("CSE", 1, "B", 3, 30),
-        Section("DSAI", 2, "A", 3, 30),
-        Section("ECE", 2, "A", 3, 30),
-        Section("CSE", 1, "A", 5, 30),
-        Section("CSE", 1, "B", 5, 30),
-        Section("DSAI", 2, "A", 5, 30),
-        Section("ECE", 2, "A", 5, 30),
-    ]
+    # Create sample sections using config
+    from config.structure_config import DEPARTMENTS, SECTIONS_BY_DEPT, STUDENTS_PER_SECTION, get_group_for_section
+    sections = []
+    for sem in [1, 3, 5]:
+        for dept in DEPARTMENTS:
+            for sec_label in SECTIONS_BY_DEPT.get(dept, []):
+                group = get_group_for_section(dept, sec_label)
+                sections.append(Section(dept, group, sec_label, sem, STUDENTS_PER_SECTION))
     
     elective_baskets, sessions = run_phase3(courses, sections)
     print(f"\nGenerated {len(sessions)} elective basket sessions")

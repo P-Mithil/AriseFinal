@@ -92,8 +92,9 @@ def check_room_availability_at_time(room_number: str, period: str, day: str,
                                    elective_room_occupancy: Dict = None) -> bool:
     """
     Check if a room is available at a specific time slot.
-    Excludes 240-seater rooms (capacity >= 240) from available rooms.
-    
+    Capacity filtering (including 240-seaters) is handled by the callers; this
+    helper purely checks time overlaps against existing sessions/assignments.
+
     Args:
         room_number: Room to check
         period: 'PRE' or 'POST'
@@ -244,7 +245,7 @@ def find_suitable_room(capacity_needed: int, period: str, time_slots: Dict[str, 
                       elective_room_occupancy: Dict = None) -> Optional[str]:
     """
     Find a suitable room that's available at all elective time slots.
-    Excludes 240-seater rooms (capacity >= 240) and rooms already assigned to other electives in the same period.
+    Rooms already assigned to other electives in the same period are excluded.
     
     Args:
         already_assigned_rooms: Set of room numbers already assigned to electives in this period
@@ -253,11 +254,12 @@ def find_suitable_room(capacity_needed: int, period: str, time_slots: Dict[str, 
     if already_assigned_rooms is None:
         already_assigned_rooms = set()
     
-    # Filter rooms: exclude ALL 240-seater rooms (capacity >= 240), exclude labs, capacity >= capacity_needed, not already assigned
+    # Filter rooms: exclude labs, capacity >= capacity_needed, not already assigned.
+    # 240‑seater rooms (capacity >= 240) are now allowed here so electives can
+    # legitimately use large halls when their registered_students demand it.
     suitable_rooms = [room for room in classrooms 
                      if room.room_type.lower() != 'lab' 
                      and 'lab' not in room.room_type.lower()
-                     and room.capacity < 240  # Exclude all 240-seaters
                      and room.room_number not in already_assigned_rooms
                      and room.capacity >= capacity_needed]
     
@@ -291,8 +293,7 @@ def find_suitable_room(capacity_needed: int, period: str, time_slots: Dict[str, 
 def assign_electives_to_rooms_and_periods(elective_courses: List[Course], semester: int,
                                          all_sessions: List, room_assignments: Dict,
                                          classrooms: List[ClassRoom],
-                                         all_courses: List[Course] = None,
-                                         registered_students: int = 80) -> List[Dict]:
+                                         all_courses: List[Course] = None) -> List[Dict]:
     """
     Main assignment logic for electives.
     
@@ -306,9 +307,18 @@ def assign_electives_to_rooms_and_periods(elective_courses: List[Course], semest
     if not time_slots:
         return []
     
-    # Calculate expected enrollment per elective
-    num_electives = len(elective_courses)
-    expected_enrollment = math.ceil(registered_students / num_electives) if num_electives > 0 else registered_students
+    # Helper: determine capacity needed for a single elective from its registered_students.
+    # Falls back to a modest default if data is missing or zero, so we never request a
+    # gigantic room based on arbitrary constants like 80.
+    def _capacity_for_course(course: Course) -> int:
+        raw = getattr(course, "registered_students", None)
+        try:
+            value = int(raw) if raw is not None else 0
+        except (TypeError, ValueError):
+            value = 0
+        # Use real registered_students when available; otherwise fall back to 40
+        # as a reasonable small-class default.
+        return value if value and value > 0 else 40
     
     # Initialize assignments
     assignments = []
@@ -349,10 +359,11 @@ def assign_electives_to_rooms_and_periods(elective_courses: List[Course], semest
         # For credits > 2, set period to "FULL" (full semester)
         if course.credits > 2:
             period = 'FULL'
+            capacity_needed = _capacity_for_course(course)
             # For FULL semester, try to find room in either period (use PRE as default for room search)
-            room = find_suitable_room(expected_enrollment, 'PRE', time_slots, all_sessions, room_assignments, classrooms, premid_assigned_rooms, elective_room_occupancy)
+            room = find_suitable_room(capacity_needed, 'PRE', time_slots, all_sessions, room_assignments, classrooms, premid_assigned_rooms, elective_room_occupancy)
             if not room:
-                room = find_suitable_room(expected_enrollment, 'POST', time_slots, all_sessions, room_assignments, classrooms, postmid_assigned_rooms, elective_room_occupancy)
+                room = find_suitable_room(capacity_needed, 'POST', time_slots, all_sessions, room_assignments, classrooms, postmid_assigned_rooms, elective_room_occupancy)
         else:
             # For credits <= 2, use existing logic (assign to PRE or POST)
             # Determine preferred period based on faculty conflicts and balance
@@ -426,14 +437,15 @@ def assign_electives_to_rooms_and_periods(elective_courses: List[Course], semest
             
             # Try preferred period first
             period = preferred_period
+            capacity_needed = _capacity_for_course(course)
             assigned_rooms_set = premid_assigned_rooms if period == 'PRE' else postmid_assigned_rooms
-            room = find_suitable_room(expected_enrollment, period, time_slots, all_sessions, room_assignments, classrooms, assigned_rooms_set, elective_room_occupancy)
+            room = find_suitable_room(capacity_needed, period, time_slots, all_sessions, room_assignments, classrooms, assigned_rooms_set, elective_room_occupancy)
         
             # If no room in preferred period, try other period
             if not room:
                 period = 'POST' if preferred_period == 'PRE' else 'PRE'
                 assigned_rooms_set = premid_assigned_rooms if period == 'PRE' else postmid_assigned_rooms
-                room = find_suitable_room(expected_enrollment, period, time_slots, all_sessions, room_assignments, classrooms, assigned_rooms_set, elective_room_occupancy)
+                room = find_suitable_room(capacity_needed, period, time_slots, all_sessions, room_assignments, classrooms, assigned_rooms_set, elective_room_occupancy)
             
             # If still no room, try to balance periods
             if not room:
@@ -441,11 +453,11 @@ def assign_electives_to_rooms_and_periods(elective_courses: List[Course], semest
                 if premid_count <= postmid_count:
                     period = 'PRE'
                     assigned_rooms_set = premid_assigned_rooms
-                    room = find_suitable_room(expected_enrollment, period, time_slots, all_sessions, room_assignments, classrooms, assigned_rooms_set, elective_room_occupancy)
+                    room = find_suitable_room(capacity_needed, period, time_slots, all_sessions, room_assignments, classrooms, assigned_rooms_set, elective_room_occupancy)
                 else:
                     period = 'POST'
                     assigned_rooms_set = postmid_assigned_rooms
-                    room = find_suitable_room(expected_enrollment, period, time_slots, all_sessions, room_assignments, classrooms, assigned_rooms_set, elective_room_occupancy)
+                    room = find_suitable_room(capacity_needed, period, time_slots, all_sessions, room_assignments, classrooms, assigned_rooms_set, elective_room_occupancy)
             
             # If still no room, be more aggressive - try any available room (even if slightly over capacity)
             if not room:
@@ -455,7 +467,7 @@ def assign_electives_to_rooms_and_periods(elective_courses: List[Course], semest
                     
                     # Try with relaxed capacity (50% of expected)
                     relaxed_room = find_suitable_room(
-                        max(10, int(expected_enrollment * 0.5)),  # At least 10, or 50% of expected
+                        max(10, int(capacity_needed * 0.5)),  # At least 10, or 50% of needed
                         try_period, time_slots, all_sessions, room_assignments, classrooms, assigned_rooms_set, elective_room_occupancy
                     )
                     
@@ -464,7 +476,7 @@ def assign_electives_to_rooms_and_periods(elective_courses: List[Course], semest
                         period = try_period
                         break
             
-            # If STILL no room, try any classroom (excluding 240-seaters and already assigned)
+            # If STILL no room, try any classroom (excluding labs and already assigned)
             if not room:
                 for try_period in ['PRE', 'POST']:
                     assigned_rooms_set = premid_assigned_rooms if try_period == 'PRE' else postmid_assigned_rooms
@@ -472,8 +484,7 @@ def assign_electives_to_rooms_and_periods(elective_courses: List[Course], semest
                     for classroom in classrooms:
                         if (classroom.room_type.lower() != 'lab' 
                             and 'lab' not in classroom.room_type.lower()
-                            and classroom.capacity < 240 and  # Exclude all 240-seaters
-                            classroom.room_number not in assigned_rooms_set):
+                            and classroom.room_number not in assigned_rooms_set):
                             
                             # Check if available at all time slots
                             room_available = True
@@ -577,13 +588,13 @@ def assign_electives_to_rooms_and_periods(elective_courses: List[Course], semest
                 if not course:
                     continue
                 
-                expected_enrollment = math.ceil(registered_students / num_electives) if num_electives > 0 else registered_students
+                capacity_needed = _capacity_for_course(course)
                 
                 # Get assigned rooms set for other period
                 other_assigned_rooms = premid_assigned_rooms if other_period == 'PRE' else postmid_assigned_rooms
                 
                 # Try to find room in other period (excluding already assigned rooms)
-                other_room = find_suitable_room(expected_enrollment, other_period, time_slots, all_sessions, room_assignments, classrooms, other_assigned_rooms, elective_room_occupancy)
+                other_room = find_suitable_room(capacity_needed, other_period, time_slots, all_sessions, room_assignments, classrooms, other_assigned_rooms, elective_room_occupancy)
                 
                 if other_room:
                     # Move to other period
@@ -625,9 +636,8 @@ def assign_electives_to_rooms_and_periods(elective_courses: List[Course], semest
                     for room in classrooms:
                         if (room.room_type.lower() != 'lab' 
                             and 'lab' not in room.room_type.lower()
-                            and room.capacity < 240 and  # Exclude all 240-seaters
-                            room.room_number not in other_assigned_rooms and
-                            room.capacity >= expected_enrollment * 0.8):  # Allow 80% capacity
+                            and room.room_number not in other_assigned_rooms and
+                            room.capacity >= capacity_needed * 0.8):  # Allow 80% capacity
                             
                             # Check if available at all time slots
                             room_available = True
@@ -691,13 +701,12 @@ def assign_electives_to_rooms_and_periods(elective_courses: List[Course], semest
                     course_code = getattr(course, 'code', 'Unknown')
                     
                     # Find any available room (even if it means a conflict)
-                    # Exclude 240-seaters and labs
+                    # Exclude labs only
                     fallback_room = None
                     for classroom in classrooms:
                         if (classroom.room_type.lower() != 'lab' 
                             and 'lab' not in classroom.room_type.lower()
-                            and classroom.capacity < 240 and  # Exclude all 240-seaters
-                            classroom.room_number not in other_assigned_rooms):
+                            and classroom.room_number not in other_assigned_rooms):
                             fallback_room = classroom.room_number
                             break
                     
@@ -741,7 +750,7 @@ def assign_electives_to_rooms_and_periods(elective_courses: List[Course], semest
 
 
 def run_phase9(courses: List[Course], all_sessions: List, room_assignments: Dict,
-              classrooms: List[ClassRoom], registered_students: int = 80,
+              classrooms: List[ClassRoom],
               all_courses: List[Course] = None) -> Dict[int, List[Dict]]:
     """
     Main entry point for Phase 9.
@@ -789,7 +798,7 @@ def run_phase9(courses: List[Course], all_sessions: List, room_assignments: Dict
         # Use time slots from the matching basket group
         assignments = assign_electives_to_rooms_and_periods(
             elective_courses, semester, all_sessions, room_assignments,
-            classrooms, all_courses or courses, registered_students
+            classrooms, all_courses or courses
         )
         for a in assignments:
             a['group_key'] = group_key

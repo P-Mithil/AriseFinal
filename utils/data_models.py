@@ -3,6 +3,8 @@ from datetime import time, datetime, timedelta
 from typing import List, Dict, Optional
 import pandas as pd
 
+from config.schedule_config import LUNCH_WINDOWS
+
 @dataclass(order=True)
 class Time:
     hour: int
@@ -65,16 +67,12 @@ class TimeBlock:
 
     def overlaps_with_lunch(self, semester: int) -> bool:
         """Check if this time block overlaps with lunch for given semester"""
-        lunch_blocks = {
-            1: TimeBlock(self.day, time(12, 30), time(13, 30)),  # Sem 1
-            3: TimeBlock(self.day, time(12, 45), time(13, 45)),  # Sem 3  
-            5: TimeBlock(self.day, time(13, 0), time(14, 0)),   # Sem 5
-        }
-        
-        if semester not in lunch_blocks:
+        window = LUNCH_WINDOWS.get(semester)
+        if not window:
             return False
-            
-        lunch = lunch_blocks[semester]
+
+        start_t, end_t = window
+        lunch = TimeBlock(self.day, start_t, end_t)
         # Check overlap for the same day
         return self.overlaps(lunch)
 

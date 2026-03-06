@@ -17,6 +17,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
 from utils.data_models import TimeBlock
+from config.schedule_config import WORKING_DAYS
 
 try:
     # Import only for type hints – avoid hard dependency at import time
@@ -216,7 +217,7 @@ def write_faculty_timetables(
         bottom=Side(style="thin"),
     )
 
-    days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+    days = list(WORKING_DAYS)
 
     def _write_period_block(
         ws,

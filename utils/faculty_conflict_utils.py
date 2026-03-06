@@ -9,6 +9,7 @@ from datetime import time
 from collections import defaultdict
 
 from utils.data_models import TimeBlock, ScheduledSession
+from config.schedule_config import WORKING_DAYS
 
 
 def check_faculty_availability_in_period(
@@ -279,7 +280,7 @@ def find_alternative_slot_for_faculty(
     lunch_base = lunch_blocks_dict.get(semester)
     lunch_blocks = []
     if lunch_base:
-        for day in ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']:
+        for day in WORKING_DAYS:
             lunch_blocks.append(TimeBlock(day, lunch_base.start, lunch_base.end))
     
     # Try each available slot from get_available_time_slots first
@@ -318,7 +319,7 @@ def find_alternative_slot_for_faculty(
         return slot
     
     # AGGRESSIVE FALLBACK: If no slot found via get_available_time_slots, generate full dynamic grid
-    # and check ALL possible slots within 09:00-18:00 (excluding lunch)
+    # and check ALL possible slots within the configured working window (excluding lunch)
     from modules_v2.phase5_core_courses import generate_dynamic_time_slots
     from datetime import datetime, timedelta
     
@@ -337,8 +338,8 @@ def find_alternative_slot_for_faculty(
     else:
         duration_minutes = 90  # Default to 1.5 hours
     
-    # Generate all possible time slots for this semester
-    all_possible_slots = generate_dynamic_time_slots(semester, start_hour=9, end_hour=18)
+    # Generate all possible time slots for this semester (config-driven window)
+    all_possible_slots = generate_dynamic_time_slots(semester)
     
     # Filter to slots that match the session duration (within tolerance)
     matching_duration_slots = []

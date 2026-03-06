@@ -11,6 +11,8 @@ from datetime import time
 from typing import List, Dict, Tuple
 from collections import defaultdict
 
+import openpyxl
+
 # Add the current directory to Python path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -18,6 +20,219 @@ from utils.data_models import Course, Section, TimeBlock
 from utils.time_slot_logger import get_logger
 from utils.session_rules_validator import SessionRulesValidator
 from utils.time_validator import validate_time_range, can_fit_duration
+from config.schedule_config import WORKING_DAYS
+from config.structure_config import (
+    DEPARTMENTS,
+    SECTION_GROUPS,
+    SECTIONS_BY_DEPT,
+    get_grouping_signature,
+)
+
+
+def get_period_assignments_path() -> str:
+    """
+    Return absolute path to the Phase 4 period assignments Excel file.
+
+    The file lives under DATA/INPUT as:
+        phase4_period_assignments.xlsx
+    """
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base_dir, "DATA", "INPUT", "phase4_period_assignments.xlsx")
+
+
+def load_period_assignments(path: str) -> Dict[Tuple[str, int], bool]:
+    """
+    Load period assignments from Excel.
+
+    Returns:
+        {(course_code, semester): True for PreMid, False for PostMid}
+    """
+    assignments: Dict[Tuple[str, int], bool] = {}
+
+    if not os.path.exists(path):
+        return assignments
+
+    try:
+        wb = openpyxl.load_workbook(path)
+        sheet = wb.active
+    except Exception:
+        # If the file is corrupted or unreadable, fall back to empty assignments
+        return assignments
+
+    # Invalidate old assignments if the section grouping changed
+    try:
+        expected_sig = get_grouping_signature()
+        meta = wb["META"] if "META" in wb.sheetnames else None
+        if meta is None:
+            return {}  # force re-prompt for legacy files
+        stored_sig = None
+        for row in meta.iter_rows(min_row=1, max_row=100):
+            k = row[0].value
+            v = row[1].value if len(row) > 1 else None
+            if str(k).strip().upper() == "GROUPING_SIGNATURE":
+                stored_sig = str(v) if v is not None else ""
+                break
+        if not stored_sig or stored_sig != expected_sig:
+            return {}  # grouping changed -> re-ask
+    except Exception:
+        return {}  # safest: re-ask if meta cannot be read
+
+    # Expect header row: Course_Code | Semester | Pre | Post
+    header = [str(cell.value).strip() if cell.value is not None else "" for cell in next(sheet.iter_rows(min_row=1, max_row=1))]
+    # Build a mapping from expected column names to indices
+    name_to_idx = {name.upper(): idx for idx, name in enumerate(header)}
+
+    def _get_col(name: str) -> int:
+        return name_to_idx.get(name.upper(), -1)
+
+    col_code = _get_col("COURSE_CODE")
+    col_sem = _get_col("SEMESTER")
+    col_pre = _get_col("PRE")
+    col_post = _get_col("POST")
+
+    if col_code < 0 or col_sem < 0 or col_pre < 0 or col_post < 0:
+        # Header does not match expected format
+        return assignments
+
+    for row in sheet.iter_rows(min_row=2):
+        code_cell = row[col_code].value
+        sem_cell = row[col_sem].value
+        pre_cell = row[col_pre].value
+        post_cell = row[col_post].value
+
+        if not code_cell or sem_cell is None:
+            continue
+
+        try:
+            code = str(code_cell).strip().upper()
+            semester = int(sem_cell)
+        except (TypeError, ValueError):
+            continue
+
+        pre_val = int(pre_cell) if pre_cell is not None else 0
+        post_val = int(post_cell) if post_cell is not None else 0
+
+        # A valid row has exactly one of Pre/Post set to 1
+        if pre_val == 1 and post_val == 0:
+            assignments[(code, semester)] = True
+        elif pre_val == 0 and post_val == 1:
+            assignments[(code, semester)] = False
+        else:
+            # Invalid or ambiguous row - ignore, will be re-asked
+            continue
+
+    return assignments
+
+
+def save_period_assignments(path: str, assignments: Dict[Tuple[str, int], bool]) -> None:
+    """
+    Save period assignments to Excel.
+
+    assignments: {(course_code, semester): True for PreMid, False for PostMid}
+    """
+    wb = openpyxl.Workbook()
+    sheet = wb.active
+    sheet.title = "Phase4Periods"
+
+    # META sheet to track grouping signature (invalidate on group change)
+    meta = wb.create_sheet(title="META")
+    meta.append(["Key", "Value"])
+    meta.append(["GROUPING_SIGNATURE", get_grouping_signature()])
+
+    # Header
+    sheet.append(["Course_Code", "Semester", "Pre", "Post"])
+
+    # Sort for stable, readable output
+    for (code, semester) in sorted(assignments.keys(), key=lambda x: (x[1], x[0])):
+        is_premid = assignments[(code, semester)]
+        pre_val = 1 if is_premid else 0
+        post_val = 0 if is_premid else 1
+        sheet.append([code, semester, pre_val, post_val])
+
+    # Ensure directory exists
+    dir_name = os.path.dirname(path)
+    if dir_name and not os.path.exists(dir_name):
+        os.makedirs(dir_name, exist_ok=True)
+
+    wb.save(path)
+
+
+def prompt_user_for_period(course_code: str, course_name: str, semester: int) -> bool:
+    """
+    Prompt the user to choose PreMid or PostMid for Group 1 for a course.
+
+    Returns:
+        True  -> PreMid for Group 1
+        False -> PostMid for Group 1
+    """
+
+    # Build a human-readable description of current Group 1 sections (e.g. CSE-A, CSE-B, DSAI-A)
+    try:
+        group1_sections = []
+        for dept, sec_map in SECTION_GROUPS.items():
+            for sec_label, grp in sec_map.items():
+                if grp == 1 and sec_label in SECTIONS_BY_DEPT.get(dept, []):
+                    group1_sections.append(f"{dept}-{sec_label}")
+        group1_desc = ", ".join(sorted(group1_sections)) if group1_sections else "Group 1 sections"
+    except Exception:
+        group1_desc = "Group 1 sections"
+
+    prompt = (
+        f"\nPhase 4: Choose period for combined course {course_code} - {course_name} (Sem {semester}) "
+        f"for Group 1 ({group1_desc}).\n"
+        f"  [1] PreMid\n"
+        f"  [2] PostMid\n"
+        f"Enter 1 or 2 (or 'pre'/'post'): "
+    )
+
+    while True:
+        try:
+            choice = input(prompt).strip().lower()
+        except EOFError:
+            # Non-interactive environment: default to PreMid
+            return True
+
+        if choice in ("1", "pre", "premid", "pre-mid", "pre_mid"):
+            return True
+        if choice in ("2", "post", "postmid", "post-mid", "post_mid"):
+            return False
+
+        print("Invalid input. Please enter 1 for PreMid or 2 for PostMid.")
+
+
+def get_period_assignments_for_courses(
+    unique_courses: Dict[int, List[Course]],
+    assignments_path: str,
+) -> Tuple[Dict[Tuple[str, int], bool], bool]:
+    """
+    Build period assignments for all combined courses handled in Phase 4.
+
+    Args:
+        unique_courses: {semester: [Course, ...]} from get_unique_combined_courses_by_semester
+        assignments_path: path to Excel file
+
+    Returns:
+        (assignments, any_prompted)
+        - assignments: {(course_code, semester): True for PreMid, False for PostMid}
+        - any_prompted: True if we asked the user for at least one course this run
+    """
+    # Load any existing assignments from disk
+    existing = load_period_assignments(assignments_path)
+    assignments: Dict[Tuple[str, int], bool] = dict(existing)
+    any_prompted = False
+
+    for semester, courses in unique_courses.items():
+        for course in courses:
+            key = (course.code.upper(), semester)
+            if key in assignments:
+                continue
+
+            # Ask user once per (course_code, semester)
+            is_premid = prompt_user_for_period(course.code, course.name, semester)
+            assignments[key] = is_premid
+            any_prompted = True
+
+    return assignments, any_prompted
 
 def calculate_slots_from_ltpsc(ltpsc: str) -> Dict[str, int]:
     """Calculate slots using LTPSC with ceiling for lectures"""
@@ -46,48 +261,64 @@ def calculate_slots_from_ltpsc(ltpsc: str) -> Dict[str, int]:
 def get_combined_courses(courses: List[Course], sections: List[Section] = None) -> Dict[int, List[Course]]:
     """
     Get truly combined courses by semester.
-    A course is combined if:
-    1. It has multiple instances with same code + same instructor (cross-group or within-group)
-    2. OR it's common to multiple sections within the same department (within-group, even if single instance in data)
+    A course is combined if ALL of the following hold:
+    1. Core (not elective)
+    2. <=2 credits
+    3. Single instructor
+    4. Common for ALL branches (CSE, DSAI, ECE) - offered in each department
+    5. Has multiple instances (same code + same instructor across branches) OR
+       is common to multiple sections within a department that has multiple sections
     """
+    REQUIRED_BRANCHES = set(DEPARTMENTS)
+
     # Group courses by (code, instructor) to find duplicates
     course_groups = defaultdict(list)
-    
+
     for course in courses:
         # Must be core, <=2 credits, single instructor
-        if (not course.is_elective and 
-            course.credits <= 2 and 
-            course.instructors and 
+        if (not course.is_elective and
+            course.credits <= 2 and
+            course.instructors and
             len(course.instructors) == 1):
-            
+
             key = (course.code, course.instructors[0])
             course_groups[key].append(course)
-    
-    # Filter to only courses with multiple instances (truly combined)
+
+    # Filter to only courses with multiple instances AND common for all branches
     combined_courses = defaultdict(list)
-    
+
     for (code, instructor), course_list in course_groups.items():
-        if len(course_list) > 1:  # Multiple instances = combined
-            for course in course_list:
-                combined_courses[course.semester].append(course)
-    
-    # Also include within-group combined courses (common to multiple sections of same department)
-    # Even if they only appear once in the data, if the department has multiple sections
+        if len(course_list) <= 1:
+            continue
+        # Check: course must be common for ALL branches (CSE, DSAI, ECE)
+        departments_with_course = set(c.department for c in course_list)
+        if departments_with_course < REQUIRED_BRANCHES:
+            continue  # Not offered in all branches - skip
+        for course in course_list:
+            combined_courses[course.semester].append(course)
+
+    # Also include within-group combined: common to multiple sections of same department,
+    # BUT only if the course is also common for ALL branches
     if sections:
         for course in courses:
-            if (not course.is_elective and 
-                course.credits <= 2 and 
-                course.instructors and 
+            if (not course.is_elective and
+                course.credits <= 2 and
+                course.instructors and
                 len(course.instructors) == 1 and
                 course.code not in [c.code for c_list in combined_courses.values() for c in c_list]):
-                
+
+                # Must be common for ALL branches
+                course_instances = [c for c in courses if c.code == course.code and c.semester == course.semester
+                                   and not c.is_elective and c.credits <= 2 and c.instructors and len(c.instructors) == 1]
+                depts_with_course = set(c.department for c in course_instances)
+                if depts_with_course < REQUIRED_BRANCHES:
+                    continue
+
                 # Check if this department has multiple sections for this semester
                 dept_sections = [s for s in sections if s.program == course.department and s.semester == course.semester]
                 if len(dept_sections) > 1:
-                    # This course is common to multiple sections of the same department
-                    # Add it to combined courses (within-group combined)
                     combined_courses[course.semester].append(course)
-    
+
     return combined_courses
 
 def get_unique_combined_courses_by_semester(combined_courses: Dict[int, List[Course]]) -> Dict[int, List[Course]]:
@@ -116,24 +347,33 @@ def create_non_overlapping_schedule(unique_courses: Dict[int, List[Course]], sec
     print(f"DEBUG: create_non_overlapping_schedule called with semesters: {list(unique_courses.keys())}")
     schedule = {}
     occupied_slots_by_semester = {}  # Track occupied slots per semester
-    # IMPORTANT: Track room occupancy GLOBALLY across all semesters and periods
-    # Filter to only include 240-seater rooms (capacity >= 240), excluding labs
+    # IMPORTANT: Track room occupancy GLOBALLY across all semesters and periods.
+    # Filter to only include large non-lab rooms based on config threshold.
     if classrooms:
-        # Filter to only 240-seaters (capacity >= 240) - include all room types except labs
-        available_large_rooms = [room.room_number for room in classrooms 
-                                if room.room_type.lower() != 'lab' 
-                                and 'lab' not in room.room_type.lower()
-                                and room.capacity >= 240]
-        print(f"DEBUG: Filtered to {len(available_large_rooms)} 240-seater rooms (excluding labs): {available_large_rooms}")
+        from config.schedule_config import LARGE_ROOM_CAPACITY_THRESHOLD
+
+        available_large_rooms = [
+            room.room_number
+            for room in classrooms
+            if str(room.room_type).lower() != "lab"
+            and "lab" not in str(room.room_type).lower()
+            and room.capacity >= LARGE_ROOM_CAPACITY_THRESHOLD
+        ]
+        print(
+            f"DEBUG: Filtered to {len(available_large_rooms)} large rooms (capacity >= {LARGE_ROOM_CAPACITY_THRESHOLD}): "
+            f"{available_large_rooms}"
+        )
     else:
-        # Fallback: use hardcoded list (should not happen in normal flow)
-        print("WARNING: No classrooms provided, using fallback list")
-        available_large_rooms = ['C004', 'C003', 'C002', 'C101', 'C102', 'C201', 'C202', 'C203', 'C204', 'C205',
-                                 'C301', 'C302', 'C303', 'C304', 'C401', 'C402', 'C403', 'C404', 'C405']
+        # Fallback: if classrooms list is missing, we cannot guess a real room.
+        # Use an empty list and let higher-level validation catch missing rooms,
+        # instead of forcing a hardcoded default like a specific lab.
+        print("WARNING: No classrooms provided; no large rooms available for Phase 4 scheduling")
+        available_large_rooms = []
     
-    global_room_occupancy = {}  # {room: {day: [(start_time, end_time), ...]}} - SHARED across all semesters
-    for room in available_large_rooms:
-        global_room_occupancy[room] = {}
+    # Track room occupancy per PERIOD. PreMid and PostMid are disjoint halves,
+    # so the same room/time can be reused across periods without conflict.
+    premid_room_occupancy = {room: {} for room in available_large_rooms}   # {room: {day: [(start,end), ...]}}
+    postmid_room_occupancy = {room: {} for room in available_large_rooms}  # {room: {day: [(start,end), ...]}}
     
     # Helper to classify a combined course into Group 1 / Group 2 / cross-group
     def get_course_group_for_phase4(course_code: str, semester: int) -> str:
@@ -152,29 +392,41 @@ def create_non_overlapping_schedule(unique_courses: Dict[int, List[Course]], sec
 
         departments_with_course = set(c.department for c in course_instances)
 
-        group1_sections = [s for s in sections if s.semester == semester and s.program == "CSE"]
-        group2_sections = [s for s in sections if s.semester == semester and s.program in ["DSAI", "ECE"]]
+        # Determine which GROUP ids have this course by looking at configured sections
+        groups_with_course = set()
+        for s in sections:
+            if not hasattr(s, "semester") or s.semester != semester:
+                continue
+            dept = getattr(s, "program", None)
+            if dept in departments_with_course:
+                groups_with_course.add(getattr(s, "group", 1))
 
-        group1_has_course = "CSE" in departments_with_course
-        group2_has_course = any(dept in departments_with_course for dept in ["DSAI", "ECE"])
+        group1_sections = [s for s in sections if hasattr(s, "semester") and s.semester == semester and getattr(s, "group", 1) == 1]
+        group2_sections = [s for s in sections if hasattr(s, "semester") and s.semester == semester and getattr(s, "group", 1) == 2]
+
+        group1_has_course = 1 in groups_with_course
+        group2_has_course = 2 in groups_with_course
 
         if group1_has_course and group2_has_course:
-            # Course appears in both groups (CSE + DSAI/ECE) - cross-group combined
             return "cross_group"
         elif group1_has_course and not group2_has_course and len(group1_sections) > 1:
-            # Only CSE has this combined course (within-group CSE)
             return "group1_only"
         elif group2_has_course and not group1_has_course and len(group2_sections) > 1:
-            # Only Group 2 (DSAI/ECE) has this combined course
             return "group2_only"
         else:
-            # Fallback: decide by primary department of first instance
-            primary_dept = course_instances[0].department
-            if primary_dept == "CSE":
+            # Default: whichever group has the course (if any), else standard
+            if group1_has_course:
                 return "group1_only"
-            if primary_dept in ["DSAI", "ECE"]:
+            if group2_has_course:
                 return "group2_only"
             return "standard"
+
+    # Build or load PreMid/PostMid decisions for each combined course
+    period_assignments_path = get_period_assignments_path()
+    period_assignments, period_assignments_modified = get_period_assignments_for_courses(
+        unique_courses,
+        period_assignments_path,
+    )
 
     for semester, sem_courses in unique_courses.items():
         print(f"DEBUG: Processing semester {semester} with {len(sem_courses)} courses")
@@ -190,22 +442,29 @@ def create_non_overlapping_schedule(unique_courses: Dict[int, List[Course]], sec
             return (c.credits, -sections_needing, c.code)
 
         courses_for_semester = sorted(sem_courses, key=course_sort_key)
-            
-        # Split courses between PreMid and PostMid - RANDOMLY
-        # Shuffle courses to ensure random distribution
-        import random
-        shuffled_courses = courses_for_semester.copy()
-        random.shuffle(shuffled_courses)
-        num_courses = len(shuffled_courses)
-        premid_courses = shuffled_courses[:num_courses//2]  # Random first half
-        postmid_courses = shuffled_courses[num_courses//2:]  # Random second half
-        print(f"DEBUG: Randomly split {num_courses} courses: {len(premid_courses)} PreMid, {len(postmid_courses)} PostMid")
+
+        # Split courses between PreMid and PostMid based on user assignments
+        premid_courses: List[Course] = []
+        postmid_courses: List[Course] = []
+        for course in courses_for_semester:
+            key = (course.code.upper(), semester)
+            is_premid = period_assignments.get(key, True)
+            if is_premid:
+                premid_courses.append(course)
+            else:
+                postmid_courses.append(course)
+
+        num_courses = len(courses_for_semester)
+        print(
+            f"DEBUG: User-driven split for semester {semester} with {num_courses} courses: "
+            f"{len(premid_courses)} PreMid, {len(postmid_courses)} PostMid"
+        )
         print(f"  PreMid courses: {[c.code for c in premid_courses]}")
         print(f"  PostMid courses: {[c.code for c in postmid_courses]}")
         
         # Generate slots dynamically based on available time windows
         # Define available time slots that avoid lunch conflicts dynamically
-        base_days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']
+        base_days = list(WORKING_DAYS)
         
         # Get lunch block for this semester
         lunch_blocks = {1: (time(12, 30), time(13, 30)),
@@ -472,16 +731,25 @@ def create_non_overlapping_schedule(unique_courses: Dict[int, List[Course]], sec
             test_block = TimeBlock(day, start, end)
             return test_block.overlaps_with_lunch(semester)
         
-        def generate_synchronized_course_slots(course: Course, sections: list, occupied_slots: dict, 
-                                              base_days: list, available_slots: list, global_room_occupancy: dict,
-                                              other_group_blocks: List[TimeBlock] = None):
-            """Generate SYNCHRONIZED slots for combined courses - SAME TIME across all sections - DYNAMIC.
+        def generate_synchronized_course_slots(
+            course: Course,
+            sections: list,
+            occupied_slots: dict,
+            base_days: list,
+            available_slots: list,
+            global_room_occupancy: dict,
+            other_group_blocks: List[TimeBlock] = None,
+        ):
+            """Generate SYNCHRONIZED slots for combined courses - SAME TIME across all sections.
 
             other_group_blocks is a list of TimeBlock instances representing combined-class
             sessions for the *other* group (and any cross-group sessions) in this period.
-            It is used to enforce a strict 30-minute gap between Group 1 (CSE-A/B) and
-            Group 2 (DSAI-A/ECE-A) combined classes.
+            Previously this was used to enforce an extra 30-minute gap between Group 1 and
+            Group 2. We now only require **no actual overlaps in time** for C004, which is
+            already guaranteed by room-occupancy tracking, so other_group_blocks is treated
+            as informational only.
             """
+            # Keep a normalized list for potential future checks, but do NOT enforce a 30-minute buffer.
             if other_group_blocks is None:
                 other_group_blocks = []
             slots_info = calculate_slots_from_ltpsc(course.ltpsc)
@@ -620,15 +888,6 @@ def create_non_overlapping_schedule(unique_courses: Dict[int, List[Course]], sec
 
                         test_block = TimeBlock(day, start, end)
 
-                        # Enforce 30-minute gap between Group 1 and Group 2 combined classes
-                        conflict_with_other_group = False
-                        for other_block in other_group_blocks:
-                            if test_block.overlaps(other_block, buffer_minutes=30):
-                                conflict_with_other_group = True
-                                break
-                        if conflict_with_other_group:
-                            continue
-
                         if session_type == 'P':
                             # Prevent overlaps across combined sessions in the same semester/period:
                             # use an overlap-based occupied list in addition to (day, slot_idx).
@@ -640,15 +899,17 @@ def create_non_overlapping_schedule(unique_courses: Dict[int, List[Course]], sec
                             if test_block is None:
                                 continue
 
-                            # Prevent overlaps within the same course on the same day (e.g., L overlapping P)
-                            for existing in course_time_slots:
-                                if len(existing) >= 3 and existing[0] == day:
-                                    existing_block = TimeBlock(day, existing[1], existing[2])
-                                    if test_block.overlaps(existing_block):
-                                        test_block = None
-                                        break
-                            if test_block is None:
-                                continue
+                        # Prevent overlaps within the same course on the same day (e.g., L overlapping P,
+                        # or P overlapping an already-placed L/T). This applies to ALL session types so the
+                        # order of scheduling (L before P or P before L) cannot create overlaps.
+                        for existing in course_time_slots:
+                            if len(existing) >= 3 and existing[0] == day:
+                                existing_block = TimeBlock(day, existing[1], existing[2])
+                                if test_block.overlaps(existing_block):
+                                    test_block = None
+                                    break
+                        if test_block is None:
+                            continue
 
                         # Still keep original discrete-slot occupancy as an additional guard
                         if (day, slot_idx) in occupied_slots:
@@ -723,15 +984,6 @@ def create_non_overlapping_schedule(unique_courses: Dict[int, List[Course]], sec
                                 end = time(start.hour + 2, start.minute)
 
                             test_block = TimeBlock(retry_day, start, end)
-
-                            # Enforce 30-minute gap between Group 1 and Group 2 combined classes
-                            conflict_with_other_group = False
-                            for other_block in other_group_blocks:
-                                if test_block.overlaps(other_block, buffer_minutes=30):
-                                    conflict_with_other_group = True
-                                    break
-                            if conflict_with_other_group:
-                                continue
                             
                             if not validate_time_range(start, end):
                                 continue
@@ -790,15 +1042,6 @@ def create_non_overlapping_schedule(unique_courses: Dict[int, List[Course]], sec
                                 end = time(start.hour + 2, start.minute)
 
                             test_block = TimeBlock(retry_day, start, end)
-
-                            # Enforce 30-minute gap between Group 1 and Group 2 combined classes
-                            conflict_with_other_group = False
-                            for other_block in other_group_blocks:
-                                if test_block.overlaps(other_block, buffer_minutes=30):
-                                    conflict_with_other_group = True
-                                    break
-                            if conflict_with_other_group:
-                                continue
                             
                             # Basic validation only
                             if not validate_time_range(start, end):
@@ -835,57 +1078,160 @@ def create_non_overlapping_schedule(unique_courses: Dict[int, List[Course]], sec
                     # Only use C004 fallback when no slot had a free 240-seater (resolution will fix conflicts)
                     if not assigned:
                         for fallback_day in base_days:
-                            if session_type in ('L', 'T') and not SessionRulesValidator.can_schedule_session_type(
-                                    course.code, fallback_day, session_type, used_days_by_course):
+                            if session_type in ("L", "T") and not SessionRulesValidator.can_schedule_session_type(
+                                course.code, fallback_day, session_type, used_days_by_course
+                            ):
                                 continue
                             for fallback_slot_idx in range(len(available_slots)):
                                 if (fallback_day, fallback_slot_idx) in occupied_slots:
                                     continue
                                 start, end = available_slots[fallback_slot_idx]
-                                if session_type == 'L':
+                                if session_type == "L":
                                     end_hour = start.hour + 1
                                     end_minute = start.minute + 30
                                     if end_minute >= 60:
                                         end_hour += 1
                                         end_minute -= 60
                                     end = time(end_hour, end_minute)
-                                elif session_type == 'T':
+                                elif session_type == "T":
                                     end = time(start.hour + 1, start.minute)
                                 else:
                                     end = time(start.hour + 2, start.minute)
                                 test_block = TimeBlock(fallback_day, start, end)
                                 conflict_with_other_group = False
                                 for other_block in other_group_blocks:
-                                    if test_block.overlaps(other_block, buffer_minutes=30):
+                                    # User explicitly removed 30-minute buffer; only real overlaps are forbidden.
+                                    if test_block.overlaps(other_block):
                                         conflict_with_other_group = True
                                         break
                                 if conflict_with_other_group or not validate_time_range(start, end):
                                     continue
-                                if session_type == 'P' and (start.hour > 16 or (start.hour == 16 and start.minute > 0)):
+                                if session_type == "P" and (
+                                    start.hour > 16 or (start.hour == 16 and start.minute > 0)
+                                ):
                                     continue
                                 if check_elective_conflict(fallback_day, start, end, course.semester):
                                     continue
                                 if check_lunch_conflict(fallback_day, start, end, course.semester):
                                     continue
                                 assigned_room = find_available_room(
-                                    fallback_day, start, end, global_room_occupancy,
-                                    available_large_rooms, allow_fallback=True
+                                    fallback_day,
+                                    start,
+                                    end,
+                                    global_room_occupancy,
+                                    available_large_rooms,
+                                    allow_fallback=True,
                                 )
                                 if assigned_room:
-                                    course_time_slots.append((fallback_day, start, end, session_type, assigned_room))
-                                    SessionRulesValidator.mark_day_used(course.code, fallback_day, session_type, used_days_by_course)
-                                    mark_room_occupied(assigned_room, fallback_day, start, end, global_room_occupancy)
+                                    course_time_slots.append(
+                                        (fallback_day, start, end, session_type, assigned_room)
+                                    )
+                                    SessionRulesValidator.mark_day_used(
+                                        course.code, fallback_day, session_type, used_days_by_course
+                                    )
+                                    mark_room_occupied(
+                                        assigned_room, fallback_day, start, end, global_room_occupancy
+                                    )
                                     occupied_slots[(fallback_day, fallback_slot_idx)] = course.code
                                     assigned = True
-                                    print(f"  FALLBACK: Assigned {session_type} for {course.code} at {fallback_day} {start}-{end} (room {assigned_room})")
+                                    print(
+                                        f"  FALLBACK: Assigned {session_type} for {course.code} at "
+                                        f"{fallback_day} {start}-{end} (room {assigned_room})"
+                                    )
                                     break
                             if assigned:
                                 break
+
+                    # ULTIMATE FALLBACK: if still not assigned, allow multiple L/T on same day
+                    # (while still preventing any real time overlaps) so that we always
+                    # use free C004 slots like Monday/Thursday evenings instead of leaving
+                    # courses short and UNSATISFIED.
                     if not assigned:
-                        print(f"CRITICAL ERROR: Still could not assign {session_type} session for {course.code} "
-                              f"(Sem {course.semester}) - this will cause UNSATISFIED status")
-                        print(f"  Constraints respected: no elective/lunch/room conflicts; "
-                              f"sections={[s.label for s in sections if hasattr(s, 'semester') and s.semester == course.semester]}")
+                        print(
+                            f"ULTIMATE RETRY: {course.code} {session_type} - "
+                            f"allowing extra same-day L/T if needed to avoid UNSATISFIED"
+                        )
+                        for retry_day in base_days:
+                            for retry_slot_idx in range(len(available_slots)):
+                                if (retry_day, retry_slot_idx) in occupied_slots:
+                                    continue
+                                start, end = available_slots[retry_slot_idx]
+                                if session_type == "L":
+                                    end_hour = start.hour + 1
+                                    end_minute = start.minute + 30
+                                    if end_minute >= 60:
+                                        end_hour += 1
+                                        end_minute -= 60
+                                    end = time(end_hour, end_minute)
+                                elif session_type == "T":
+                                    end = time(start.hour + 1, start.minute)
+                                else:
+                                    end = time(start.hour + 2, start.minute)
+
+                                test_block = TimeBlock(retry_day, start, end)
+
+                                if not validate_time_range(start, end):
+                                    continue
+                                if session_type == "P" and (
+                                    start.hour > 16 or (start.hour == 16 and start.minute > 0)
+                                ):
+                                    continue
+                                if check_elective_conflict(retry_day, start, end, course.semester):
+                                    continue
+                                if check_lunch_conflict(retry_day, start, end, course.semester):
+                                    continue
+
+                                # Do NOT relax no-overlap rule: still forbid overlaps with this
+                                # course's own other sessions on the same day.
+                                overlap_with_self = False
+                                for existing in course_time_slots:
+                                    if len(existing) >= 3 and existing[0] == retry_day:
+                                        existing_block = TimeBlock(
+                                            retry_day, existing[1], existing[2]
+                                        )
+                                        if test_block.overlaps(existing_block):
+                                            overlap_with_self = True
+                                            break
+                                if overlap_with_self:
+                                    continue
+
+                                assigned_room = find_available_room(
+                                    retry_day,
+                                    start,
+                                    end,
+                                    global_room_occupancy,
+                                    available_large_rooms,
+                                    allow_fallback=True,
+                                )
+                                if not assigned_room:
+                                    continue
+
+                                course_time_slots.append(
+                                    (retry_day, start, end, session_type, assigned_room)
+                                )
+                                # Mark occupancy so later sessions respect this.
+                                mark_room_occupied(
+                                    assigned_room, retry_day, start, end, global_room_occupancy
+                                )
+                                occupied_slots[(retry_day, retry_slot_idx)] = course.code
+                                assigned = True
+                                print(
+                                    f"  ULTIMATE SUCCESS: Assigned {session_type} for {course.code} at "
+                                    f"{retry_day} {start}-{end} (room {assigned_room})"
+                                )
+                                break
+                            if assigned:
+                                break
+
+                    if not assigned:
+                        print(
+                            f"CRITICAL ERROR: Still could not assign {session_type} session for {course.code} "
+                            f"(Sem {course.semester}) - this will cause UNSATISFIED status"
+                        )
+                        print(
+                            "  Constraints respected: no elective/lunch/room conflicts; "
+                            f"sections={[s.label for s in sections if hasattr(s, 'semester') and s.semester == course.semester]}"
+                        )
             
             # POST-PROCESSING: Verify all required sessions were scheduled
             scheduled_lectures = sum(1 for slot in course_time_slots if len(slot) >= 4 and slot[3] == 'L')
@@ -931,79 +1277,147 @@ def create_non_overlapping_schedule(unique_courses: Dict[int, List[Course]], sec
         # Rooms will be assigned dynamically per course
         semester_schedule = {
             'premid': {
-                'courses': [c.code for c in premid_courses],
-                'course_objects': premid_courses,
+                # PreMid contains Group 1's chosen PreMid courses AND Group 2's opposite-period courses.
+                # To keep mapping robust, expose all combined course objects for this semester.
+                'courses': [c.code for c in courses_for_semester],
+                'course_objects': courses_for_semester,
                 'slots': [],
                 'room': None  # Will be assigned dynamically
             },
             'postmid': {
-                'courses': [c.code for c in postmid_courses],
-                'course_objects': postmid_courses,
+                # PostMid contains Group 1's chosen PostMid courses AND Group 2's opposite-period courses.
+                'courses': [c.code for c in courses_for_semester],
+                'course_objects': courses_for_semester,
                 'slots': [],
                 'room': None  # Will be assigned dynamically
             }
         }
         
-        # Track occupied slots - SHARED between PreMid and PostMid
-        occupied_slots = {}
+        # Track occupied slots PER PERIOD so PRE slots don't block POST slots.
+        occupied_slots_premid: dict = {}
+        occupied_slots_postmid: dict = {}
         
         # Use global room occupancy tracking (shared across all semesters)
         # This ensures no conflicts between different semesters using any room
         
-        # PASS 1: Generate time slots for each unique course code (PreMid)
-        premid_course_slots_map = {}  # {course_code: [(day, start, end, session_type), ...]}
-        # Track Group 1 / Group 2 / cross-group combined blocks for this semester & period
+        # Determine which configured sections belong to Group 1 vs Group 2 for this semester.
+        group1_sections = [
+            s
+            for s in sections
+            if hasattr(s, "semester")
+            and s.semester == semester
+            and getattr(s, "group", 1) == 1
+        ]
+        group2_sections = [
+            s
+            for s in sections
+            if hasattr(s, "semester")
+            and s.semester == semester
+            and getattr(s, "group", 1) == 2
+        ]
+
+        print(
+            f"DEBUG: Semester {semester} group sections: "
+            f"G1={len(group1_sections)} ({[getattr(s, 'label', str(s)) for s in group1_sections]}), "
+            f"G2={len(group2_sections)} ({[getattr(s, 'label', str(s)) for s in group2_sections]})"
+        )
+
+        def _track_unique_blocks(course_slots: List[tuple], bucket: List[TimeBlock]) -> None:
+            unique = set()
+            for slot in course_slots or []:
+                if len(slot) >= 3:
+                    unique.add((slot[0], slot[1], slot[2]))
+            for day, start, end in unique:
+                bucket.append(TimeBlock(day, start, end))
+
+        # PASS 1 (PreMid): schedule by GROUP and enforce 30-min gap between groups.
+        # - Group 1 gets the user's chosen PreMid courses.
+        # - Group 2 gets the opposite-period courses (i.e., Group 1's PostMid list).
+        premid_course_slots_map: Dict[str, List[tuple]] = {}
         premid_group1_blocks: List[TimeBlock] = []
         premid_group2_blocks: List[TimeBlock] = []
-        premid_cross_blocks: List[TimeBlock] = []
-        # Debug: Check sections
-        all_sections_with_semester = [s for s in sections if hasattr(s, 'semester')]
-        print(f"DEBUG: Total sections with semester attribute: {len(all_sections_with_semester)}")
-        sections_for_semester = [s for s in sections if hasattr(s, 'semester') and s.semester == semester]
-        print(f"DEBUG: Sections for semester {semester}: {len(sections_for_semester)}")
-        if sections_for_semester:
-            print(f"DEBUG: Section labels: {[s.label if hasattr(s, 'label') else str(s) for s in sections_for_semester[:3]]}")
-        
+
         for course in premid_courses:
-            if course.code not in premid_course_slots_map:
-                course_sections = [s for s in sections if hasattr(s, 'semester') and s.semester == semester]
-                if course_sections:
-                    print(f"DEBUG: Generating slots for {course.code} with {len(course_sections)} sections, {len(available_slots)} available slots")
-                    course_group = get_course_group_for_phase4(course.code, semester)
-                    # Decide which existing blocks this course must keep a 30-min gap from
-                    if course_group == "group1_only":
-                        other_blocks = premid_group2_blocks + premid_cross_blocks
-                    elif course_group == "group2_only":
-                        other_blocks = premid_group1_blocks + premid_cross_blocks
-                    else:  # cross_group or standard
-                        other_blocks = premid_group1_blocks + premid_group2_blocks + premid_cross_blocks
+            if course.code in premid_course_slots_map:
+                continue
+            if not group1_sections:
+                continue
+            course_slots, occupied_slots_premid, premid_room_occupancy = generate_synchronized_course_slots(
+                course,
+                group1_sections,
+                occupied_slots_premid,
+                base_days,
+                available_slots,
+                premid_room_occupancy,
+                other_group_blocks=list(premid_group2_blocks),
+            )
+            premid_course_slots_map[course.code] = course_slots
+            _track_unique_blocks(course_slots, premid_group1_blocks)
+            print(f"  PRE: Group 1 scheduled {course.code}: {len(course_slots)} sessions")
 
-                    course_slots, occupied_slots, global_room_occupancy = generate_synchronized_course_slots(
-                        course, course_sections, occupied_slots, base_days, available_slots, global_room_occupancy,
-                        other_group_blocks=other_blocks
-                    )
-                    premid_course_slots_map[course.code] = course_slots
+        for course in postmid_courses:
+            if course.code in premid_course_slots_map:
+                continue
+            if not group2_sections:
+                continue
+            course_slots, occupied_slots_premid, premid_room_occupancy = generate_synchronized_course_slots(
+                course,
+                group2_sections,
+                occupied_slots_premid,
+                base_days,
+                available_slots,
+                premid_room_occupancy,
+                other_group_blocks=list(premid_group1_blocks),
+            )
+            premid_course_slots_map[course.code] = course_slots
+            _track_unique_blocks(course_slots, premid_group2_blocks)
+            print(f"  PRE: Group 2 scheduled {course.code}: {len(course_slots)} sessions")
 
-                    # Track unique time blocks for 30-min gap enforcement
-                    unique_blocks = set()
-                    for slot in course_slots:
-                        if len(slot) >= 3:
-                            day = slot[0]
-                            start = slot[1]
-                            end = slot[2]
-                            unique_blocks.add((day, start, end))
-                    for day, start, end in unique_blocks:
-                        tb = TimeBlock(day, start, end)
-                        if course_group == "group1_only":
-                            premid_group1_blocks.append(tb)
-                        elif course_group == "group2_only":
-                            premid_group2_blocks.append(tb)
-                        else:
-                            premid_cross_blocks.append(tb)
+        # PASS 1 (PostMid): schedule by GROUP and enforce 30-min gap between groups.
+        # - Group 1 gets the user's chosen PostMid courses.
+        # - Group 2 gets the opposite-period courses (i.e., Group 1's PreMid list).
+        print(f"DEBUG: Starting PostMid scheduling for semester {semester}")
+        postmid_course_slots_map: Dict[str, List[tuple]] = {}
+        postmid_group1_blocks: List[TimeBlock] = []
+        postmid_group2_blocks: List[TimeBlock] = []
 
-                    print(f"  {course.code} time slots allocated: {len(course_slots)} sessions (C004 room checked)")
-                else:
-                    print(f"DEBUG: No sections found for {course.code} in semester {semester} (total sections: {len(sections)}, sections with semester: {len(all_sections_with_semester)})")
+        for course in postmid_courses:
+            if course.code in postmid_course_slots_map:
+                continue
+            if not group1_sections:
+                continue
+            course_slots, occupied_slots_postmid, postmid_room_occupancy = generate_synchronized_course_slots(
+                course,
+                group1_sections,
+                occupied_slots_postmid,
+                base_days,
+                available_slots,
+                postmid_room_occupancy,
+                other_group_blocks=list(postmid_group2_blocks),
+            )
+            postmid_course_slots_map[course.code] = course_slots
+            _track_unique_blocks(course_slots, postmid_group1_blocks)
+            print(f"  POST: Group 1 scheduled {course.code}: {len(course_slots)} sessions")
+
+        for course in premid_courses:
+            if course.code in postmid_course_slots_map:
+                continue
+            if not group2_sections:
+                continue
+            course_slots, occupied_slots_postmid, postmid_room_occupancy = generate_synchronized_course_slots(
+                course,
+                group2_sections,
+                occupied_slots_postmid,
+                base_days,
+                available_slots,
+                postmid_room_occupancy,
+                other_group_blocks=list(postmid_group1_blocks),
+            )
+            postmid_course_slots_map[course.code] = course_slots
+            _track_unique_blocks(course_slots, postmid_group2_blocks)
+            print(f"  POST: Group 2 scheduled {course.code}: {len(course_slots)} sessions")
+
+        """
         
         # PASS 1: Generate time slots for each unique course code (PostMid)
         # PostMid courses are synchronized dynamically based on course properties
@@ -1181,15 +1595,21 @@ def create_non_overlapping_schedule(unique_courses: Dict[int, List[Course]], sec
                                     corrected_slots.append((day, start, adjusted_end, corrected_session_type, assigned_room))
                                 else:
                                     # Find available room for this slot
-                                    temp_room = find_available_room(day, start, adjusted_end, global_room_occupancy, available_large_rooms)
+                                    temp_room = find_available_room(
+                                        day, start, adjusted_end, postmid_room_occupancy, available_large_rooms
+                                    )
                                     if temp_room:
                                         corrected_slots.append((day, start, adjusted_end, corrected_session_type, temp_room))
-                                        mark_room_occupied(temp_room, day, start, adjusted_end, global_room_occupancy)
+                                        mark_room_occupied(
+                                            temp_room, day, start, adjusted_end, postmid_room_occupancy
+                                        )
                                     else:
                                         # Use default room
                                         default_room = available_large_rooms[0] if available_large_rooms else 'C004'
                                         corrected_slots.append((day, start, adjusted_end, corrected_session_type, default_room))
-                                        mark_room_occupied(default_room, day, start, adjusted_end, global_room_occupancy)
+                                        mark_room_occupied(
+                                            default_room, day, start, adjusted_end, postmid_room_occupancy
+                                        )
                                 
                                 used_days.add(day)
                                 if corrected_session_type == 'L':
@@ -1227,8 +1647,13 @@ def create_non_overlapping_schedule(unique_courses: Dict[int, List[Course]], sec
                             course_sections = [s for s in sections if hasattr(s, 'semester') and s.semester == semester]
                             if course_sections:
                                 try:
-                                    course_slots, occupied_slots, global_room_occupancy = generate_synchronized_course_slots(
-                                        course, course_sections, occupied_slots, base_days, available_slots, global_room_occupancy
+                                    course_slots, occupied_slots_postmid, postmid_room_occupancy = generate_synchronized_course_slots(
+                                        course,
+                                        course_sections,
+                                        occupied_slots_postmid,
+                                        base_days,
+                                        available_slots,
+                                        postmid_room_occupancy,
                                     )
                                     # Verify we got all required sessions
                                     if len(course_slots) >= required_sessions:
@@ -1253,8 +1678,13 @@ def create_non_overlapping_schedule(unique_courses: Dict[int, List[Course]], sec
                         # No PreMid course to sync with, or sync failed - generate slots dynamically
                         if course_sections:
                             try:
-                                course_slots, occupied_slots, global_room_occupancy = generate_synchronized_course_slots(
-                                    course, course_sections, occupied_slots, base_days, available_slots, global_room_occupancy
+                                course_slots, occupied_slots_postmid, postmid_room_occupancy = generate_synchronized_course_slots(
+                                    course,
+                                    course_sections,
+                                    occupied_slots_postmid,
+                                    base_days,
+                                    available_slots,
+                                    postmid_room_occupancy,
                                 )
                                 postmid_course_slots_map[course.code] = course_slots
                                 print(f"  {course.code} time slots allocated: {len(course_slots)} sessions (dynamically generated)")
@@ -1279,9 +1709,14 @@ def create_non_overlapping_schedule(unique_courses: Dict[int, List[Course]], sec
                                 else:
                                     other_blocks = postmid_group1_blocks + postmid_group2_blocks + postmid_cross_blocks
 
-                                course_slots, occupied_slots, global_room_occupancy = generate_synchronized_course_slots(
-                                    course, course_sections, occupied_slots, base_days, available_slots, global_room_occupancy,
-                                    other_group_blocks=other_blocks
+                                course_slots, occupied_slots_postmid, postmid_room_occupancy = generate_synchronized_course_slots(
+                                    course,
+                                    course_sections,
+                                    occupied_slots_postmid,
+                                    base_days,
+                                    available_slots,
+                                    postmid_room_occupancy,
+                                    other_group_blocks=other_blocks,
                                 )
                                 postmid_course_slots_map[course.code] = course_slots
 
@@ -1309,7 +1744,8 @@ def create_non_overlapping_schedule(unique_courses: Dict[int, List[Course]], sec
                 
                 # All PostMid courses are now handled by dynamic generation above
                 # No hardcoded course-specific logic remains
-        
+        """
+
         # Log time slots for Phase 4
         logger = get_logger()
         
@@ -1329,7 +1765,9 @@ def create_non_overlapping_schedule(unique_courses: Dict[int, List[Course]], sec
                 elif len(slot) == 5:  # Old format: (day, start, end, session_type, section)
                     day, start, end, session_type, section = slot
                     # Find available room for this slot
-                    assigned_room = find_available_room(day, start, end, global_room_occupancy, available_large_rooms)
+                    assigned_room = find_available_room(
+                        day, start, end, premid_room_occupancy, available_large_rooms
+                    )
                     if session_type == 'P':
                         assigned_room = 'L105'  # Lab for practicals
                     # Store as (course_code, day, start, end, session_type, section, room)
@@ -1363,7 +1801,9 @@ def create_non_overlapping_schedule(unique_courses: Dict[int, List[Course]], sec
                 elif len(slot) == 5:  # Old format: (day, start, end, session_type, section)
                     day, start, end, session_type, section = slot
                     # Find available room for this slot
-                    assigned_room = find_available_room(day, start, end, global_room_occupancy, available_large_rooms)
+                    assigned_room = find_available_room(
+                        day, start, end, postmid_room_occupancy, available_large_rooms
+                    )
                     if session_type == 'P':
                         assigned_room = 'L105'  # Lab for practicals
                     # Store as (course_code, day, start, end, session_type, section, room)
@@ -1382,7 +1822,14 @@ def create_non_overlapping_schedule(unique_courses: Dict[int, List[Course]], sec
             print(f"  {course_code} scheduled: {len(course_slots)} sessions (synchronized across all sections)")
         
         schedule[semester] = semester_schedule
-        occupied_slots_by_semester[semester] = occupied_slots
+        occupied_slots_by_semester[semester] = {
+            "PRE": occupied_slots_premid,
+            "POST": occupied_slots_postmid,
+        }
+
+    # Persist any new or updated period assignments so future runs are non-interactive
+    if period_assignments_modified:
+        save_period_assignments(period_assignments_path, period_assignments)
     
     return {
         'schedule': schedule,

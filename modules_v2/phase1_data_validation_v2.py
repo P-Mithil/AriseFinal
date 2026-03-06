@@ -4,6 +4,7 @@ from typing import List, Dict, Tuple
 from collections import defaultdict
 
 from utils.data_models import Course, ClassRoom, Section, create_course_from_row, create_classroom_from_row
+from config.structure_config import DEPARTMENTS
 
 def read_course_data() -> List[Course]:
     """Read and parse course data from Excel file"""
@@ -55,7 +56,7 @@ def filter_courses(courses: List[Course]) -> List[Course]:
     
     for course in courses:
         # Only relevant departments (accept all semesters from data)
-        if course.department not in ['CSE', 'DSAI', 'ECE']:
+        if course.department not in DEPARTMENTS:
             continue
             
         filtered.append(course)

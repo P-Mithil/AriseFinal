@@ -1,6 +1,10 @@
 """
 Phase 7: Remaining ≤2 Credit Courses Scheduling
-Handles within-group combined and non-combined courses
+Handles courses that are not scheduled in Phase 4 (combined) but still need
+half-semester (PreMid/PostMid) placement.
+
+This version makes period (PreMid/PostMid) selection user-driven on a
+per-course-per-section basis, persisted to an Excel file, similar to Phase 4.
 """
 
 import os
@@ -10,6 +14,8 @@ from datetime import time, datetime, timedelta
 from typing import List, Dict, Tuple
 from collections import defaultdict
 
+import openpyxl
+
 # Add the current directory to Python path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -17,6 +23,7 @@ from utils.data_models import Course, Section, TimeBlock, ClassRoom, ScheduledSe
 from utils.time_slot_logger import get_logger
 from utils.session_rules_validator import SessionRulesValidator
 from utils.time_validator import validate_time_range
+from config.schedule_config import WORKING_DAYS, LUNCH_WINDOWS, DAY_START_TIME, DAY_END_TIME
 
 def calculate_slots_from_ltpsc(ltpsc: str) -> Dict[str, int]:
     """Calculate slots using LTPSC with ceiling for lectures"""
@@ -42,28 +49,322 @@ def calculate_slots_from_ltpsc(ltpsc: str) -> Dict[str, int]:
     except:
         return {'lectures': 2, 'tutorials': 1, 'practicals': 0, 'total': 3}
 
+
+def get_phase7_period_assignments_path() -> str:
+    """
+    Return absolute path for Phase 7 period assignment Excel file.
+
+    File: DATA/INPUT/phase7_period_assignments.xlsx
+    """
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base_dir, "DATA", "INPUT", "phase7_period_assignments.xlsx")
+
+
+def load_phase7_period_assignments(path: str) -> Dict[Tuple[str, int, str], bool]:
+    """
+    Load per-course, per-section period assignments from Excel.
+
+    Returns:
+        {(course_code, semester, section_label): True for PreMid, False for PostMid}
+    """
+    assignments: Dict[Tuple[str, int, str], bool] = {}
+
+    if not os.path.exists(path):
+        return assignments
+
+    try:
+        wb = openpyxl.load_workbook(path)
+        sheet = wb.active
+    except Exception:
+        # Corrupt or unreadable file – ignore and start fresh
+        return assignments
+
+    # Invalidate old assignments if the section grouping changed
+    try:
+        from config.structure_config import get_grouping_signature
+        expected_sig = get_grouping_signature()
+        meta = wb["META"] if "META" in wb.sheetnames else None
+        if meta is None:
+            return {}  # legacy -> re-ask
+        stored_sig = None
+        for row in meta.iter_rows(min_row=1, max_row=100):
+            k = row[0].value
+            v = row[1].value if len(row) > 1 else None
+            if str(k).strip().upper() == "GROUPING_SIGNATURE":
+                stored_sig = str(v) if v is not None else ""
+                break
+        if not stored_sig or stored_sig != expected_sig:
+            return {}
+    except Exception:
+        return {}
+
+    # Expect header: Course_Code | Semester | Section | Pre | Post
+    header_row = next(sheet.iter_rows(min_row=1, max_row=1), None)
+    if not header_row:
+        return assignments
+
+    header = [
+        str(cell.value).strip() if cell.value is not None else ""
+        for cell in header_row
+    ]
+    name_to_idx = {name.upper(): idx for idx, name in enumerate(header)}
+
+    def _get_col(name: str) -> int:
+        return name_to_idx.get(name.upper(), -1)
+
+    col_code = _get_col("COURSE_CODE")
+    col_sem = _get_col("SEMESTER")
+    col_section = _get_col("SECTION")
+    col_pre = _get_col("PRE")
+    col_post = _get_col("POST")
+
+    if min(col_code, col_sem, col_section, col_pre, col_post) < 0:
+        return assignments
+
+    for row in sheet.iter_rows(min_row=2):
+        code_cell = row[col_code].value
+        sem_cell = row[col_sem].value
+        section_cell = row[col_section].value
+        pre_cell = row[col_pre].value
+        post_cell = row[col_post].value
+
+        if not code_cell or sem_cell is None or not section_cell:
+            continue
+
+        try:
+            code = str(code_cell).strip().upper()
+            semester = int(sem_cell)
+            section_label = str(section_cell).strip()
+        except (TypeError, ValueError):
+            continue
+
+        pre_val = int(pre_cell) if pre_cell is not None else 0
+        post_val = int(post_cell) if post_cell is not None else 0
+
+        if pre_val == 1 and post_val == 0:
+            assignments[(code, semester, section_label)] = True
+        elif pre_val == 0 and post_val == 1:
+            assignments[(code, semester, section_label)] = False
+        else:
+            # Invalid or ambiguous row – ignore; it will be re-asked
+            continue
+
+    return assignments
+
+
+def save_phase7_period_assignments(
+    path: str,
+    assignments: Dict[Tuple[str, int, str], bool],
+) -> None:
+    """
+    Persist Phase 7 period assignments to Excel.
+
+    Each row: Course_Code | Semester | Section | Pre | Post
+    """
+    wb = openpyxl.Workbook()
+    sheet = wb.active
+    sheet.title = "Phase7Periods"
+
+    # META sheet to track grouping signature (invalidate on group change)
+    try:
+        from config.structure_config import get_grouping_signature
+        meta = wb.create_sheet(title="META")
+        meta.append(["Key", "Value"])
+        meta.append(["GROUPING_SIGNATURE", get_grouping_signature()])
+    except Exception:
+        pass
+
+    sheet.append(["Course_Code", "Semester", "Section", "Pre", "Post"])
+
+    for (code, semester, section_label) in sorted(
+        assignments.keys(), key=lambda x: (x[1], x[0], x[2])
+    ):
+        is_premid = assignments[(code, semester, section_label)]
+        pre_val = 1 if is_premid else 0
+        post_val = 0 if is_premid else 1
+        sheet.append([code, semester, section_label, pre_val, post_val])
+
+    dir_name = os.path.dirname(path)
+    if dir_name and not os.path.exists(dir_name):
+        os.makedirs(dir_name, exist_ok=True)
+
+    wb.save(path)
+
+
+def _normalize_period(raw: object) -> str:
+    """Normalize period values to 'PRE' or 'POST'."""
+    if raw is None:
+        return "PRE"
+    val = str(raw).strip().upper()
+    if val in ("PRE", "PREMID"):
+        return "PRE"
+    if val in ("POST", "POSTMID"):
+        return "POST"
+    return val or "PRE"
+
+
+def add_session_to_occupied_slots(
+    session: object,
+    occupied_slots: Dict[str, List[Tuple[TimeBlock, str]]],
+) -> None:
+    """
+    Add a session (dict or ScheduledSession) into occupied_slots with
+    normalized section and period keys.
+
+    Key format: f"{section_label}_{period}", where period is 'PRE' or 'POST'.
+    """
+    if session is None:
+        return
+
+    # Dict format – used by Phase 4 combined sessions and some helpers
+    if isinstance(session, dict):
+        course_code = session.get("course_code", "")
+        block = session.get("time_block") or session.get("block")
+        if not isinstance(block, TimeBlock):
+            return
+
+        period = _normalize_period(session.get("period", "PRE"))
+
+        sections = session.get("sections")
+        if not sections and "section" in session:
+            sections = [session.get("section")]
+        if not sections:
+            return
+
+        for sec in sections:
+            if not sec:
+                continue
+            section_key = f"{sec}_{period}"
+            occupied_slots.setdefault(section_key, []).append((block, str(course_code)))
+        return
+
+    # ScheduledSession-like object
+    if hasattr(session, "block") and hasattr(session, "section"):
+        block = getattr(session, "block")
+        if not isinstance(block, TimeBlock):
+            return
+        period_raw = getattr(session, "period", "PRE")
+        period = _normalize_period(period_raw)
+        section_label = str(getattr(session, "section", "")).strip()
+        if not section_label:
+            return
+        course_code = getattr(session, "course_code", "")
+        section_key = f"{section_label}_{period}"
+        occupied_slots.setdefault(section_key, []).append((block, str(course_code)))
+
+
+def prompt_user_for_phase7_period(
+    course: Course,
+    section_label: str,
+) -> bool:
+    """
+    Ask the user whether this course+section should be in PreMid or PostMid.
+
+    Returns:
+        True  -> PreMid
+        False -> PostMid
+    """
+    prompt = (
+        f"\nPhase 7: Choose period for {course.code} - {course.name} "
+        f"(Sem {course.semester}, section {section_label}).\n"
+        f"  [1] PreMid\n"
+        f"  [2] PostMid\n"
+        f"Enter 1 or 2 (or 'pre'/'post'): "
+    )
+
+    while True:
+        try:
+            choice = input(prompt).strip().lower()
+        except EOFError:
+            # Non-interactive env: default to PreMid
+            return True
+
+        if choice in ("1", "pre", "premid", "pre-mid", "pre_mid"):
+            return True
+        if choice in ("2", "post", "postmid", "post-mid", "post_mid"):
+            return False
+
+        print("Invalid input. Please enter 1 for PreMid or 2 for PostMid.")
+
+
+def get_phase7_period_assignments(
+    within_group: List[List[Course]],
+    non_combined: List[Course],
+    sections: List[Section],
+    assignments_path: str,
+) -> Tuple[Dict[Tuple[str, int, str], bool], bool]:
+    """
+    Build / update Phase 7 period assignments for all remaining ≤2 credit courses.
+
+    Returns:
+        (assignments, any_prompted)
+        - assignments: {(course_code, semester, section_label): True for PreMid, False for PostMid}
+        - any_prompted: True if at least one prompt was shown this run
+    """
+    existing = load_phase7_period_assignments(assignments_path)
+    assignments: Dict[Tuple[str, int, str], bool] = dict(existing)
+    any_prompted = False
+
+    # Helper to ensure a mapping for given course & section
+    def ensure_assignment(course: Course, section_label: str) -> None:
+        nonlocal any_prompted
+        key = (course.code.upper(), course.semester, section_label)
+        if key in assignments:
+            return
+        is_premid = prompt_user_for_phase7_period(course, section_label)
+        assignments[key] = is_premid
+        any_prompted = True
+
+    # Within-group: course is common within a department's multiple sections
+    seen_within: Dict[Tuple[str, int, str], Course] = {}
+    for group in within_group:
+        if not group:
+            continue
+        course = group[0]
+        key = (course.code.upper(), course.semester, course.department)
+        if key in seen_within:
+            continue
+        seen_within[key] = course
+
+        dept_sections = [
+            s for s in sections
+            if s.program == course.department and s.semester == course.semester
+        ]
+        for sec in dept_sections:
+            section_label = f"{sec.program}-{sec.name}-Sem{sec.semester}"
+            ensure_assignment(course, section_label)
+
+    # Non-combined: section-specific or only one section in that department
+    seen_non: Dict[Tuple[str, int], Course] = {}
+    for course in non_combined:
+        key = (course.code.upper(), course.semester)
+        if key in seen_non:
+            continue
+        seen_non[key] = course
+
+        # Phase 7 currently assumes A-section for departments with only one section
+        section_label = f"{course.department}-A-Sem{course.semester}"
+        ensure_assignment(course, section_label)
+
+    return assignments, any_prompted
 def get_phase4_course_codes(combined_sessions: List = None) -> List[str]:
-    """Get list of Phase 4 combined course codes"""
-    # Default hardcoded list - include CS161 to prevent duplicate scheduling
-    # CS261 is excluded from Phase 7 because it should be scheduled in Phase 4 if it's combined
-    # If CS261 is not combined (only one instance), it will be scheduled in Phase 7
-    default_codes = ['MA161', 'DS161', 'MA162', 'EC161', 'MA261', 'MA262', 'CS161']
-    
-    if combined_sessions:
-        # Extract course codes from combined sessions
-        phase4_codes = set(default_codes)  # Start with default codes
-        for session in combined_sessions:
-            if hasattr(session, 'course_code'):
-                phase4_codes.add(session.course_code)
-            elif isinstance(session, dict) and 'course_code' in session:
-                # Handle dictionary format from map_corrected_schedule_to_sessions
-                course_code = session['course_code']
-                # Remove suffixes like -TUT, -LAB to get base course code
-                base_code = course_code.split('-')[0]
-                phase4_codes.add(base_code)
+    """
+    Get list of Phase 4 combined course codes dynamically from combined_sessions.
+    Phase 7 must exclude these to avoid duplicate scheduling.
+    """
+    phase4_codes = set()
+    if not combined_sessions:
         return list(phase4_codes)
-    
-    return default_codes
+
+    for session in combined_sessions:
+        if hasattr(session, 'course_code'):
+            base_code = session.course_code.split('-')[0]  # Remove -TUT, -LAB suffix
+            phase4_codes.add(base_code)
+        elif isinstance(session, dict) and 'course_code' in session:
+            course_code = session['course_code']
+            base_code = course_code.split('-')[0]
+            phase4_codes.add(base_code)
+    return list(phase4_codes)
 
 def identify_phase7_courses(courses: List[Course], sections: List[Section], combined_sessions: List = None) -> Tuple[List[List[Course]], List[Course]]:
     """
@@ -112,17 +413,19 @@ def identify_phase7_courses(courses: List[Course], sections: List[Section], comb
 
 def get_lunch_blocks() -> Dict[int, TimeBlock]:
     """Get lunch break time blocks for each semester"""
-    return {
-        1: TimeBlock('Monday', time(12, 30), time(13, 30)),
-        3: TimeBlock('Monday', time(13, 0), time(14, 0)),
-        5: TimeBlock('Monday', time(13, 30), time(14, 30))
-    }
+    blocks: Dict[int, TimeBlock] = {}
+    for sem, (start_t, end_t) in LUNCH_WINDOWS.items():
+        # Day here is a placeholder; callers should project it onto the slot's day.
+        blocks[sem] = TimeBlock("Monday", start_t, end_t)
+    return blocks
 
 def is_slot_available(slot: TimeBlock, section: str, period: str, occupied_slots: Dict, lunch_block: TimeBlock) -> bool:
     """Check if a time slot is available"""
     # Check lunch overlap
-    if slot.overlaps(lunch_block):
-        return False
+    if lunch_block:
+        lunch_for_day = TimeBlock(slot.day, lunch_block.start, lunch_block.end)
+        if slot.overlaps(lunch_for_day):
+            return False
     
     # Check occupied slots
     section_key = f"{section}_{period}"
@@ -181,19 +484,19 @@ def find_available_slots_phase7(semester: int, section: str, period: str,
     
     EXPANDED: Use full day (9:00-18:00) with 15-minute intervals for maximum flexibility
     """
-    days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+    days = list(WORKING_DAYS)
     available_slots = []
     
     lunch_blocks = get_lunch_blocks()
-    lunch_block = lunch_blocks.get(semester)
+    lunch_block_base = lunch_blocks.get(semester)
     
     used_days = set()
     max_iterations = 5000  # Increased limit for full day search
     iteration_count = 0
     
-    # Generate time slots dynamically across full day (9:00-18:00) with 15-minute intervals
-    # This gives us maximum flexibility to find available slots
-    start_hour, end_hour = 9, 18
+    # Generate time slots dynamically across full day with 15-minute intervals.
+    # Start/end are driven by schedule_config.DAY_START_TIME / DAY_END_TIME.
+    start_hour, end_hour = DAY_START_TIME.hour, DAY_END_TIME.hour
     
     for duration in slot_durations:
         if len(available_slots) >= num_slots:
@@ -226,6 +529,11 @@ def find_available_slots_phase7(semester: int, section: str, period: str,
                 slot = TimeBlock(day, current_time, end_time)
                 
                 # Check if slot overlaps with lunch
+                if lunch_block_base:
+                    lunch_block = TimeBlock(day, lunch_block_base.start, lunch_block_base.end)
+                else:
+                    lunch_block = None
+
                 if lunch_block and slot.overlaps(lunch_block):
                     # Skip to after lunch
                     if current_time < lunch_block.start:
@@ -280,7 +588,8 @@ def assign_classroom(capacity_needed: int, classrooms: List[ClassRoom], slot: Ti
 def schedule_within_group_combined(course: Course, sections: List[Section],
                                    occupied_slots: Dict,
                                    classrooms: List[ClassRoom],
-                                   room_occupancy: Dict) -> List[ScheduledSession]:
+                                   room_occupancy: Dict,
+                                   period_assignments: Dict[Tuple[str, int, str], bool]) -> List[ScheduledSession]:
     """
     Schedule within-group combined courses
     Section A gets PreMid, Section B gets PostMid
@@ -288,8 +597,10 @@ def schedule_within_group_combined(course: Course, sections: List[Section],
     sessions = []
     
     # Get sections for this department and semester
-    dept_sections = [s for s in sections 
-                    if s.program == course.department and s.semester == course.semester]
+    dept_sections = [
+        s for s in sections
+        if s.program == course.department and s.semester == course.semester
+    ]
     dept_sections.sort(key=lambda s: s.name)  # Sort A, B, etc.
     
     # Calculate slots needed from LTPSC
@@ -304,13 +615,14 @@ def schedule_within_group_combined(course: Course, sections: List[Section],
     for _ in range(slots_info['practicals']):
         slot_durations.append(120)  # 2 hours
     
-    for idx, section in enumerate(dept_sections):
-        # Alternate: A=PreMid, B=PostMid, C=PreMid, etc.
-        period = 'PRE' if idx % 2 == 0 else 'POST'
-        
+    for section in dept_sections:
         section_label = f"{section.program}-{section.name}-Sem{section.semester}"
+        # User-driven period selection (default to PRE if missing for robustness)
+        key = (course.code.upper(), course.semester, section_label)
+        is_premid = period_assignments.get(key, True)
+        period = 'PRE' if is_premid else 'POST'
         
-        # Find available time slots
+        # Find available time slots for this section+period
         available_slots = find_available_slots_phase7(
             section.semester, section_label, period, occupied_slots, 
             slots_info['total'], slot_durations
@@ -648,7 +960,8 @@ def schedule_within_group_combined(course: Course, sections: List[Section],
 def schedule_non_combined(course: Course, sections: List[Section],
                          occupied_slots: Dict,
                          classrooms: List[ClassRoom],
-                         room_occupancy: Dict) -> List[ScheduledSession]:
+                         room_occupancy: Dict,
+                         period_assignments: Dict[Tuple[str, int, str], bool]) -> List[ScheduledSession]:
     """
     Schedule non-combined section-specific courses
     Schedule in EITHER PreMid OR PostMid (not both) - half-semester courses
@@ -671,18 +984,14 @@ def schedule_non_combined(course: Course, sections: List[Section],
     for _ in range(slots_info['practicals']):
         slot_durations.append(120)  # 2 hours
     
-    # Find the section for this course
+    # Find the section for this course (Phase 7 uses A-section for single-section depts)
     section_label = f"{course.department}-A-Sem{course.semester}"
     
-    # Schedule in either PreMid or PostMid (half-semester course)
-    # Try both periods to maximize scheduling success
-    periods_to_try = ['PRE', 'POST']
-    
-    # Use course code hash to determine preferred period (for consistency)
-    import hashlib
-    course_hash = int(hashlib.md5(course.code.encode()).hexdigest(), 16)
-    preferred_period = 'PRE' if course_hash % 2 == 0 else 'POST'
-    # Try preferred period first, then the other
+    # User-driven period selection (default to PRE if missing for robustness)
+    key = (course.code.upper(), course.semester, section_label)
+    is_premid = period_assignments.get(key, True)
+    preferred_period = 'PRE' if is_premid else 'POST'
+    # Try preferred period first, then the other as fallback
     periods_to_try = [preferred_period, 'POST' if preferred_period == 'PRE' else 'PRE']
     
     available_slots = []
@@ -1091,6 +1400,15 @@ def run_phase7(courses: List[Course], sections: List[Section],
         print(f"  {course.code} - {course.name} ({course.department}, Sem{course.semester})")
         print(f"    LTPSC: {course.ltpsc} -> {slots_info['lectures']}L + {slots_info['tutorials']}T + {slots_info['practicals']}P")
     
+    # Build or load user-driven period assignments for Phase 7
+    assignments_path = get_phase7_period_assignments_path()
+    period_assignments, any_prompted = get_phase7_period_assignments(
+        within_group,
+        non_combined,
+        sections,
+        assignments_path,
+    )
+
     all_sessions = []
     
     # Schedule within-group combined
@@ -1104,7 +1422,14 @@ def run_phase7(courses: List[Course], sections: List[Section],
             
         course = course_group[0]
         print(f"  [{idx}/{total_within}] Scheduling {course.code}...", end=" ", flush=True)
-        sessions = schedule_within_group_combined(course, sections, occupied_slots, classrooms, room_occupancy)
+        sessions = schedule_within_group_combined(
+            course,
+            sections,
+            occupied_slots,
+            classrooms,
+            room_occupancy,
+            period_assignments,
+        )
         all_sessions.extend(sessions)
         print(f"[OK] {len(sessions)} sessions scheduled")
     
@@ -1118,12 +1443,23 @@ def run_phase7(courses: List[Course], sections: List[Section],
             break
             
         print(f"  [{idx}/{total_non}] Scheduling {course.code}...", end=" ", flush=True)
-        sessions = schedule_non_combined(course, sections, occupied_slots, classrooms, room_occupancy)
+        sessions = schedule_non_combined(
+            course,
+            sections,
+            occupied_slots,
+            classrooms,
+            room_occupancy,
+            period_assignments,
+        )
         all_sessions.extend(sessions)
         print(f"[OK] {len(sessions)} sessions scheduled")
     
     print(f"\nPhase 7 completed: {len(all_sessions)} sessions scheduled")
     
+    # Persist any newly entered period assignments
+    if any_prompted:
+        save_phase7_period_assignments(assignments_path, period_assignments)
+
     # Log time slots
     logger = get_logger()
     for session in all_sessions:
@@ -1158,15 +1494,12 @@ if __name__ == "__main__":
     
     # Create sections
     sections = []
-    for dept in ["CSE", "DSAI", "ECE"]:
+    from config.structure_config import DEPARTMENTS, SECTIONS_BY_DEPT, STUDENTS_PER_SECTION, get_group_for_section
+    for dept in DEPARTMENTS:
         for sem in unique_semesters:
-            if dept == "CSE":
-                sections.extend([
-                    Section(dept, 1, "A", sem, 30),
-                    Section(dept, 1, "B", sem, 30)
-                ])
-            else:
-                sections.append(Section(dept, 2, "A", sem, 30))
+            for sec_label in SECTIONS_BY_DEPT.get(dept, []):
+                group = get_group_for_section(dept, sec_label)
+                sections.append(Section(dept, group, sec_label, sem, STUDENTS_PER_SECTION))
     
     # Run previous phases to build occupied_slots
     elective_baskets, elective_sessions = run_phase3(courses, sections)
