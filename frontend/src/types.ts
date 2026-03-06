@@ -1,4 +1,6 @@
 export interface Session {
+  // Optional stable identifier used by the UI for drag-and-drop.
+  id?: string;
   Phase: string;
   'Course Code': string;
   Section: string;
@@ -33,10 +35,26 @@ export interface LabelsConfig {
   section_labels: SectionLabel[];
 }
 
+export interface VerificationRow {
+  code: string;
+  course_name: string;
+  instructor?: string;
+  ltpsc?: string;
+  assigned_lab?: string;
+  assigned_classroom?: string;
+  lectures?: string;
+  tutorials?: string;
+  labs?: string;
+  status: string;
+  time_slot_issues?: string;
+  room_conflicts?: string;
+}
+
 export interface GenerateResponse {
   success: boolean;
   timetable: Session[];
   labels: LabelsConfig;
+  verification_table?: Record<string, VerificationRow[]>;
   log_timestamp?: string;
 }
 

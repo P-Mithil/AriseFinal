@@ -1,8 +1,21 @@
 import { useState, useCallback } from 'react'
 import Sidebar from './components/Sidebar'
 import MainContent from './components/MainContent'
-import type { Session, LabelsConfig } from './types'
+import type { Session, LabelsConfig, VerificationRow } from './types'
 import './App.css'
+
+function attachSessionIds(sessions: Session[]): Session[] {
+  const now = Date.now()
+  return sessions.map((s, idx) => {
+    if (s.id) {
+      return s
+    }
+    return {
+      ...s,
+      id: `sess-${now}-${idx}`,
+    }
+  })
+}
 
 function App() {
   const [labels, setLabels] = useState<LabelsConfig | null>(null)
@@ -16,11 +29,18 @@ function App() {
   const [showConfirmReflow, setShowConfirmReflow] = useState(false)
   const [reflowLoading, setReflowLoading] = useState(false)
   const [message, setMessage] = useState<string | null>(null)
+  const [verificationTable, setVerificationTable] = useState<Record<string, VerificationRow[]>>({})
 
-  const onGenerateFirst = useCallback((timetable: Session[], newLabels: LabelsConfig) => {
-    setFirstGeneratedTimetable(timetable)
-    setCurrentTimetable(timetable)
+  const onGenerateFirst = useCallback((
+    timetable: Session[],
+    newLabels: LabelsConfig,
+    verification_table?: Record<string, VerificationRow[]>,
+  ) => {
+    const withIds = attachSessionIds(timetable)
+    setFirstGeneratedTimetable(withIds)
+    setCurrentTimetable(withIds)
     setLabels(newLabels)
+    setVerificationTable(verification_table ?? {})
     setVerifyErrors([])
     setVerifySuccess(false)
     setShowConfirmReflow(false)
@@ -46,21 +66,25 @@ function App() {
     }
   }, [])
 
-  const onReflowResult = useCallback((success: boolean, notPossible: boolean, newTimetable?: Session[]) => {
-    if (success && newTimetable) {
-      setCurrentTimetable(newTimetable)
-      setFirstGeneratedTimetable(newTimetable)
-      setVerifyErrors([])
-      setVerifySuccess(true)
-      setShowConfirmReflow(false)
-      setMessage('Timetable reflowed and updated.')
-    } else if (notPossible) {
-      setCurrentTimetable(firstGeneratedTimetable)
-      setVerifyErrors([])
-      setShowConfirmReflow(false)
-      setMessage('Not possible. Reverted to first-generated timetable.')
-    }
-  }, [firstGeneratedTimetable])
+  const onReflowResult = useCallback(
+    (success: boolean, notPossible: boolean, newTimetable?: Session[]) => {
+      if (success && newTimetable) {
+        const withIds = attachSessionIds(newTimetable)
+        setCurrentTimetable(withIds)
+        setFirstGeneratedTimetable(withIds)
+        setVerifyErrors([])
+        setVerifySuccess(true)
+        setShowConfirmReflow(false)
+        setMessage('Timetable reflowed and updated.')
+      } else if (notPossible) {
+        setCurrentTimetable(firstGeneratedTimetable)
+        setVerifyErrors([])
+        setShowConfirmReflow(false)
+        setMessage('Not possible. Reverted to first-generated timetable.')
+      }
+    },
+    [firstGeneratedTimetable],
+  )
 
   const revertToFirst = useCallback(() => {
     if (firstGeneratedTimetable) {
@@ -84,6 +108,7 @@ function App() {
         timetable={currentTimetable}
         firstGeneratedTimetable={firstGeneratedTimetable}
         labels={labels}
+        verificationTable={verificationTable}
         selectedSection={selectedSection}
         selectedPeriod={selectedPeriod}
         generateLoading={generateLoading}

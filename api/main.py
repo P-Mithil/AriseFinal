@@ -90,6 +90,79 @@ def load_timetable_from_csv(log_path: str) -> List[Dict[str, Any]]:
     return rows
 
 
+# Verification table column indices (0-based) matching write_verification_table headers
+_VERIFICATION_HEADERS = [
+    "Code", "Course Name", "Instructor", "LTPSC", "Assigned Lab", "Assigned Classroom",
+    "Lectures (Req/Sched)", "Tutorials (Req/Sched)", "Labs (Req/Sched)", "Status",
+    "Time Slot Issues", "Room Conflicts", "Colour",
+]
+
+
+def _sheet_name_to_key(sheet_name: str) -> Optional[str]:
+    """Convert Excel sheet name to frontend key. e.g. 'CSE-A Sem1 PreMid' -> 'CSE-A-Sem1-PRE'."""
+    # Sheet name format: "{section_name} Sem{semester} {period}" e.g. "CSE-A Sem1 PreMid"
+    m = re.match(r"^(.+?)\s+Sem(\d+)\s+(PreMid|PostMid)$", sheet_name.strip(), re.IGNORECASE)
+    if not m:
+        return None
+    section_name, sem, period = m.group(1).strip(), m.group(2), m.group(3)
+    period_key = "PRE" if period.lower() == "premid" else "POST"
+    return f"{section_name}-Sem{sem}-{period_key}"
+
+
+def parse_verification_tables_from_excel(excel_path: str) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Parse verification tables from generated Excel. Returns dict keyed by section-period
+    e.g. "CSE-A-Sem1-PRE" -> list of { code, course_name, ltpsc, lectures, tutorials, labs, status, ... }.
+    """
+    import openpyxl
+    result: Dict[str, List[Dict[str, Any]]] = {}
+    if not os.path.isfile(excel_path):
+        return result
+    wb = openpyxl.load_workbook(excel_path, data_only=True)
+    for sheet_name in wb.sheetnames:
+        key = _sheet_name_to_key(sheet_name)
+        if not key:
+            continue
+        sheet = wb[sheet_name]
+        # Find header row (row with "Code" in first column)
+        header_row_idx = None
+        for row_idx in range(1, min(sheet.max_row + 1, 500)):
+            cell_val = sheet.cell(row=row_idx, column=1).value
+            if cell_val is not None and str(cell_val).strip() == "Code":
+                header_row_idx = row_idx
+                break
+        if header_row_idx is None:
+            continue
+        # Read data rows (columns: Code, Course Name, Instructor, LTPSC, Assigned Lab, Assigned Classroom,
+        # Lectures (Req/Sched), Tutorials (Req/Sched), Labs (Req/Sched), Status, Time Slot Issues, Room Conflicts, Colour)
+        rows_data = []
+        for row_idx in range(header_row_idx + 1, sheet.max_row + 1):
+            code_cell = sheet.cell(row=row_idx, column=1).value
+            if code_cell is None or (isinstance(code_cell, str) and not code_cell.strip()):
+                break
+            def _cell(r: int, c: int) -> str:
+                v = sheet.cell(row=r, column=c).value
+                return str(v).strip() if v is not None else ""
+            row_dict = {
+                "code": _cell(row_idx, 1),
+                "course_name": _cell(row_idx, 2),
+                "instructor": _cell(row_idx, 3),
+                "ltpsc": _cell(row_idx, 4),
+                "assigned_lab": _cell(row_idx, 5),
+                "assigned_classroom": _cell(row_idx, 6),
+                "lectures": _cell(row_idx, 7),
+                "tutorials": _cell(row_idx, 8),
+                "labs": _cell(row_idx, 9),
+                "status": _cell(row_idx, 10),
+                "time_slot_issues": _cell(row_idx, 11),
+                "room_conflicts": _cell(row_idx, 12),
+            }
+            if row_dict["code"]:
+                rows_data.append(row_dict)
+        result[key] = rows_data
+    return result
+
+
 @app.get("/api/config")
 def api_config():
     """Working days, day start/end, lunch windows, programs and section labels for UI."""
@@ -111,10 +184,13 @@ def api_generate():
             raise HTTPException(status_code=500, detail=f"Time slot log not found: {log_path}")
         timetable = load_timetable_from_csv(log_path)
         labels = get_config()
+        excel_full_path = os.path.join(REPO_ROOT, output_path)
+        verification_table = parse_verification_tables_from_excel(excel_full_path)
         return {
             "success": True,
             "timetable": timetable,
             "labels": labels,
+            "verification_table": verification_table,
             "log_timestamp": ts,
         }
     except HTTPException:
@@ -195,17 +271,191 @@ def api_verify(req: VerifyRequest):
 
 class ReflowRequest(BaseModel):
     sessions: List[Dict[str, Any]]
+    movedSession: Dict[str, Any]
 
 
 @app.post("/api/reflow")
 def api_reflow(req: ReflowRequest):
     """
     Try to reflow: keep user-moved sessions, reschedule others to satisfy rules.
-    For now returns not_possible; full reflow can be implemented later.
+    Minimal implementation: if the move introduced conflicts, try to relocate only
+    the directly-conflicting sessions to the next available 15-minute slot.
+    If still not possible, return not_possible so frontend can revert.
     """
-    # Placeholder: attempt would require re-running parts of the pipeline with fixed blocks.
-    # Return not_possible so frontend reverts to first-generated timetable.
-    return {"success": False, "not_possible": True}
+    try:
+        sessions = list(req.sessions or [])
+        moved = req.movedSession or {}
+
+        def _norm_period(p: str) -> str:
+            v = (p or "").strip().upper()
+            if v in ("PREMID", "PRE"):
+                return "PRE"
+            if v in ("POSTMID", "POST"):
+                return "POST"
+            return v or "PRE"
+
+        def _parse_hhmm(t: str) -> int:
+            hh, mm = (t or "").strip().split(":")
+            return int(hh) * 60 + int(mm)
+
+        def _fmt_hhmm(m: int) -> str:
+            return f"{m // 60:02d}:{m % 60:02d}"
+
+        def _overlap(a_start: int, a_end: int, b_start: int, b_end: int) -> bool:
+            return a_start < b_end and b_start < a_end
+
+        moved_day = (moved.get("Day") or "").strip()
+        moved_start = moved.get("Start Time") or ""
+        moved_end = moved.get("End Time") or ""
+        moved_section = (moved.get("Section") or "").strip()
+        moved_room = (moved.get("Room") or "").strip()
+        moved_faculty = (moved.get("Faculty") or "").strip()
+        moved_period = _norm_period(moved.get("Period") or "PRE")
+        if not (moved_day and moved_start and moved_end and moved_section):
+            return {"success": False, "not_possible": True}
+        moved_start_m = _parse_hhmm(moved_start)
+        moved_end_m = _parse_hhmm(moved_end)
+
+        # Build slot grid
+        from config.schedule_config import WORKING_DAYS, DAY_START_TIME, DAY_END_TIME, LUNCH_WINDOWS
+        day_start_m = DAY_START_TIME.hour * 60 + DAY_START_TIME.minute
+        day_end_m = DAY_END_TIME.hour * 60 + DAY_END_TIME.minute
+
+        # Lunch windows by semester (SemX parsed from section label)
+        sem_re = re.compile(r"Sem(\d+)", re.IGNORECASE)
+
+        def _get_lunch_window(section_label: str):
+            m = sem_re.search(section_label or "")
+            if not m:
+                return None
+            sem = int(m.group(1))
+            win = LUNCH_WINDOWS.get(sem)
+            if not win:
+                return None
+            start_t, end_t = win
+            return (start_t.hour * 60 + start_t.minute, end_t.hour * 60 + end_t.minute)
+
+        def _session_conflicts(s: Dict[str, Any], other: Dict[str, Any]) -> bool:
+            if _norm_period(s.get("Period")) != _norm_period(other.get("Period")):
+                return False
+            if (s.get("Day") or "").strip() != (other.get("Day") or "").strip():
+                return False
+            try:
+                s1, e1 = _parse_hhmm(s.get("Start Time")), _parse_hhmm(s.get("End Time"))
+                s2, e2 = _parse_hhmm(other.get("Start Time")), _parse_hhmm(other.get("End Time"))
+            except Exception:
+                return False
+            if not _overlap(s1, e1, s2, e2):
+                return False
+
+            # Conflicts if share section OR room OR faculty
+            same_section = (s.get("Section") or "").strip() == (other.get("Section") or "").strip()
+            same_room = (s.get("Room") or "").strip() and (s.get("Room") or "").strip() == (other.get("Room") or "").strip()
+            same_faculty = (s.get("Faculty") or "").strip() and (s.get("Faculty") or "").strip() == (other.get("Faculty") or "").strip()
+            return same_section or same_room or same_faculty
+
+        # Find sessions directly conflicting with the moved one
+        moved_key = (
+            (moved.get("Course Code") or "").strip(),
+            moved_section,
+            moved_day,
+            moved_start,
+            moved_end,
+            moved_period,
+        )
+
+        def _is_same_session(a: Dict[str, Any], key) -> bool:
+            return (
+                ((a.get("Course Code") or "").strip(), (a.get("Section") or "").strip(),
+                 (a.get("Day") or "").strip(), a.get("Start Time") or "", a.get("End Time") or "",
+                 _norm_period(a.get("Period") or "PRE")) == key
+            )
+
+        conflicts = []
+        for s in sessions:
+            if _is_same_session(s, moved_key):
+                continue
+            # Ensure we only move sessions within the same period as moved (UI is scoped by period)
+            if _norm_period(s.get("Period") or "PRE") != moved_period:
+                continue
+            if _session_conflicts(moved, s):
+                conflicts.append(s)
+
+        if not conflicts:
+            # Already ok (or conflicts not detected here); let verifier be source of truth
+            v = run_verify(sessions)
+            if v.get("success"):
+                return {"success": True, "timetable": sessions}
+            return {"success": False, "not_possible": True}
+
+        # Occupancy check against current sessions (keeps moved fixed)
+        def _can_place(sess: Dict[str, Any], cand_day: str, cand_start: int) -> bool:
+            duration = _parse_hhmm(sess.get("End Time")) - _parse_hhmm(sess.get("Start Time"))
+            cand_end = cand_start + duration
+            if cand_start < day_start_m or cand_end > day_end_m:
+                return False
+
+            lunch = _get_lunch_window((sess.get("Section") or "").strip())
+            if lunch and _overlap(cand_start, cand_end, lunch[0], lunch[1]):
+                return False
+
+            # Check overlap vs all others (including moved)
+            for o in sessions:
+                if o is sess:
+                    continue
+                if _norm_period(o.get("Period") or "PRE") != moved_period:
+                    continue
+                if (o.get("Day") or "").strip() != cand_day:
+                    continue
+                try:
+                    o_s, o_e = _parse_hhmm(o.get("Start Time")), _parse_hhmm(o.get("End Time"))
+                except Exception:
+                    continue
+                if not _overlap(cand_start, cand_end, o_s, o_e):
+                    continue
+                same_section = (sess.get("Section") or "").strip() == (o.get("Section") or "").strip()
+                same_room = (sess.get("Room") or "").strip() and (sess.get("Room") or "").strip() == (o.get("Room") or "").strip()
+                same_faculty = (sess.get("Faculty") or "").strip() and (sess.get("Faculty") or "").strip() == (o.get("Faculty") or "").strip()
+                if same_section or same_room or same_faculty:
+                    return False
+            return True
+
+        # Try to relocate each conflicting session greedily
+        for sess in conflicts:
+            orig_day = (sess.get("Day") or "").strip()
+            try:
+                duration = _parse_hhmm(sess.get("End Time")) - _parse_hhmm(sess.get("Start Time"))
+            except Exception:
+                continue
+
+            day_order = [orig_day] + [d for d in WORKING_DAYS if d != orig_day]
+            placed = False
+            for d in day_order:
+                for start in range(day_start_m, day_end_m - duration + 1, 15):
+                    # avoid placing exactly on moved's start time if it would still conflict
+                    if d == moved_day and _overlap(start, start + duration, moved_start_m, moved_end_m):
+                        continue
+                    if _can_place(sess, d, start):
+                        sess["Day"] = d
+                        sess["Start Time"] = _fmt_hhmm(start)
+                        sess["End Time"] = _fmt_hhmm(start + duration)
+                        placed = True
+                        break
+                if placed:
+                    break
+
+            if not placed:
+                return {"success": False, "not_possible": True}
+
+        # Final deep verification
+        v = run_verify(sessions)
+        if v.get("success"):
+            return {"success": True, "timetable": sessions}
+        return {"success": False, "not_possible": True}
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        return {"success": False, "not_possible": True}
 
 
 if __name__ == "__main__":
