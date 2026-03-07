@@ -455,7 +455,14 @@ function MainContent({
         }
       }
 
-      // Fallback: move only the dragged session
+      // Fallback: move only the dragged session (reject if it would create an overlap and cause a session to vanish)
+      const wouldOverlap = sameDaySessions.some((c) =>
+        intervalOverlaps(c.startMin, c.endMin, newStartMin, newEndMin),
+      )
+      if (wouldOverlap) {
+        setMessage('Drop would create a conflict. Try a different slot.')
+        return
+      }
       updated = timetable.map((s, idx) =>
         idx === draggedIndex
           ? {
@@ -469,7 +476,7 @@ function MainContent({
       onTimetableChange(updated)
       setLastMovedSessionId(sessionId)
     },
-    [timetable, filteredSessions, onTimetableChange, selectedSection, dayStart, dayEnd, lunchWindow],
+    [timetable, filteredSessions, onTimetableChange, selectedSection, dayStart, dayEnd, lunchWindow, setMessage],
   )
 
   const handleDndDragStart = useCallback((e: DragStartEvent) => {
