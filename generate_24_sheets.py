@@ -654,11 +654,16 @@ def map_corrected_schedule_to_sessions_v2(
                 if course_code is None:
                     continue  # cannot safely map
 
-                # Resolve section label
+                # Resolve section label(s) — may be a comma-joined combined-class string
                 if hasattr(section_ref, "label"):
                     section_label = section_ref.label
                 else:
                     section_label = str(section_ref) if section_ref is not None else ""
+
+                # Split comma-joined section labels (e.g. "CSE-A-Sem1,CSE-B-Sem1")
+                section_labels_list = [s.strip() for s in section_label.split(",") if s.strip()]
+                if not section_labels_list:
+                    section_labels_list = []
 
                 # Determine display code
                 if session_type == "T":
@@ -684,7 +689,7 @@ def map_corrected_schedule_to_sessions_v2(
                 sessions.append(
                     {
                         "course_code": display_code,
-                        "sections": [section_label] if section_label else [],
+                        "sections": section_labels_list,
                         "period": period_flag,
                         "day": day,
                         "time_block": time_block,
@@ -1227,6 +1232,7 @@ def create_integrated_schedule(
     courses: List = None,
     final_sessions_all_days: List[tuple] = None,
     extra_candidates: List[tuple] = None,
+    sessions_from_log: List[Dict] = None,
 ) -> tuple:
     """Create an integrated schedule with electives, combined classes, core courses, and Phase 7 courses.
     Returns (DayScheduleGrid, deferred) where deferred is a list of (block, course, prio, base) rescheduled to another day.
@@ -1236,6 +1242,37 @@ def create_integrated_schedule(
 
     period_code = normalize_period(period)
     expected_section = f"{section_name}-Sem{semester}"
+
+    if sessions_from_log is not None:
+        # FAST PATH: use pre-existing sessions from log to rebuild exactly
+        relevant = []
+        for s in sessions_from_log:
+            if (match_section(expected_section, s.get("Section", "")) and 
+                str(s.get("Day", "")).strip().upper() == str(day).strip().upper() and 
+                normalize_period(s.get("Period", "")) == period_code):
+                relevant.append(s)
+        
+        final_sessions = []
+        for s in relevant:
+            try:
+                start_str = s.get("Start Time", "00:00")
+                end_str = s.get("End Time", "00:00")
+                sh, sm = map(int, start_str.split(':'))
+                eh, em = map(int, end_str.split(':'))
+                block = TimeBlock(day, time(sh, sm), time(eh, em))
+                # Skip if already in final_sessions (some logs might have redundancy if not cleaned)
+                if any(b.start == block.start and b.end == block.end for b, c, p, bse in final_sessions):
+                    continue
+                final_sessions.append((block, s.get("Course Code", ""), 0, ""))
+            except Exception:
+                continue
+        
+        # Add lunch block
+        final_sessions.append((grid.lunch_block, "LUNCH", -1, "LUNCH"))
+        final_sessions.sort(key=lambda x: x[0].start)
+        
+        return _add_breaks_to_grid(grid, final_sessions, day), []
+
     traced = _trace_enabled(section_name, semester, period)
 
     def trace_log(msg: str) -> None:
@@ -2511,83 +2548,62 @@ def create_integrated_schedule(
         logger.debug(f"Session counts [{day} {period} {expected_section}]: "
                     f"{len(candidates)} candidates -> {len(deduped)} after dedup -> {len(final_sessions)} final")
     
-    # Add lunch block
-    lunch_block = grid.lunch_block
-    final_sessions.append((lunch_block, "LUNCH", -1, "LUNCH"))
+    # Add lunch block before calculating breaks
+    final_sessions.append((grid.lunch_block, "LUNCH", -1, "LUNCH"))
     
     # Sort again by start
     final_sessions.sort(key=lambda x: x[0].start)
     
-    # Smart break insertion - Fixed logic
+    return _add_breaks_to_grid(grid, final_sessions, day), deferred
+
+def _add_breaks_to_grid(grid: DayScheduleGrid, final_sessions: List[tuple], day: str) -> DayScheduleGrid:
+    """Helper to insert smart 15-minute breaks after sessions in the grid"""
+    from datetime import datetime, timedelta
+    
     def should_place_break(current_block: TimeBlock, next_item: tuple) -> bool:
-        """Determine if a break should be placed after current block"""
-        if next_item is None:
-            # Last session of the day - add break
-            return True
-        
+        if next_item is None: return True
         next_block, next_course = next_item[0], next_item[1]
+        if next_course == "LUNCH": return False
+        if isinstance(next_course, str) and "Break" in next_course: return False
         
-        # Don't add break before lunch
-        if next_course == "LUNCH":
-            return False
-        
-        # Don't add break if next item is already a break
-        if isinstance(next_course, str) and "Break" in next_course:
-            return False
-        
-        # Calculate break end time
         break_start = current_block.end
         break_end = (datetime.combine(datetime.min, break_start) + timedelta(minutes=15)).time()
         break_block = TimeBlock(day, break_start, break_end)
         
-        # Check if break would overlap with next session
         if break_block.overlaps(next_block):
-            # If break would overlap, check if next session starts exactly when break would end
-            # In that case, we still want the break (no overlap, just back-to-back)
-            if break_end == next_block.start:
-                return True
-            # Otherwise, there's an overlap - don't add break
+            if break_end == next_block.start: return True
             return False
-        
-        # No overlap - safe to add break
         return True
-    
+
     sessions_with_breaks: List[tuple] = []
-    lab_count_in_breaks = 0
     for idx, item in enumerate(final_sessions):
         block, course = item[0], item[1]
         sessions_with_breaks.append((block, course))
         
-        # Track labs being added
-        if 'LAB' in course:
-            lab_count_in_breaks += 1
-            print(f"DEBUG LAB: Adding lab {course} to sessions_with_breaks at {block.day} {block.start}-{block.end}")
-        
-        # Add break after session (but not after lunch, breaks, or electives)
         if isinstance(course, str) and course not in ["LUNCH", "ELECTIVE"] and "Break" not in course:
             next_item = final_sessions[idx + 1] if idx + 1 < len(final_sessions) else None
             if should_place_break(block, next_item):
                 break_start = block.end
                 break_end = (datetime.combine(datetime.min, break_start) + timedelta(minutes=15)).time()
-                
-                # Double-check break doesn't overlap with next session
                 break_block = TimeBlock(day, break_start, break_end)
                 if next_item:
                     next_block = next_item[0]
-                    # Only add if no overlap or ends exactly when next starts
                     if not break_block.overlaps(next_block) or break_end == next_block.start:
                         sessions_with_breaks.append((break_block, "Break(15min)"))
                 else:
-                    # No next item - safe to add
-                        sessions_with_breaks.append((break_block, "Break(15min)"))
+                    sessions_with_breaks.append((break_block, "Break(15min)"))
     
     grid.sessions = sessions_with_breaks
-    print(f"DEBUG: Total sessions added to grid: {len(sessions_with_breaks)}, Labs in grid: {lab_count_in_breaks}")
-    
-    return (grid, deferred)
+    return grid
 
-def generate_24_sheets():
-    """Generate all 24 sheets for the timetable"""
+def generate_24_sheets(sessions_from_log: List[Dict] = None):
+    """Generate all 24 sheets for the timetable.
+    If sessions_from_log is provided, it use those sessions directly and skips the scheduling phases.
+    """
+    from utils.time_slot_logger import reset_logger
+    if sessions_from_log is None:
+        reset_logger()
+    
     global rescheduling_conflicts
     rescheduling_conflicts = []  # Reset conflicts for each generation
     
@@ -2611,203 +2627,219 @@ def generate_24_sheets():
                 group = get_group_for_section(dept, sec_label)
                 sections.append(Section(dept, group, sec_label, sem, STUDENTS_PER_SECTION))
     
-    # Step 2: Run Phase 3 - Elective basket scheduling
-    print("\nStep 2: Running Phase 3 - Elective basket scheduling...")
-    elective_baskets, elective_sessions = run_phase3(courses, sections)
-    
-    # Step 3: Run Phase 4 - Combined class scheduling
-    print("\nStep 3: Running Phase 4 - Combined class scheduling...")
-    print("DEBUG: About to call run_phase4")
-    print("DEBUG: courses type:", type(courses), "length:", len(courses))
-    print("DEBUG: sections type:", type(sections), "length:", len(sections))
-    print("DEBUG: run_phase4 function:", run_phase4)
-    try:
-        phase4_result = run_phase4(courses, sections, classrooms)
-        print("DEBUG: run_phase4 completed")
-    except Exception as e:
-        print(f"DEBUG: Error in run_phase4: {e}")
-        import traceback
-        traceback.print_exc()
-        raise
-    schedule = phase4_result['schedule']
-    periods = ["PreMid", "PostMid"]
-    combined_sessions = map_corrected_schedule_to_sessions(schedule, sections, periods, courses, classrooms)
-
-    # Assign 2 labs to combined course practicals (EC->hardware, exclude research)
-    from modules_v2.phase8_classroom_assignment import assign_labs_to_combined_practicals
-    combined_sessions = assign_labs_to_combined_practicals(combined_sessions, classrooms)
-    
-    # Step 4: Run Phase 5 - Core courses scheduling
-    print("\nStep 4: Running Phase 5 - Core courses scheduling...")
-    phase5_sessions = run_phase5(courses, sections, classrooms, elective_sessions, combined_sessions)
-    
-    # Step 4.5: Run Phase 7 - Remaining <=2 credit courses scheduling
-    print("\n" + "="*80)
-    print("Step 4.5: Running Phase 7 - Remaining <=2 credit courses scheduling...")
-    print("="*80)
+    # Step 2-6: Scheduling Phases (Skip if pre-loaded from log)
+    elective_sessions = []
+    combined_sessions = []
+    phase5_sessions = []
     phase7_sessions = []
-    try:
-        from modules_v2.phase7_remaining_courses import run_phase7, add_session_to_occupied_slots
-        import time
-        
-        # Build occupied_slots from all previous phases
-        occupied_slots = {}
-        for session in elective_sessions + phase5_sessions:
-            add_session_to_occupied_slots(session, occupied_slots)
-        
-        # Add combined sessions
-        for session in combined_sessions:
-            add_session_to_occupied_slots(session, occupied_slots)
-        
-        # Run Phase 7 with 60 second timeout
-        phase7_start = time.time()
-        phase7_sessions = run_phase7(courses, sections, classrooms, occupied_slots, {}, combined_sessions, timeout_seconds=60)
-        phase7_elapsed = time.time() - phase7_start
-        
-        if phase7_elapsed > 55:
-            print(f"⚠️  Phase 7 took {phase7_elapsed:.1f}s (slow, but completed)")
-        else:
-            print(f"[OK] Phase 7 completed in {phase7_elapsed:.1f}s: {len(phase7_sessions)} sessions scheduled")
-    except Exception as e:
-        print(f"WARNING: Phase 7 failed. Continuing without Phase 7. Reason: {e}")
-        import traceback
-        traceback.print_exc()
-        phase7_sessions = []
-    
-    # Step 5: Run Phase 8 - Classroom assignment for core courses
-    print("\n" + "="*80)
-    print("Step 5: Running Phase 8 - Classroom assignment for core courses...")
-    print("="*80)
-    room_assignments = {}
-    try:
-        from modules_v2.phase8_classroom_assignment import run_phase8
-        room_assignments = run_phase8(
-            phase5_sessions, phase7_sessions, combined_sessions,
-            courses, sections, classrooms, elective_sessions
-        )
-    except Exception as e:
-        print(f"WARNING: Phase 8 failed. Continuing without room assignments. Reason: {e}")
-        import traceback
-        traceback.print_exc()
-        room_assignments = {}
-    
-    # Step 5.5: Run Phase 9 - Elective Room Assignment
-    print("\n" + "="*80)
-    print("Step 5.5: Running Phase 9 - Elective Room Assignment...")
-    print("="*80)
-    elective_assignments = {}
-    try:
-        from modules_v2.phase9_elective_room_assignment import run_phase9
-        all_sessions_for_phase9 = elective_sessions + combined_sessions + phase5_sessions + phase7_sessions
-        elective_assignments = run_phase9(
-            courses, all_sessions_for_phase9, room_assignments, classrooms,
-            all_courses=courses
-        )
-    except Exception as e:
-        print(f"WARNING: Phase 9 failed. Continuing without elective assignments. Reason: {e}")
-        import traceback
-        traceback.print_exc()
-        elective_assignments = {}
-    
-    # Step 5.55: Room conflict resolution (0 conflicts target)
-    elective_sessions_with_rooms = []
-    try:
-        from modules_v2.phase3_elective_baskets_v2 import ELECTIVE_BASKET_SLOTS
-        def _extract_semester_from_group(gk):
-            try:
-                return int(str(gk).split('.')[0]) if '.' in str(gk) else int(gk)
-            except (ValueError, AttributeError):
-                return -1
-        for semester, assignments in (elective_assignments or {}).items():
-            for a in assignments:
-                group_key = a.get('group_key', str(semester) + '.1')
-                slots = (ELECTIVE_BASKET_SLOTS or {}).get(group_key) or {}
-                course = a.get('course')
-                course_code = getattr(course, 'code', '') if course else ''
-                # Include assignments with no room (Phase 9 may leave None); resolver will assign
-                room = a.get('room') if a.get('room') is not None else ''
-                period = a.get('period', 'PRE')
-                for slot_name in ('lecture_1', 'lecture_2', 'tutorial'):
-                    tb = slots.get(slot_name)
-                    if not tb:
-                        continue
-                    elective_sessions_with_rooms.append({
-                        'room': room,
-                        'period': period,
-                        'time_block': tb,
-                        'course_code': course_code,
-                        'section': 'ELECTIVE_BASKET_' + str(group_key),
-                        '_assignment': a,
-                    })
-        from utils.room_conflict_resolver import resolve_room_conflicts
-        from modules_v2.phase8_classroom_assignment import detect_room_conflicts
-        resolved, remaining = resolve_room_conflicts(
-            phase5_sessions, phase7_sessions, combined_sessions,
-            elective_sessions_with_rooms, classrooms, max_passes=15
-        )
-        for s in elective_sessions_with_rooms:
-            if isinstance(s, dict) and '_assignment' in s and 'room' in s:
-                s['_assignment']['room'] = s['room']
-        room_conflicts_after = detect_room_conflicts(
-            phase5_sessions, phase7_sessions, combined_sessions,
-            elective_sessions_with_rooms, classrooms
-        )
-        if room_conflicts_after:
-            print(f"\nWARNING: {len(room_conflicts_after)} classroom conflict(s) remain after resolution:")
-            for idx, c in enumerate(room_conflicts_after, 1):
-                print(f"  {idx}. Room {c.get('room')} on {c.get('day')} ({c.get('period')}) at {c.get('time')}")
-                print(f"     - {c.get('course1')} ({c.get('section1')})")
-                print(f"     - {c.get('course2')} ({c.get('section2')})")
-        else:
-            print("\n[OK] 0 classroom conflicts after resolution")
-    except Exception as e:
-        print(f"WARNING: Room conflict resolution failed: {e}")
-        import traceback
-        traceback.print_exc()
-    
-    # Step 5.6: Run Phase 10 - Course Color Assignment
-    print("\n" + "="*80)
-    print("Step 5.6: Running Phase 10 - Course Color Assignment...")
-    print("="*80)
+    faculty_conflicts = []
     course_colors = {}
-    try:
-        from modules_v2.phase10_course_colors import run_phase10
-        course_colors = run_phase10(courses)
-    except Exception as e:
-        print(f"WARNING: Phase 10 failed. Continuing without course colors. Reason: {e}")
-        import traceback
-        traceback.print_exc()
-        course_colors = {}
-    
-    # Step 6: Run Phase 6 - Faculty conflict detection and resolution
-    print("\nStep 6: Running Phase 6 - Faculty conflict detection and resolution...")
-    all_sessions = elective_sessions + combined_sessions + phase5_sessions + phase7_sessions
-    
-    # First detect conflicts
-    faculty_conflicts, conflict_report = run_phase6_faculty_conflicts(all_sessions)
-    
-    from modules_v2.phase5_core_courses import detect_and_resolve_section_overlaps
-    from collections import defaultdict
+    all_sessions = []
+    elective_sessions_with_rooms = []
+    elective_assignments = {}
+    room_assignments = {}
 
-    # If conflicts exist, resolve them using the central resolver
-    if faculty_conflicts and len(faculty_conflicts) > 0:
-        print(f"\n=== RESOLVING FACULTY CONFLICTS (Central Resolver) ===")
+    if sessions_from_log is not None:
+        print("Bypassing Phase 2-6 scheduling as sessions were provided from log.")
+        all_sessions = sessions_from_log
+        
+        # Load cached elective assignments to prevent "TBD" in the Excel tables
+        import json, os
+        cache_file = "DATA/OUTPUT/elective_assignments_cache.json"
+        if os.path.exists(cache_file):
+            try:
+                with open(cache_file, "r") as f:
+                    cache_data = json.load(f)
+                # Reconstruct course objects for the assignments
+                course_map = {getattr(c, 'code', ''): c for c in courses}
+                for sem_str, assignments in cache_data.items():
+                    try:
+                        sem = int(sem_str)
+                    except ValueError:
+                        sem = sem_str
+                    elective_assignments[sem] = []
+                    for a in assignments:
+                        course_obj = course_map.get(a.get('course_code', ''))
+                        if course_obj:
+                            elective_assignments[sem].append({
+                                'course': course_obj,
+                                'room': a.get('room', ''),
+                                'period': a.get('period', ''),
+                                'faculty': a.get('faculty', ''),
+                                'group_key': a.get('group_key', '')
+                            })
+                print("Loaded cached elective assignments.")
+            except Exception as e:
+                print(f"Error loading elective assignments cache: {e}")
+    else:
+        # Step 2: Run Phase 3 - Elective basket scheduling
+        print("\nStep 2: Running Phase 3 - Elective basket scheduling...")
+        elective_baskets, elective_sessions = run_phase3(courses, sections)
+        
+        # Step 3: Run Phase 4 - Combined class scheduling
+        print("\nStep 3: Running Phase 4 - Combined class scheduling...")
+        phase4_result = run_phase4(courses, sections, classrooms)
+        schedule = phase4_result['schedule']
+        periods = ["PreMid", "PostMid"]
+        combined_sessions = map_corrected_schedule_to_sessions(schedule, sections, periods, courses, classrooms)
+
+        # Assign 2 labs to combined course practicals
+        from modules_v2.phase8_classroom_assignment import assign_labs_to_combined_practicals
+        combined_sessions = assign_labs_to_combined_practicals(combined_sessions, classrooms)
+        
+        # Step 4: Run Phase 5 - Core courses scheduling
+        print("\nStep 4: Running Phase 5 - Core courses scheduling...")
+        phase5_sessions = run_phase5(courses, sections, classrooms, elective_sessions, combined_sessions)
+        
+        # Step 4.5: Run Phase 7 - Remaining <=2 credit courses scheduling
+        phase7_sessions = []
+        try:
+            from modules_v2.phase7_remaining_courses import run_phase7, add_session_to_occupied_slots
+            occupied_slots = {}
+            for session in elective_sessions + phase5_sessions:
+                add_session_to_occupied_slots(session, occupied_slots)
+            for session in combined_sessions:
+                add_session_to_occupied_slots(session, occupied_slots)
+            # Run Phase 7
+            phase7_sessions = run_phase7(courses, sections, classrooms, occupied_slots, {}, combined_sessions, timeout_seconds=60)
+        except Exception as e:
+            print(f"ERROR in Phase 7: {e}")
+            phase7_sessions = []
+
+
+    
+        # Step 5: Run Phase 8 - Classroom assignment for core courses
+        print("\n" + "="*80)
+        print("Step 5: Running Phase 8 - Classroom assignment for core courses...")
+        print("="*80)
+        room_assignments = {}
+        try:
+            from modules_v2.phase8_classroom_assignment import run_phase8
+            room_assignments = run_phase8(
+                phase5_sessions, phase7_sessions, combined_sessions,
+                courses, sections, classrooms, elective_sessions
+            )
+        except Exception as e:
+            print(f"WARNING: Phase 8 failed. Continuing without room assignments. Reason: {e}")
+            room_assignments = {}
+    
+        # Step 5.5: Run Phase 9 - Elective Room Assignment
+        print("\n" + "="*80)
+        print("Step 5.5: Running Phase 9 - Elective Room Assignment...")
+        print("="*80)
+        elective_assignments = {}
+        try:
+            from modules_v2.phase9_elective_room_assignment import run_phase9
+            all_sessions_for_phase9 = elective_sessions + combined_sessions + phase5_sessions + phase7_sessions
+            elective_assignments = run_phase9(
+                courses, all_sessions_for_phase9, room_assignments, classrooms,
+                all_courses=courses
+            )
+            # Cache elective assignments for fast-path regeneration
+            import json, os
+            os.makedirs("DATA/OUTPUT", exist_ok=True)
+            cache_data = {}
+            for sem, assignments in elective_assignments.items():
+                cache_data[sem] = []
+                for a in assignments:
+                    cache_data[sem].append({
+                        'course_code': getattr(a.get('course'), 'code', '') if a.get('course') else '',
+                        'room': a.get('room', ''),
+                        'period': a.get('period', ''),
+                        'faculty': a.get('faculty', ''),
+                        'group_key': a.get('group_key', '')
+                    })
+            with open("DATA/OUTPUT/elective_assignments_cache.json", "w") as f:
+                json.dump(cache_data, f)
+        except Exception as e:
+            print(f"WARNING: Phase 9 failed. Continuing without elective assignments. Reason: {e}")
+            import traceback
+            traceback.print_exc()
+            elective_assignments = {}
+        
+        # Step 5.55: Room conflict resolution (0 conflicts target)
+        elective_sessions_with_rooms = []
+        try:
+            from modules_v2.phase3_elective_baskets_v2 import ELECTIVE_BASKET_SLOTS
+            def _extract_semester_from_group_i(gk):
+                try:
+                    return int(str(gk).split('.')[0]) if '.' in str(gk) else int(gk)
+                except (ValueError, AttributeError):
+                    return -1
+            for semester_val, assignments in (elective_assignments or {}).items():
+                for a in assignments:
+                    group_key = a.get('group_key', str(semester_val) + '.1')
+                    slots = (ELECTIVE_BASKET_SLOTS or {}).get(group_key) or {}
+                    course = a.get('course')
+                    course_code = getattr(course, 'code', '') if course else ''
+                    room = a.get('room') if a.get('room') is not None else ''
+                    period_val = a.get('period', 'PRE')
+                    for slot_name in ('lecture_1', 'lecture_2', 'tutorial'):
+                        tb = slots.get(slot_name)
+                        if not tb:
+                            continue
+                        elective_sessions_with_rooms.append({
+                            'room': room,
+                            'period': period_val,
+                            'time_block': tb,
+                            'course_code': f"{course_code}-Elective",
+                            'course_obj': course,
+                            'session_type': 'L' if 'lecture' in slot_name else 'T'
+                        })
+        except Exception as e:
+            print(f"WARNING: Error building elective_sessions_with_rooms: {e}")
+            import traceback
+            traceback.print_exc()
+        try:
+            from utils.room_conflict_resolver import resolve_room_conflicts
+            from modules_v2.phase8_classroom_assignment import detect_room_conflicts
+            resolved, remaining = resolve_room_conflicts(
+                phase5_sessions, phase7_sessions, combined_sessions,
+                elective_sessions_with_rooms, classrooms, max_passes=15
+            )
+            for s in elective_sessions_with_rooms:
+                if isinstance(s, dict) and '_assignment' in s and 'room' in s:
+                    s['_assignment']['room'] = s['room']
+            room_conflicts_after = detect_room_conflicts(
+                phase5_sessions, phase7_sessions, combined_sessions,
+                elective_sessions_with_rooms, classrooms
+            )
+            if room_conflicts_after:
+                print(f"\nWARNING: {len(room_conflicts_after)} classroom conflict(s) remain after resolution:")
+            else:
+                print("\n[OK] 0 classroom conflicts after resolution")
+        except Exception as e:
+            print(f"WARNING: Room conflict resolution failed: {e}")
+    
+        # Step 6: Run Phase 6 - Faculty conflict detection and resolution
+        print("\nStep 6: Running Phase 6 - Faculty conflict detection and resolution...")
+        all_sessions = elective_sessions + combined_sessions + phase5_sessions + phase7_sessions
+    
+        # First detect conflicts
+        faculty_conflicts, conflict_report = run_phase6_faculty_conflicts(all_sessions)
+        
+        from modules_v2.phase5_core_courses import detect_and_resolve_section_overlaps
+        from collections import defaultdict
+    
+        # If conflicts exist, resolve them using the central resolver
+        if faculty_conflicts and len(faculty_conflicts) > 0:
+            print(f"\n=== RESOLVING FACULTY CONFLICTS (Central Resolver) ===")
         
         # Build occupied_slots for the resolver
         occupied_slots = defaultdict(list)
-        for session in all_sessions:
-            if isinstance(session, dict):
-                sections = session.get('sections', [])
-                period = session.get('period', 'PRE')
-                block = session.get('time_block')
-                course_code = session.get('course_code', '')
-                if block and sections:
-                    for section in sections:
-                        section_key = f"{section}_{period}"
-                        occupied_slots[section_key].append((block, course_code))
-            elif hasattr(session, 'section') and hasattr(session, 'block'):
-                section_key = f"{session.section}_{getattr(session, 'period', 'PRE')}"
-                occupied_slots[section_key].append((session.block, session.course_code))
+        for session_val in all_sessions:
+            if isinstance(session_val, dict):
+                sections_val = session_val.get('sections', [])
+                period_val = session_val.get('period', 'PRE')
+                block_val = session_val.get('time_block')
+                course_code_val = session_val.get('course_code', '')
+                if block_val and sections_val:
+                    for section_val_inner in sections_val:
+                        section_key_val = f"{section_val_inner}_{period_val}"
+                        occupied_slots[section_key_val].append((block_val, course_code_val))
+            elif hasattr(session_val, 'section') and hasattr(session_val, 'block'):
+                section_key_val = f"{session_val.section}_{getattr(session_val, 'period', 'PRE')}"
+                occupied_slots[section_key_val].append((session_val.block, session_val.course_code))
 
         # Use central resolver (handles all session types, respects move priorities)
         all_sessions, remaining_conflicts = resolve_all_faculty_conflicts(
@@ -2822,262 +2854,196 @@ def generate_24_sheets():
         else:
             print("[OK] All faculty conflicts resolved successfully")
 
-    # Always resolve overlaps within the same section+period (regardless of faculty-conflict presence)
-    # Include BOTH object sessions and combined (dict) sessions so resolver sees full occupancy
-    occupied_slots = defaultdict(list)
-    for session in all_sessions:
-        if isinstance(session, dict):
-            sections = session.get('sections', [])
-            period = session.get('period', 'PRE')
-            block = session.get('time_block')
-            course_code = session.get('course_code', '')
-            if block and sections:
-                for section in sections:
-                    section_key = f"{section}_{period}"
-                    occupied_slots[section_key].append((block, course_code))
-        elif hasattr(session, 'section') and hasattr(session, 'block'):
-            section_key = f"{session.section}_{getattr(session, 'period', 'PRE')}"
-            occupied_slots[section_key].append((session.block, session.course_code))
-    all_sessions = detect_and_resolve_section_overlaps(all_sessions, occupied_slots, classrooms)
+        # Always resolve overlaps within the same section+period
+        occupied_slots_overlap = defaultdict(list)
+        for session_overlap in all_sessions:
+            if isinstance(session_overlap, dict):
+                sections_overlap = session_overlap.get('sections', [])
+                period_overlap = session_overlap.get('period', 'PRE')
+                block_overlap = session_overlap.get('time_block')
+                course_code_overlap = session_overlap.get('course_code', '')
+                if block_overlap and sections_overlap:
+                    for section_overlap_inner in sections_overlap:
+                        section_key_overlap = f"{section_overlap_inner}_{period_overlap}"
+                        occupied_slots_overlap[section_key_overlap].append((block_overlap, course_code_overlap))
+            elif hasattr(session_overlap, 'section') and hasattr(session_overlap, 'block'):
+                section_key_overlap = f"{session_overlap.section}_{getattr(session_overlap, 'period', 'PRE')}"
+                occupied_slots_overlap[section_key_overlap].append((session_overlap.block, session_overlap.course_code))
+        all_sessions = detect_and_resolve_section_overlaps(all_sessions, occupied_slots_overlap, classrooms)
     
-    # Step 5.5: Validate one-session-per-day rules
-    print("\nStep 5.5: Validating one-session-per-day rules...")
-    from utils.session_rules_validator import validate_one_session_per_day, SessionRulesValidator
-    from utils.data_models import ScheduledSession
-    
-    # Convert combined_sessions to ScheduledSession objects for validation
-    validation_sessions = []
-    for session in all_sessions:
-        if isinstance(session, dict):
-            # Convert dict to ScheduledSession
-            session_obj = ScheduledSession(
-                course_code=session.get('course_code', '').split('-')[0],
-                section=session.get('sections', [None])[0] if session.get('sections') else None,
-                kind=session.get('session_type', 'L'),
-                block=session.get('time_block'),
-                room=session.get('room'),
-                period=session.get('period', 'PRE'),
-                faculty=session.get('instructor', 'TBD')
-            )
-            validation_sessions.append(session_obj)
-        else:
-            validation_sessions.append(session)
-    
-    is_valid, error_messages = validate_one_session_per_day(validation_sessions)
-    if is_valid:
-        print("[OK] One-session-per-day rule: PASSED")
-    else:
-        print(f"⚠️  One-session-per-day rule: {len(error_messages)} violations found")
-        for msg in error_messages[:10]:  # Show first 10 violations
-            print(f"  - {msg}")
-        if len(error_messages) > 10:
-            print(f"  ... and {len(error_messages) - 10} more violations")
-    
-    # Step 6: Verify no overlaps between electives and other courses
-    print("\nStep 6: Verifying no overlaps between electives and other courses...")
-    
-    # Get elective time slots
-    from modules_v2.phase3_elective_baskets_v2 import ELECTIVE_BASKET_SLOTS
-    
-    elective_conflicts = []
-    # Helper to extract semester from group key
-    def extract_semester_from_group(gk: str) -> int:
-        try:
-            if '.' in str(gk):
-                return int(str(gk).split('.')[0])
-            else:
-                return int(gk)
-        except (ValueError, AttributeError):
-            return -1
-    
-    for semester in unique_semesters:
-        # Find all groups for this semester
-        matching_groups = [gk for gk in ELECTIVE_BASKET_SLOTS.keys() 
-                          if extract_semester_from_group(gk) == semester]
+        # Step 5.5: Validate one-session-per-day rules
+        print("\nStep 5.5: Validating one-session-per-day rules...")
+        from utils.session_rules_validator import validate_one_session_per_day
+        from utils.data_models import ScheduledSession
         
-        if not matching_groups:
-            continue
-        
-        # Check conflicts for all groups in this semester
-        for group_key in matching_groups:
-            elective_slots = ELECTIVE_BASKET_SLOTS[group_key]
-            elective_blocks = [
-                elective_slots.get('lecture_1'),
-                elective_slots.get('lecture_2'),
-                elective_slots.get('tutorial')
-            ]
-            # Filter out None values
-            elective_blocks = [b for b in elective_blocks if b is not None]
-        
-        # Check all other sessions for conflicts with electives
-        all_other_sessions = combined_sessions + phase5_sessions + phase7_sessions
-        
-        for elective_block in elective_blocks:
-            for session in all_other_sessions:
-                session_block = None
-                session_semester = None
-                
-                if isinstance(session, dict):
-                    session_block = session.get('time_block')
-                    course_obj = session.get('course_obj')
-                    if course_obj:
-                        session_semester = getattr(course_obj, 'semester', None)
-                elif hasattr(session, 'block'):
-                    session_block = session.block
-                    # Try to get semester from section
-                    if hasattr(session, 'section'):
-                        section_label = session.section
-                        if f"-Sem{semester}" in section_label:
-                            session_semester = semester
-                
-                if session_block and session_semester == semester:
-                    if elective_block.day == session_block.day and elective_block.overlaps(session_block):
-                        course_code = session.get('course_code', '') if isinstance(session, dict) else getattr(session, 'course_code', 'Unknown')
-                        elective_conflicts.append({
-                            'semester': semester,
-                            'elective_time': f"{elective_block.day} {elective_block.start}-{elective_block.end}",
-                            'conflicting_course': course_code,
-                            'conflicting_time': f"{session_block.day} {session_block.start}-{session_block.end}"
-                        })
-    
-    if elective_conflicts:
-        print(f"  ERROR: Found {len(elective_conflicts)} conflicts with elective time slots:")
-        for conflict in elective_conflicts[:10]:  # Show first 10
-            print(f"    Sem {conflict['semester']}: {conflict['conflicting_course']} conflicts with elective at {conflict['elective_time']}")
-        if len(elective_conflicts) > 10:
-            print(f"    ... and {len(elective_conflicts) - 10} more conflicts")
-    else:
-        print("  [OK] No conflicts found between electives and other courses")
-
-    # Step 6.25: Verify no overlaps within the SAME section+period (the Excel grid should never show 2 courses at same time)
-    print("\nStep 6.25: Verifying no overlaps within each section/period...")
-    per_section_conflicts = []
-    from collections import defaultdict
-
-    # Use the same normalized session list we already built for one-session-per-day validation
-    by_section_period = defaultdict(list)
-    for s in validation_sessions:
-        if not getattr(s, "section", None) or not getattr(s, "block", None):
-            continue
-        sec = str(s.section)
-        per = str(getattr(s, "period", "PRE"))
-        by_section_period[(sec, per)].append(s)
-
-    for (sec, per), sess_list in by_section_period.items():
-        # group by day
-        by_day = defaultdict(list)
-        for s in sess_list:
-            by_day[s.block.day].append(s)
-        for day, day_sessions in by_day.items():
-            # sort by start time
-            day_sessions.sort(key=lambda x: (x.block.start.hour, x.block.start.minute, x.block.end.hour, x.block.end.minute))
-            # check overlaps
-            for i in range(len(day_sessions)):
-                for j in range(i + 1, len(day_sessions)):
-                    a = day_sessions[i]
-                    b = day_sessions[j]
-                    if a.block.overlaps(b.block):
-                        per_section_conflicts.append(
-                            f"{sec} {per} {day}: {a.course_code} {a.block.start}-{a.block.end} overlaps {b.course_code} {b.block.start}-{b.block.end}"
-                        )
-
-    if per_section_conflicts:
-        print(f"  ERROR: Found {len(per_section_conflicts)} per-section time overlaps:")
-        for msg in per_section_conflicts[:10]:
-            print(f"    - {msg}")
-        if len(per_section_conflicts) > 10:
-            print(f"    ... and {len(per_section_conflicts) - 10} more")
-    else:
-        print("  [OK] No per-section overlaps detected")
-    
-    # The new time slot allocation should prevent conflicts:
-    # - Semester 1 combined courses: Tuesday/Thursday 14:00-16:45 (afternoon)
-    # - Semester 3 combined courses: Monday/Wednesday/Friday mornings (09:00-10:30)
-    # - Electives: Sem1 (Mon/Wed/Fri 09:00), Sem3 (Mon/Wed/Fri 11:00), Sem5 (Mon/Wed/Fri 14:00)
-    
-    print("\nTime slot design summary:")
-    print("  - Semester 1 combined courses: Tuesday/Thursday afternoons (14:00-16:45)")
-    print("  - Semester 3 combined courses: Monday/Wednesday/Friday mornings (09:00-10:30)")
-    print("  - Electives: Sem1 (09:00), Sem3 (11:00), Sem5 (14:00) - no overlaps")
-    
-    # Step 6.5: Final validation - Check all time slots are within 9:00-18:00
-    print("\nStep 6.5: Final validation - Checking all time slots are within 9:00-18:00...")
-    from utils.time_validator import validate_time_range
-    from datetime import time
-    
-    all_sessions_for_validation = combined_sessions + phase5_sessions + phase7_sessions
-    time_violations = []
-    for session in all_sessions_for_validation:
-        if isinstance(session, dict):
-            time_block = session.get('time_block')
-            if time_block:
-                if not validate_time_range(time_block.start, time_block.end):
-                    course_code = session.get('course_code', 'Unknown')
-                    time_violations.append(f"{course_code}: {time_block.start}-{time_block.end}")
-        elif hasattr(session, 'block'):
-            if not validate_time_range(session.block.start, session.block.end):
-                time_violations.append(f"{session.course_code}: {session.block.start}-{session.block.end}")
-    
-    if time_violations:
-        print(f"WARNING: Found {len(time_violations)} time violations (outside 9:00-18:00):")
-        for violation in time_violations[:10]:  # Show first 10
-            print(f"  {violation}")
-        if len(time_violations) > 10:
-            print(f"  ... and {len(time_violations) - 10} more violations")
-    else:
-        print("[OK] All time slots are within 9:00-18:00")
-    
-    # Step 6.75: Final classroom conflict resolution after all rescheduling
-    print("\nStep 6.75: Final classroom conflict check after all rescheduling...")
-    try:
-        from modules_v2.phase8_classroom_assignment import detect_room_conflicts
-        from utils.room_conflict_resolver import resolve_room_conflicts
-
-        # Elective room sessions list may have been built earlier; fetch if present
-        elective_sessions_for_rooms = locals().get("elective_sessions_with_rooms", None)
-
-        final_room_conflicts = detect_room_conflicts(
-            phase5_sessions,
-            phase7_sessions,
-            combined_sessions,
-            elective_sessions_for_rooms,
-            classrooms,
-        )
-        if final_room_conflicts:
-            print(
-                f"  Found {len(final_room_conflicts)} room conflict(s) after "
-                "faculty/section moves; resolving again..."
-            )
-            _, remaining_final = resolve_room_conflicts(
-                phase5_sessions,
-                phase7_sessions,
-                combined_sessions,
-                elective_sessions_for_rooms,
-                classrooms,
-                max_passes=5,
-            )
-            room_conflicts_after = detect_room_conflicts(
-                phase5_sessions,
-                phase7_sessions,
-                combined_sessions,
-                elective_sessions_for_rooms,
-                classrooms,
-            )
-            if room_conflicts_after:
-                print(
-                    f"  WARNING: {len(room_conflicts_after)} room conflict(s) "
-                    "remain after final pass."
+        # Convert combined_sessions to ScheduledSession objects for validation
+        validation_sessions = []
+        for session_val_check in all_sessions:
+            if isinstance(session_val_check, dict):
+                # Convert dict to ScheduledSession
+                session_obj_check = ScheduledSession(
+                    course_code=session_val_check.get('course_code', '').split('-')[0],
+                    section=session_val_check.get('sections', [None])[0] if session_val_check.get('sections') else None,
+                    kind=session_val_check.get('session_type', 'L'),
+                    block=session_val_check.get('time_block'),
+                    room=session_val_check.get('room'),
+                    period=session_val_check.get('period', 'PRE'),
+                    faculty=session_val_check.get('instructor', 'TBD')
                 )
+                validation_sessions.append(session_obj_check)
+            else:
+                validation_sessions.append(session_val_check)
+        
+        is_valid_check, error_messages_check = validate_one_session_per_day(validation_sessions)
+        if is_valid_check:
+            print("[OK] One-session-per-day rule: PASSED")
+        else:
+            print(f"⚠️  One-session-per-day rule: {len(error_messages_check)} violations found")
+            for msg_check in error_messages_check[:10]:  # Show first 10 violations
+                print(f"  - {msg_check}")
+            if len(error_messages_check) > 10:
+                print(f"  ... and {len(error_messages_check) - 10} more violations")
+    
+        # Step 6: Verify no overlaps between electives and other courses
+        print("\nStep 6: Verifying no overlaps between electives and other courses...")
+        
+        # Get elective time slots
+        from modules_v2.phase3_elective_baskets_v2 import ELECTIVE_BASKET_SLOTS
+        
+        elective_conflicts = []
+        # Helper to extract semester from group key
+        def extract_semester_from_group_local(gk: str) -> int:
+            try:
+                if '.' in str(gk):
+                    return int(str(gk).split('.')[0])
+                else:
+                    return int(gk)
+            except (ValueError, AttributeError):
+                return -1
+        
+        for sem_val in unique_semesters:
+            # Find all groups for this semester
+            matching_groups_local = [gk for gk in ELECTIVE_BASKET_SLOTS.keys() 
+                                    if extract_semester_from_group_local(gk) == sem_val]
+            
+            if not matching_groups_local:
+                continue
+            
+            # Check conflicts for all groups in this semester
+            elective_blocks_local = []
+            for group_key_local in matching_groups_local:
+                elective_slots_local = ELECTIVE_BASKET_SLOTS[group_key_local]
+                eb_list = [
+                    elective_slots_local.get('lecture_1'),
+                    elective_slots_local.get('lecture_2'),
+                    elective_slots_local.get('tutorial')
+                ]
+                elective_blocks_local.extend([b for b in eb_list if b is not None])
+            
+            # Check all other sessions
+            all_other_sessions_local = combined_sessions + phase5_sessions + phase7_sessions
+            
+            for eb_local in elective_blocks_local:
+                for session_local in all_other_sessions_local:
+                    s_block = None
+                    s_semester = None
+                    
+                    if isinstance(session_local, dict):
+                        s_block = session_local.get('time_block')
+                        course_obj_local = session_local.get('course_obj')
+                        if course_obj_local:
+                            s_semester = getattr(course_obj_local, 'semester', None)
+                    elif hasattr(session_local, 'block'):
+                        s_block = session_local.block
+                        if hasattr(session_local, 'section'):
+                            if f"-Sem{sem_val}" in session_local.section:
+                                s_semester = sem_val
+                    
+                    if s_block and s_semester == sem_val:
+                        if eb_local.day == s_block.day and eb_local.overlaps(s_block):
+                            c_code = session_local.get('course_code', '') if isinstance(session_local, dict) else getattr(session_local, 'course_code', 'Unknown')
+                            elective_conflicts.append({
+                                'semester': sem_val,
+                                'elective_time': f"{eb_local.day} {eb_local.start}-{eb_local.end}",
+                                'conflicting_course': c_code,
+                                'conflicting_time': f"{s_block.day} {s_block.start}-{s_block.end}"
+                            })
+        
+        if elective_conflicts:
+            print(f"  ERROR: Found {len(elective_conflicts)} conflicts with elective time slots:")
+        else:
+            print("  [OK] No conflicts found between electives and other courses")
+
+        # Step 6.25: Verify no overlaps within the SAME section+period
+        print("\nStep 6.25: Verifying no overlaps within each section/period...")
+        per_section_conflicts = []
+        
+        # Use simple local by_section_period
+        by_sec_per_local = defaultdict(list)
+        for s_val in validation_sessions:
+            if not getattr(s_val, "section", None) or not getattr(s_val, "block", None):
+                continue
+            by_sec_per_local[(str(s_val.section), str(getattr(s_val, "period", "PRE")))].append(s_val)
+
+        for (sec_val, per_val), sess_list_val in by_sec_per_local.items():
+            by_day_val = defaultdict(list)
+            for s_val in sess_list_val:
+                by_day_val[s_val.block.day].append(s_val)
+            for day_val, day_sess_val in by_day_val.items():
+                day_sess_val.sort(key=lambda x: (x.block.start.hour, x.block.start.minute))
+                for i_val in range(len(day_sess_val)):
+                    for j_val in range(i_val + 1, len(day_sess_val)):
+                        if day_sess_val[i_val].block.overlaps(day_sess_val[j_val].block):
+                            per_section_conflicts.append(f"{sec_val} {per_val} {day_val}: overlap detected")
+
+        if per_section_conflicts:
+            print(f"  ERROR: Found {len(per_section_conflicts)} per-section time overlaps.")
+        else:
+            print("  [OK] No per-section overlaps detected")
+    
+        # The new time slot allocation should prevent conflicts:
+        # - Semester 1 combined courses: Tuesday/Thursday 14:00-16:45 (afternoon)
+        # - Semester 3 combined courses: Monday/Wednesday/Friday mornings (09:00-10:30)
+        # - Electives: Sem1 (Mon/Wed/Fri 09:00), Sem3 (Mon/Wed/Fri 11:00), Sem5 (Mon/Wed/Fri 14:00)
+    
+        # Step 6.75: Final classroom conflict check
+        print("\nStep 6.75: Final classroom conflict check after all rescheduling...")
+        try:
+            from modules_v2.phase8_classroom_assignment import detect_room_conflicts, resolve_room_conflicts
+            r_conflicts_final = detect_room_conflicts(
+                phase5_sessions, phase7_sessions, combined_sessions,
+                locals().get("elective_sessions_with_rooms", None), classrooms
+            )
+            if r_conflicts_final:
+                print(f"  Found {len(r_conflicts_final)} room conflict(s); resolving...")
+                _, r_conflicts_final = resolve_room_conflicts(
+                    phase5_sessions, phase7_sessions, combined_sessions,
+                    locals().get("elective_sessions_with_rooms", None), classrooms
+                )
+            if r_conflicts_final:
+                print(f"  WARNING: {len(r_conflicts_final)} room conflicts remain.")
             else:
                 print("  [OK] 0 classroom conflicts after final pass.")
-        else:
-            print("  [OK] No classroom conflicts after rescheduling.")
-    except Exception as e:
-        print(f"WARNING: Final classroom conflict check failed: {e}")
-        import traceback
-        traceback.print_exc()
+        except Exception as e_room_final:
+            print(f"WARNING: Final classroom conflict check failed: {e_room_final}")
+            import traceback
+            traceback.print_exc()
     
-    # Step 7: Create timetable with all sessions
+    # Ensure all_sessions is populated if we didn't go through the else block above
+    if sessions_from_log is not None:
+        all_sessions = sessions_from_log
+
+    # Step 5.6: Run Phase 10 - Course Color Assignment
+    print("\n" + "="*80)
+    print("Step 5.6: Running Phase 10 - Course Color Assignment...")
+    print("="*80)
+    try:
+        from modules_v2.phase10_course_colors import run_phase10
+        course_colors = run_phase10(courses)
+    except Exception as e:
+        print(f"WARNING: Phase 10 failed. Continuing without course colors. Reason: {e}")
+        course_colors = {}
+
     print("\nStep 7: Creating 24 sheets with all sessions...")
     
     # Define sections, semesters, and periods
@@ -3090,6 +3056,8 @@ def generate_24_sheets():
     
     # Create writer
     writer = TimetableWriterV2(course_colors=course_colors)
+    
+    final_ui_sessions = []
     
     # Generate sheets for each combination
     sheet_count = 0
@@ -3129,6 +3097,7 @@ def generate_24_sheets():
                         courses=courses,
                         final_sessions_all_days=accumulated_final_sessions,
                         extra_candidates=extra,
+                        sessions_from_log=sessions_from_log
                     )
                     for t in deferred:
                         target_day = t[0].day
@@ -3138,6 +3107,26 @@ def generate_24_sheets():
                     grid_sessions_dict[day] = schedule_grid.sessions
                     for s in schedule_grid.sessions:
                         accumulated_final_sessions.append(s)  # (block, course) each
+                        
+                        # Add to our final_ui_sessions list for re-logging
+                        block, course_display = s
+                        if course_display != "LUNCH" and course_display != "Break(15min)":
+                            section_key = f"{section_name}-Sem{semester}"
+                            stype = 'L'
+                            if '-TUT' in course_display: stype = 'T'
+                            elif '-LAB' in course_display: stype = 'P'
+                            if course_display.startswith("ELECTIVE_BASKET_"): stype = 'ELECTIVE'
+                            
+                            final_ui_sessions.append({
+                                'course_code': course_display,
+                                'section': section_key,
+                                'day': day,
+                                'start_time': block.start,
+                                'end_time': block.end,
+                                'period': normalize_period(period),
+                                'session_type': stype
+                            })
+
                     current_row = writer.write_day_schedule(sheet, day, schedule_grid, current_row)
                     current_row += 1
                 print("[OK] Done")
@@ -3216,9 +3205,12 @@ def generate_24_sheets():
     print("Creating summary sheet...")
     writer.create_summary_sheet(courses)
     
+    # Set base output directory
+    base_out_dir = "DATA/EDITED OUTPUT" if sessions_from_log is not None else "DATA/OUTPUT"
+    
     # Save the main timetable workbook
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_path = f"DATA/OUTPUT/IIITDWD_24_Sheets_v2_{timestamp}.xlsx"
+    output_path = f"{base_out_dir}/IIITDWD_24_Sheets_v2_{timestamp}.xlsx"
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     writer.save_timetable(output_path)
     
@@ -3229,17 +3221,69 @@ def generate_24_sheets():
     # Print time slot logging summary
     from utils.time_slot_logger import get_logger
     logger = get_logger()
+    
+    # RECONSTRUCT LOGGER FROM FINAL EXCEL GRIDS TO ENSURE 1:1 UI SYNC
+    logger.entries = []
+    logger._seen = set()
+    for s in final_ui_sessions:
+        course_display = s['course_code']
+        base_code = course_display.replace('-TUT', '').replace('-LAB', '').split('-')[0]
+        section_key = s['section']
+        
+        # Determine room
+        room = ""
+        comb_sess = next((cs for cs in combined_sessions if isinstance(cs, dict) and cs.get('course_code') == course_display and any(str(sec).startswith(section_key) for sec in cs.get('sections', []))), None)
+        if comb_sess and comb_sess.get('room'):
+            room = comb_sess['room']
+        elif room_assignments and section_key in room_assignments and base_code in room_assignments[section_key]:
+            room = room_assignments[section_key][base_code]
+            
+        # Determine faculty
+        faculty = ""
+        if comb_sess and comb_sess.get('instructor'):
+            faculty = comb_sess['instructor']
+        else:
+            course_obj = next((c for c in courses if getattr(c, 'code', '') == base_code), None)
+            if course_obj and hasattr(course_obj, 'instructor_name'):
+                faculty = course_obj.instructor_name
+                
+        # If generating from log (UI edits), preserve original Room and Faculty
+        if sessions_from_log is not None:
+             orig_s = next((os_item for os_item in sessions_from_log if 
+                  os_item.get('Section') == section_key and 
+                  os_item.get('Course Code') == course_display and 
+                  str(os_item.get('Day')).strip().upper() == str(s['day']).strip().upper() and 
+                  str(os_item.get('Start Time')).replace(':', '') == s['start_time'].strftime("%H%M")
+             ), None)
+             if orig_s:
+                 room = orig_s.get('Room') or room
+                 faculty = orig_s.get('Faculty') or faculty
+
+                
+        logger.log_slot(
+            phase="Final",
+            course_code=course_display,
+            section=s['section'],
+            day=s['day'],
+            start_time=s['start_time'],
+            end_time=s['end_time'],
+            period=s['period'],
+            session_type=s['session_type'],
+            room=room,
+            faculty=faculty
+        )
+
     logger.print_summary()
     
     # Export time slot log to CSV
-    log_output_path = f"DATA/OUTPUT/time_slot_log_{timestamp}.csv"
+    log_output_path = f"{base_out_dir}/time_slot_log_{timestamp}.csv"
     logger.export_to_csv(log_output_path)
 
     # ------------------------------------------------------------------
     # Faculty-level outputs: per-faculty timetables + conflict summary
     # ------------------------------------------------------------------
     try:
-        faculty_tt_path = f"DATA/OUTPUT/faculty_timetables_{timestamp}.xlsx"
+        faculty_tt_path = f"{base_out_dir}/faculty_timetables_{timestamp}.xlsx"
         print(f"\nCreating per-faculty timetables at: {faculty_tt_path}")
 
         # Include synthetic elective sessions with faculty names so electives
@@ -3292,6 +3336,26 @@ def generate_24_sheets():
     # and room clash information is included in the classroom timetables workbook (SUMMARY sheet).
 
     return output_path, timestamp
+
+
+def generate_24_sheets_from_log(log_path: str, timestamp: str) -> str:
+    """Regenerate 24 Excel sheets from an existing time_slot_log CSV.
+    The caller already wrote the dragged sessions to log_path.
+    """
+    import os as _os
+    import pandas as pd
+    log_path = _os.path.abspath(log_path)
+    if not _os.path.exists(log_path):
+        raise FileNotFoundError(f"Log file not found: {log_path}")
+    
+    # Load sessions from CSV
+    df = pd.read_csv(log_path)
+    sessions = df.to_dict('records')
+    
+    # Call generate_24_sheets with the sessions to skip scheduling steps
+    output_path, _ts = generate_24_sheets(sessions_from_log=sessions)
+    return output_path
+
 
 def main():
     """Main function to generate 24 sheets"""

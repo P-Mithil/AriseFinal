@@ -178,6 +178,7 @@ function MainContent({
 }: MainContentProps) {
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null)
   const [lastMovedSessionId, setLastMovedSessionId] = useState<string | null>(null)
+  const [generateSheetsLoading, setGenerateSheetsLoading] = useState(false)
 
   const selectedSemester = useMemo(() => getSemesterFromSection(selectedSection), [selectedSection])
 
@@ -227,10 +228,11 @@ function MainContent({
     () => (selectedSection ? `${selectedSection}-${normalizePeriod(selectedPeriod)}` : null),
     [selectedSection, selectedPeriod],
   )
-  const verificationRows = useMemo(
-    () => (sectionPeriodKey && verificationTable[sectionPeriodKey]) ? verificationTable[sectionPeriodKey] : [],
-    [sectionPeriodKey, verificationTable],
-  )
+  const verificationRows = useMemo(() => {
+    const rows = (sectionPeriodKey && verificationTable[sectionPeriodKey]) ? verificationTable[sectionPeriodKey] : []
+    console.log('[DEBUG] sectionPeriodKey:', sectionPeriodKey, '| VT has key?', sectionPeriodKey ? (sectionPeriodKey in verificationTable) : 'N/A', '| rows:', rows.length)
+    return rows
+  }, [sectionPeriodKey, verificationTable])
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
@@ -252,6 +254,8 @@ function MainContent({
       if (!data.success) {
         throw new Error('Generation failed')
       }
+      console.log('[DEBUG] VT keys:', Object.keys(data.verification_table ?? {}))
+      console.log('[DEBUG] sectionPeriodKey would be:', selectedSection ? `${selectedSection}-${normalizePeriod(selectedPeriod)}` : null)
       onGenerateFirst(data.timetable, data.labels, data.verification_table)
     } catch (err: any) {
       setMessage(`Generate failed: ${err.message ?? String(err)}`)
@@ -280,6 +284,32 @@ function MainContent({
       setMessage(`Verify failed: ${err.message ?? String(err)}`)
     }
   }, [timetable, onVerifyResult, setMessage])
+
+  const handleGenerateFromSessions = useCallback(async () => {
+    if (!timetable) return
+    setGenerateSheetsLoading(true)
+    setMessage(null)
+    try {
+      const res = await fetch(`${API_BASE}/api/generate-from-sessions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessions: timetable }),
+      })
+      if (!res.ok) {
+        const text = await res.text()
+        throw new Error(text || res.statusText)
+      }
+      const data = (await res.json()) as GenerateResponse
+      if (!data.success) throw new Error('Sheet generation failed')
+      // Update timetable with refreshed data
+      onGenerateFirst(data.timetable, data.labels, data.verification_table)
+      setMessage('✅ 24 sheets generated successfully from your changes!')
+    } catch (err: any) {
+      setMessage(`Generate sheets failed: ${err.message ?? String(err)}`)
+    } finally {
+      setGenerateSheetsLoading(false)
+    }
+  }, [timetable, onGenerateFirst, setMessage])
 
   const handleReflow = useCallback(async () => {
     if (!timetable || !lastMovedSessionId) return
@@ -349,7 +379,6 @@ function MainContent({
 
       // Try push right for conflicting sessions so the dropped slot always shows the dragged course
       const MAX_PUSH_CHAIN = 3
-      const sessionsOnDay = [...sameDaySessions]
 
       const tryPushRight = (
         toMove: { session: Session; idx: number; startMin: number; endMin: number; duration: number },
@@ -359,9 +388,18 @@ function MainContent({
         minStart?: number,
       ): Session[] | null => {
         if (depth > MAX_PUSH_CHAIN) return null
-        const others = sessionsOnDay.filter(
-          (c) => c.idx !== toMove.idx && !excludeIds.has((c.session as any).id as string),
-        )
+
+        // Evaluate overlaps against ALL sessions on the same day in currentState (except toMove itself)
+        const relevantHelpers = currentState
+          .map((s, i) => ({ session: s, idx: i }))
+          .filter(
+            (c) =>
+              c.session.Day === day &&
+              c.session.Section === selectedSection &&
+              normalizePeriod(c.session.Period) === normalizePeriod(selectedPeriod) &&
+              c.idx !== toMove.idx
+          )
+
         let cursor = Math.max(toMove.endMin, minStart ?? 0)
         cursor = alignTo15(cursor)
         if (lunchStartMin != null && lunchEndMin != null && intervalOverlaps(cursor, cursor + toMove.duration, lunchStartMin, lunchEndMin)) {
@@ -374,7 +412,7 @@ function MainContent({
             cursor = alignTo15(lunchEndMin)
             continue
           }
-          const overlaps = others.filter((o) => {
+          const overlaps = relevantHelpers.filter((o) => {
             const oStart = parseTimeToMinutes(
               currentState[o.idx]['Start Time'],
             )
@@ -385,35 +423,43 @@ function MainContent({
             const nextState = currentState.map((s, idx) =>
               idx === toMove.idx
                 ? {
-                    ...s,
-                    Day: day,
-                    'Start Time': minutesToTime(candStart),
-                    'End Time': minutesToTime(candEnd),
-                  }
+                  ...s,
+                  Day: day,
+                  'Start Time': minutesToTime(candStart),
+                  'End Time': minutesToTime(candEnd),
+                }
                 : s,
             )
             return nextState
           }
           if (overlaps.length === 1 && depth < MAX_PUSH_CHAIN) {
-            const pushed = tryPushRight(
-              { ...overlaps[0], startMin: parseTimeToMinutes(currentState[overlaps[0].idx]['Start Time']), endMin: parseTimeToMinutes(currentState[overlaps[0].idx]['End Time']) },
-              currentState,
-              new Set([...excludeIds, (toMove.session as any).id as string]),
-              depth + 1,
-              candEnd,
-            )
-            if (pushed) {
-              const nextState = pushed.map((s, idx) =>
-                idx === toMove.idx
-                  ? {
+            const overlapping = overlaps[0]
+            const oId = (overlapping.session as any).id as string
+
+            // Only try to push if the overlapping obstacle is NOT an anchored/excluded session (like the currently dragged session)
+            if (!excludeIds.has(oId)) {
+              const oStartMap = parseTimeToMinutes(currentState[overlapping.idx]['Start Time'])
+              const oEndMap = parseTimeToMinutes(currentState[overlapping.idx]['End Time'])
+              const pushed = tryPushRight(
+                { session: overlapping.session, idx: overlapping.idx, startMin: oStartMap, endMin: oEndMap, duration: oEndMap - oStartMap },
+                currentState,
+                new Set([...excludeIds, (toMove.session as any).id as string]),
+                depth + 1,
+                candEnd,
+              )
+              if (pushed) {
+                const nextState = pushed.map((s, idx) =>
+                  idx === toMove.idx
+                    ? {
                       ...s,
                       Day: day,
                       'Start Time': minutesToTime(candStart),
                       'End Time': minutesToTime(candEnd),
                     }
-                  : s,
-              )
-              return nextState
+                    : s,
+                )
+                return nextState
+              }
             }
           }
           cursor += 15
@@ -425,11 +471,11 @@ function MainContent({
         const baseState = timetable.map((s, idx) =>
           idx === draggedIndex
             ? {
-                ...s,
-                Day: day,
-                'Start Time': minutesToTime(newStartMin),
-                'End Time': minutesToTime(newEndMin),
-              }
+              ...s,
+              Day: day,
+              'Start Time': minutesToTime(newStartMin),
+              'End Time': minutesToTime(newEndMin),
+            }
             : s,
         )
         let pushedState: Session[] | null = baseState
@@ -466,11 +512,11 @@ function MainContent({
       updated = timetable.map((s, idx) =>
         idx === draggedIndex
           ? {
-              ...s,
-              Day: day,
-              'Start Time': minutesToTime(newStartMin),
-              'End Time': minutesToTime(newEndMin),
-            }
+            ...s,
+            Day: day,
+            'Start Time': minutesToTime(newStartMin),
+            'End Time': minutesToTime(newEndMin),
+          }
           : s,
       )
       onTimetableChange(updated)
@@ -529,128 +575,128 @@ function MainContent({
           onDragEnd={handleDndDragEnd}
         >
           <table className="grid-table">
-          <thead>
-            <tr>
-              <th>Day / Time</th>
-              {timeSlots.map((slot) => {
-                const [slotStart] = slot.split('-')
-                const isHourStart = slotStart.endsWith(':00')
+            <thead>
+              <tr>
+                <th>Day / Time</th>
+                {timeSlots.map((slot) => {
+                  const [slotStart] = slot.split('-')
+                  const isHourStart = slotStart.endsWith(':00')
+                  return (
+                    <th key={slot} className={`time-col${isHourStart ? ' hour-start' : ''}`}>
+                      {slotStart}
+                    </th>
+                  )
+                })}
+              </tr>
+            </thead>
+            <tbody>
+              {workingDays.map((day) => {
+                const sessionsForDay = filteredSessions
+                  .filter((s) => s.Day === day)
+                  .sort(
+                    (a, b) =>
+                      parseTimeToMinutes(a['Start Time']) - parseTimeToMinutes(b['Start Time']),
+                  )
+
+                // Compute 15-minute break starts between consecutive sessions
+                const breakStarts = new Set<string>()
+                for (let idx = 0; idx < sessionsForDay.length - 1; idx += 1) {
+                  const currentEnd = parseTimeToMinutes(sessionsForDay[idx]['End Time'])
+                  const nextStart = parseTimeToMinutes(sessionsForDay[idx + 1]['Start Time'])
+                  if (nextStart - currentEnd === 15) {
+                    breakStarts.add(minutesToTime(currentEnd))
+                  }
+                }
+
+                const rowCells: ReactNode[] = []
+                let i = 0
+
+                while (i < timeSlots.length) {
+                  const slot = timeSlots[i]
+                  const [slotStart] = slot.split('-')
+
+                  // Lunch block (permanent, non-draggable, non-droppable)
+                  if (lunchWindow && normalizeTimeStr(lunchWindow.start) === slotStart) {
+                    const startMin = parseTimeToMinutes(lunchWindow.start)
+                    const endMin = parseTimeToMinutes(lunchWindow.end)
+                    const span = Math.max(1, Math.floor((endMin - startMin) / 15))
+                    rowCells.push(
+                      <td
+                        key={`${day}-lunch-${slotStart}`}
+                        colSpan={span}
+                        className="grid-cell lunch"
+                      >
+                        <div className="grid-block grid-block-lunch">LUNCH BREAK</div>
+                      </td>,
+                    )
+                    i += span
+                    continue
+                  }
+
+                  // Does a real session start at this slot? (normalize so "9:00" matches "09:00")
+                  const session = sessionsForDay.find(
+                    (s) => normalizeTimeStr(s['Start Time']) === slotStart,
+                  )
+
+                  if (session) {
+                    const startMin = parseTimeToMinutes(session['Start Time'])
+                    const endMin = parseTimeToMinutes(session['End Time'])
+                    const span = Math.max(1, Math.floor((endMin - startMin) / 15))
+                    const droppableId = slotDroppableId(day, slotStart)
+
+                    rowCells.push(
+                      <DroppableCellTd
+                        key={`${day}-${slotStart}`}
+                        colSpan={span}
+                        className="grid-cell occupied"
+                        droppableId={droppableId}
+                      >
+                        <DraggableSessionBlock session={session} />
+                      </DroppableCellTd>,
+                    )
+                    i += span
+                    continue
+                  }
+
+                  // Temporary 15-min BREAK block (droppable)
+                  if (breakStarts.has(slotStart)) {
+                    const droppableId = slotDroppableId(day, slotStart)
+                    rowCells.push(
+                      <DroppableCellTd
+                        key={`${day}-break-${slotStart}`}
+                        className="grid-cell break"
+                        droppableId={droppableId}
+                      >
+                        <div className="grid-block grid-block-break">BREAK</div>
+                      </DroppableCellTd>,
+                    )
+                    i += 1
+                    continue
+                  }
+
+                  // Empty slot
+                  {
+                    const droppableId = slotDroppableId(day, slotStart)
+                    rowCells.push(
+                      <DroppableCellTd
+                        key={`${day}-${slot}`}
+                        className="grid-cell empty"
+                        droppableId={droppableId}
+                        children={null}
+                      />,
+                    )
+                  }
+                  i += 1
+                }
+
                 return (
-                  <th key={slot} className={`time-col${isHourStart ? ' hour-start' : ''}`}>
-                    {slotStart}
-                  </th>
+                  <tr key={day}>
+                    <th>{day}</th>
+                    {rowCells}
+                  </tr>
                 )
               })}
-            </tr>
-          </thead>
-          <tbody>
-            {workingDays.map((day) => {
-              const sessionsForDay = filteredSessions
-                .filter((s) => s.Day === day)
-                .sort(
-                  (a, b) =>
-                    parseTimeToMinutes(a['Start Time']) - parseTimeToMinutes(b['Start Time']),
-                )
-
-              // Compute 15-minute break starts between consecutive sessions
-              const breakStarts = new Set<string>()
-              for (let idx = 0; idx < sessionsForDay.length - 1; idx += 1) {
-                const currentEnd = parseTimeToMinutes(sessionsForDay[idx]['End Time'])
-                const nextStart = parseTimeToMinutes(sessionsForDay[idx + 1]['Start Time'])
-                if (nextStart - currentEnd === 15) {
-                  breakStarts.add(minutesToTime(currentEnd))
-                }
-              }
-
-              const rowCells: ReactNode[] = []
-              let i = 0
-
-              while (i < timeSlots.length) {
-                const slot = timeSlots[i]
-                const [slotStart] = slot.split('-')
-
-                // Lunch block (permanent, non-draggable, non-droppable)
-                if (lunchWindow && normalizeTimeStr(lunchWindow.start) === slotStart) {
-                  const startMin = parseTimeToMinutes(lunchWindow.start)
-                  const endMin = parseTimeToMinutes(lunchWindow.end)
-                  const span = Math.max(1, Math.floor((endMin - startMin) / 15))
-                  rowCells.push(
-                    <td
-                      key={`${day}-lunch-${slotStart}`}
-                      colSpan={span}
-                      className="grid-cell lunch"
-                    >
-                      <div className="grid-block grid-block-lunch">LUNCH BREAK</div>
-                    </td>,
-                  )
-                  i += span
-                  continue
-                }
-
-                // Does a real session start at this slot? (normalize so "9:00" matches "09:00")
-                const session = sessionsForDay.find(
-                  (s) => normalizeTimeStr(s['Start Time']) === slotStart,
-                )
-
-                if (session) {
-                  const startMin = parseTimeToMinutes(session['Start Time'])
-                  const endMin = parseTimeToMinutes(session['End Time'])
-                  const span = Math.max(1, Math.floor((endMin - startMin) / 15))
-                  const droppableId = slotDroppableId(day, slotStart)
-
-                  rowCells.push(
-                    <DroppableCellTd
-                      key={`${day}-${slotStart}`}
-                      colSpan={span}
-                      className="grid-cell occupied"
-                      droppableId={droppableId}
-                    >
-                      <DraggableSessionBlock session={session} />
-                    </DroppableCellTd>,
-                  )
-                  i += span
-                  continue
-                }
-
-                // Temporary 15-min BREAK block (droppable)
-                if (breakStarts.has(slotStart)) {
-                  const droppableId = slotDroppableId(day, slotStart)
-                  rowCells.push(
-                    <DroppableCellTd
-                      key={`${day}-break-${slotStart}`}
-                      className="grid-cell break"
-                      droppableId={droppableId}
-                    >
-                      <div className="grid-block grid-block-break">BREAK</div>
-                    </DroppableCellTd>,
-                  )
-                  i += 1
-                  continue
-                }
-
-                // Empty slot
-                {
-                  const droppableId = slotDroppableId(day, slotStart)
-                  rowCells.push(
-                    <DroppableCellTd
-                      key={`${day}-${slot}`}
-                      className="grid-cell empty"
-                      droppableId={droppableId}
-                      children={null}
-                    />,
-                  )
-                }
-                i += 1
-              }
-
-              return (
-                <tr key={day}>
-                  <th>{day}</th>
-                  {rowCells}
-                </tr>
-              )
-            })}
-          </tbody>
+            </tbody>
           </table>
 
           <DragOverlay>
@@ -686,7 +732,7 @@ function MainContent({
             {generateLoading ? 'Generating…' : 'Generate'}
           </button>
           <button type="button" onClick={handleVerify} disabled={!timetable}>
-            Generate after drag (Verify)
+            Verify Drag Changes
           </button>
           <button type="button" onClick={revertToFirst} disabled={!firstGeneratedTimetable}>
             Revert to first timetable
@@ -696,7 +742,19 @@ function MainContent({
 
       {message && <div className="main-message">{message}</div>}
 
-      {verifySuccess && <div className="main-success">Verification passed. Timetable is safe.</div>}
+      {verifySuccess && (
+        <div className="main-success">
+          <span>✅ Verification passed — timetable is conflict-free!</span>
+          <button
+            type="button"
+            className="btn-generate-sheets"
+            onClick={handleGenerateFromSessions}
+            disabled={generateSheetsLoading}
+          >
+            {generateSheetsLoading ? 'Generating sheets…' : '📄 Generate 24 Sheets from Changes'}
+          </button>
+        </div>
+      )}
 
       {verifyErrors.length > 0 && (
         <div className="main-errors">
@@ -740,11 +798,14 @@ function MainContent({
               <tr>
                 <th>Code</th>
                 <th>Course Name</th>
+                <th>Instructor</th>
                 <th>LTPSC</th>
+                <th>Assigned Room(s)</th>
                 <th>Lectures (Req/Sched)</th>
                 <th>Tutorials (Req/Sched)</th>
                 <th>Labs (Req/Sched)</th>
                 <th>Status</th>
+                <th>Issues / Conflicts</th>
               </tr>
             </thead>
             <tbody>
@@ -752,12 +813,21 @@ function MainContent({
                 <tr key={`${row.code}-${idx}`}>
                   <td>{row.code}</td>
                   <td>{row.course_name}</td>
+                  <td>{row.instructor ?? ''}</td>
                   <td>{row.ltpsc ?? ''}</td>
+                  <td>
+                    {row.assigned_classroom ? <div>Class: {row.assigned_classroom}</div> : null}
+                    {row.assigned_lab ? <div>Lab: {row.assigned_lab}</div> : null}
+                  </td>
                   <td>{row.lectures ?? ''}</td>
                   <td>{row.tutorials ?? ''}</td>
                   <td>{row.labs ?? ''}</td>
                   <td className={row.status?.toUpperCase() === 'SATISFIED' ? 'status-satisfied' : 'status-unsatisfied'}>
                     {row.status ?? ''}
+                  </td>
+                  <td className="issues-cell">
+                    {row.time_slot_issues && row.time_slot_issues !== 'None' ? <div className="text-error">{row.time_slot_issues}</div> : null}
+                    {row.room_conflicts && row.room_conflicts !== 'None' ? <div className="text-error">{row.room_conflicts}</div> : null}
                   </td>
                 </tr>
               ))}

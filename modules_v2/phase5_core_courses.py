@@ -1230,20 +1230,27 @@ def run_phase5(courses: List[Course], sections: List[Section], classrooms: List[
         if course.is_combined:
             continue
         
-        # Deduplicate by code+dept+sem+credits to avoid picking up wrong course with same code
-        key = (course.code, course.department, course.semester, course.credits)
+        # Deduplicate by code+sem+credits to avoid picking up same course multiple times across departments
+        key = (course.code, course.semester, course.credits)
         if key not in seen:
             seen[key] = course
+            # Store all departments this course belongs to
+            course._departments_list = [course.department]
             phase5_courses.append(course)
-            print(f"  Phase 5 course: {course.code} ({course.name}) - {course.credits} credits - {course.department} Sem{course.semester}")
+            print(f"  Phase 5 course: {course.code} ({course.name}) - {course.credits} credits - Sem{course.semester}")
+        else:
+            # Append department to the existing course
+            if course.department not in seen[key]._departments_list:
+                seen[key]._departments_list.append(course.department)
     
     print(f"Found {len(phase5_courses)} Phase 5 courses to schedule")
     
-    # Group courses by semester and department
+    # Group courses by semester and departments (a course can belong to multiple)
     courses_by_sem_dept = defaultdict(list)
     for course in phase5_courses:
-        key = (course.semester, course.department)
-        courses_by_sem_dept[key].append(course)
+        for dept in course._departments_list:
+            key = (course.semester, dept)
+            courses_by_sem_dept[key].append(course)
     
     # Create occupied slots map from existing sessions (electives + combined)
     occupied_slots = defaultdict(list)

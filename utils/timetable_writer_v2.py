@@ -1368,7 +1368,24 @@ class TimetableWriterV2:
                             total_tutorials += 1
                         else:
                             total_lectures += 1
-                
+                # 4) If phase lists are empty/skipped (like in Log Regeneration), rely entirely on `grid_sessions`.
+                if grid_sessions:
+                    # Collect all displayed sessions from grid_sessions
+                    # It's a dict of {day: [sessions]}
+                    for day, sessions in grid_sessions.items():
+                        for s in sessions:
+                            block, course_display = s
+                            if course_display in ("LUNCH", "Break(15min)"):
+                                continue
+                            if course_code in course_display:
+                                # Infer type
+                                if '-LAB' in course_display:
+                                    total_labs += 1
+                                elif '-TUT' in course_display:
+                                    total_tutorials += 1
+                                else:
+                                    total_lectures += 1
+                                
                 # Strict check: TOTAL scheduled (all phases, both periods) must meet LTPSC
                 lectures_satisfied = total_lectures >= required_lectures
                 tutorials_satisfied = total_tutorials >= required_tutorials
@@ -1568,8 +1585,22 @@ class TimetableWriterV2:
                 course_name = getattr(course, 'name', '')
                 # Get actual faculty from scheduled sessions
                 faculty_for_course = set()
+                
+                # Check phase5_sessions for faculty
                 if phase5_sessions:
                     for session in phase5_sessions:
+                        if (hasattr(session, 'course_code') and session.course_code == course_code and
+                            hasattr(session, 'section') and session.section == f"{section}-Sem{semester}" and
+                            hasattr(session, 'period')):
+                            session_period = session.period
+                            period_match = (period == 'PreMid' and session_period == 'PRE') or \
+                                          (period == 'PostMid' and session_period == 'POST')
+                            if period_match and hasattr(session, 'faculty') and session.faculty:
+                                faculty_for_course.add(session.faculty)
+                                
+                # Check phase7_sessions for faculty
+                if phase7_sessions:
+                    for session in phase7_sessions:
                         if (hasattr(session, 'course_code') and session.course_code == course_code and
                             hasattr(session, 'section') and session.section == f"{section}-Sem{semester}" and
                             hasattr(session, 'period')):
@@ -1705,6 +1736,21 @@ class TimetableWriterV2:
                                 total_tutorials += 1
                             else:
                                 total_lectures += 1
+
+                # 4) If regenerating from log, calculate from grid_sessions
+                if grid_sessions:
+                    for day, sessions in grid_sessions.items():
+                        for s in sessions:
+                            block, course_display = s
+                            if course_display in ("LUNCH", "Break(15min)"):
+                                continue
+                            if course_code in course_display:
+                                if '-LAB' in course_display:
+                                    total_labs += 1
+                                elif '-TUT' in course_display:
+                                    total_tutorials += 1
+                                else:
+                                    total_lectures += 1
 
                 # Special case: If all requirements are 0, mark as satisfied if TOTAL scheduled is also 0
                 if required_lectures == 0 and required_tutorials == 0 and required_labs == 0:

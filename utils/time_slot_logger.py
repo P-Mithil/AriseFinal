@@ -49,12 +49,19 @@ class TimeSlotLogger:
     def __init__(self):
         self.entries: List[TimeSlotLogEntry] = []
         self._phase_stats = defaultdict(lambda: {'count': 0, 'courses': set(), 'sections': set()})
+        # Deduplication: track (course_code, section, day, start_time, period, session_type)
+        self._seen: set = set()
     
     def log_slot(self, phase: str, course_code: str, section: str, 
                  day: str, start_time: time, end_time: time,
                  room: Optional[str] = None, period: Optional[str] = None,
                  session_type: str = "", faculty: Optional[str] = None):
-        """Log a time slot"""
+        """Log a time slot (silently skips duplicates for same section/course/day/time/period)"""
+        dedup_key = (course_code, section, day, start_time, period, session_type)
+        if dedup_key in self._seen:
+            return  # Skip duplicate
+        self._seen.add(dedup_key)
+
         entry = TimeSlotLogEntry(
             phase=phase,
             course_code=course_code,
@@ -73,6 +80,7 @@ class TimeSlotLogger:
         self._phase_stats[phase]['count'] += 1
         self._phase_stats[phase]['courses'].add(course_code)
         self._phase_stats[phase]['sections'].add(section)
+
     
     def log_session(self, phase: str, session):
         """Log a ScheduledSession object"""
@@ -188,19 +196,34 @@ class TimeSlotLogger:
         print("\n" + "=" * 80)
     
     def export_to_csv(self, output_path: str):
-        """Export all entries to CSV"""
-        import pandas as pd
+        """Export deduplicated entries to CSV.
         
+        Multiple scheduling passes may log the same course+section+day into
+        different time slots.  We keep only the FIRST logged slot per
+        (course_code, section, day, period) so that the CSV is a 1:1 replica
+        of what the Excel timetable actually shows.
+        """
+        import pandas as pd
+
         if not self.entries:
             print("No entries to export")
             return
-        
+
         data = [entry.to_dict() for entry in self.entries]
         df = pd.DataFrame(data)
-        
+
+        # Deduplicate: one row per (Course Code, Section, Day, Start Time, End Time, Period).
+        # Ensures that distinct time slots for the same course (like different lectures)
+        # and correct durations are preserved.
+        df = df.drop_duplicates(
+            subset=["Course Code", "Section", "Day", "Start Time", "End Time", "Period"],
+            keep="first",
+        )
+
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         df.to_csv(output_path, index=False)
         print(f"Time slot log exported to: {output_path}")
+
     
     def get_entries_by_phase(self, phase: str) -> List[TimeSlotLogEntry]:
         """Get all entries for a specific phase"""

@@ -813,99 +813,94 @@ def run_verification_on_sessions(
     classrooms: List,
 ) -> Tuple[bool, List[Dict[str, Any]]]:
     """
-    Run verification on in-memory sessions (internal dict format).
-    Returns (success, errors) where errors is a list of
-    { "rule", "message", "course_code", "section", "day", "time", ... }.
-    Reuses DeepVerification checks: time constraints, faculty overlap, LTPSC, phase rules.
-    Also runs section overlap and room conflict checks.
+    Run post-drag verification on in-memory sessions (internal dict format).
+    Only checks rules that a manual drag can break:
+      1) Time constraints (session outside day bounds or inside lunch)
+      2) Section overlap  (two DIFFERENT courses in same section at same time)
+      3) Faculty conflict (same instructor teaching two courses at same time)
+    Room conflicts and LTPSC are pre-existing generator state and not checked here.
+    Returns (success, errors).
     """
-    from config.schedule_config import LUNCH_WINDOWS
     errors: List[Dict[str, Any]] = []
-
-    # Classify by phase for LTPSC/phase rules
-    elective_sessions = [s for s in all_sessions if str(s.get("phase", "")).startswith("Phase 3")]
-    combined_sessions = [s for s in all_sessions if str(s.get("phase", "")).startswith("Phase 4")]
-    phase5_sessions = [s for s in all_sessions if str(s.get("phase", "")).startswith("Phase 5")]
-    phase7_sessions = [s for s in all_sessions if str(s.get("phase", "")).startswith("Phase 7")]
-
     verifier = DeepVerification()
+    seen_errors: set = set()
 
-    # 1) Time constraints (bounds + lunch) per session
+    def _add_error(rule: str, message: str, course_code: str, section: str, day: str, time: str) -> None:
+        key = (rule, course_code, section, message)
+        if key not in seen_errors:
+            seen_errors.add(key)
+            errors.append({
+                "rule": rule,
+                "message": message,
+                "course_code": course_code,
+                "section": section,
+                "day": day,
+                "time": time,
+            })
+
+    # 1) Time constraints: session outside working hours or inside lunch
     for sess in all_sessions:
         time_violations = verifier.verify_time_constraints(sess)
         section_str = (sess.get("sections") or [None])[0] or ""
         tb = sess.get("time_block")
         if tb and time_violations:
             for v in time_violations:
-                errors.append({
-                    "rule": "Time constraints",
-                    "message": v,
-                    "course_code": sess.get("course_code", ""),
-                    "section": section_str,
-                    "day": getattr(tb, "day", ""),
-                    "time": f"{tb.start.strftime('%H:%M')}-{tb.end.strftime('%H:%M')}" if hasattr(tb, "start") else "",
-                })
+                _add_error(
+                    "Time constraints", v,
+                    sess.get("course_code", ""), section_str,
+                    getattr(tb, "day", ""),
+                    f"{tb.start.strftime('%H:%M')}-{tb.end.strftime('%H:%M')}" if hasattr(tb, "start") else "",
+                )
 
-    # 2) Section overlap: same section+period, same day, overlapping time
-    by_key = defaultdict(list)
+    # 2) Section overlap: two DIFFERENT courses in the same section+period overlapping in time
+    by_sec_period = defaultdict(list)
     for s in all_sessions:
         key = ((s.get("sections") or [""])[0], (s.get("period") or "").strip().upper())
-        by_key[key].append(s)
-    for key, sess_list in by_key.items():
+        by_sec_period[key].append(s)
+    for key, sess_list in by_sec_period.items():
         for i, a in enumerate(sess_list):
-            for b in sess_list[i + 1 :]:
+            for b in sess_list[i + 1:]:
                 tb_a, tb_b = a.get("time_block"), b.get("time_block")
                 if not tb_a or not tb_b or tb_a.day != tb_b.day or not tb_a.overlaps(tb_b):
                     continue
-                errors.append({
-                    "rule": "Section overlap",
-                    "message": f"Same section has two sessions at same time: {a.get('course_code')} and {b.get('course_code')}",
-                    "course_code": a.get("course_code", ""),
-                    "section": key[0],
-                    "day": tb_a.day,
-                    "time": f"{tb_a.start.strftime('%H:%M')}-{tb_a.end.strftime('%H:%M')}",
-                })
-
-    # 3) Room conflict: same room, same day, overlapping time, different course
-    by_room = defaultdict(list)
-    for s in all_sessions:
-        if s.get("room"):
-            by_room[s["room"]].append(s)
-    for room, sess_list in by_room.items():
-        for i, a in enumerate(sess_list):
-            for b in sess_list[i + 1 :]:
-                tb_a, tb_b = a.get("time_block"), b.get("time_block")
-                if not tb_a or not tb_b or tb_a.day != tb_b.day or not tb_a.overlaps(tb_b):
+                code_a = (a.get("course_code") or "").split("-")[0].strip().upper()
+                code_b = (b.get("course_code") or "").split("-")[0].strip().upper()
+                # Skip if same base course code (combined-class duplicate entries)
+                if code_a == code_b:
                     continue
-                base_a = (a.get("course_code") or "").split("-")[0]
-                base_b = (b.get("course_code") or "").split("-")[0]
-                if base_a == base_b:
+                # Skip if either is an elective basket (individual elective sub-courses
+                # are alternatives within the same basket and share their combined slot)
+                if "ELECTIVE_BASKET" in code_a or "ELECTIVE_BASKET" in code_b:
                     continue
-                errors.append({
-                    "rule": "Room conflict",
-                    "message": f"Room {room} double-booked: {a.get('course_code')} and {b.get('course_code')}",
-                    "course_code": a.get("course_code", ""),
-                    "section": (a.get("sections") or [""])[0],
-                    "day": tb_a.day,
-                    "time": f"{tb_a.start.strftime('%H:%M')}-{tb_a.end.strftime('%H:%M')}",
-                })
+                # Skip known sub-elective course code patterns (e.g. CS261, CS262 are
+                # elective options that share the same time slot by design)
+                phase_a = str(a.get("phase", ""))
+                phase_b = str(b.get("phase", ""))
+                if phase_a.startswith("Phase 3") or phase_b.startswith("Phase 3"):
+                    continue
+                _add_error(
+                    "Section overlap",
+                    f"Same section has two sessions at same time: {a.get('course_code')} and {b.get('course_code')}",
+                    a.get("course_code", ""), key[0], tb_a.day,
+                    f"{tb_a.start.strftime('%H:%M')}-{tb_a.end.strftime('%H:%M')}",
+                )
 
-    # 4) Faculty conflict: same instructor, same period, same day, overlapping
-    faculty_map: Dict[str, List[Tuple[TimeBlock, str, str]]] = defaultdict(list)
-    seen: Set[Tuple[str, str, str, str, str]] = set()
+    # 3) Faculty conflict: same instructor teaching two different courses at same time
+    faculty_map: Dict[str, List[tuple]] = defaultdict(list)
+    faculty_seen: Set[tuple] = set()
     for s in all_sessions:
         fac = (s.get("instructor") or "").strip()
-        if not fac or fac in ("TBD", "Various"):
+        if not fac or fac.upper() in ("TBD", "VARIOUS", ""):
             continue
         block = s.get("time_block")
         if not block:
             continue
-        code = (s.get("course_code") or "").split("-")[0]
+        code = (s.get("course_code") or "").split("-")[0].upper()
         period = str(s.get("period") or "").upper()
-        key = (str(fac), str(code), str(block.day), block.start.strftime("%H:%M"), block.end.strftime("%H:%M"))
-        if key in seen:
+        fkey = (fac, code, block.day, block.start.strftime("%H:%M"), block.end.strftime("%H:%M"))
+        if fkey in faculty_seen:
             continue
-        seen.add(key)
+        faculty_seen.add(fkey)
         faculty_map[fac].append((block, code, period))
     for fac, items in faculty_map.items():
         items_sorted = sorted(items, key=lambda x: (x[0].day, x[0].start))
@@ -913,68 +908,157 @@ def run_verification_on_sessions(
             b1, c1, p1 = items_sorted[i]
             for j in range(i + 1, len(items_sorted)):
                 b2, c2, p2 = items_sorted[j]
+                if c1 == c2:
+                    continue  # Same course, different sections - fine
                 if p1 and p2 and p1 != p2:
-                    continue
+                    continue  # Different periods
                 if b1.day != b2.day or not b1.overlaps(b2):
                     continue
-                errors.append({
-                    "rule": "Faculty conflict",
-                    "message": f"Faculty {fac} overlap: {c1} ({p1}) vs {c2} ({p2}) on {b1.day} {b1.start}-{b1.end}",
-                    "course_code": c1,
-                    "section": "",
-                    "day": b1.day,
-                    "time": f"{b1.start.strftime('%H:%M')}-{b1.end.strftime('%H:%M')}",
-                })
-
-    # 5) LTPSC and phase rules per course/section (reuse verifier)
-    for course in courses:
-        if course.is_elective:
-            continue
-        for section in sections:
-            if section.program != course.department or section.semester != course.semester:
-                continue
-            section_name = f"{section.program}-{section.name}-Sem{section.semester}"
-            if course.is_combined:
-                found = any(
-                    isinstance(cs, dict)
-                    and (cs.get("course_code") or "").split("-")[0] == course.code
-                    and section_name in (cs.get("sections") or [])
-                    for cs in combined_sessions
+                _add_error(
+                    "Faculty conflict",
+                    f"Faculty {fac} has overlapping sessions: {c1} and {c2} on {b1.day} {b1.start.strftime('%H:%M')}-{b1.end.strftime('%H:%M')}",
+                    c1, "", b1.day,
+                    f"{b1.start.strftime('%H:%M')}-{b1.end.strftime('%H:%M')}",
                 )
-                if found:
-                    compliance = verifier.verify_ltpsc_compliance(course, all_sessions, section, "PRE")
-                    if not (compliance["satisfied"]["lectures"] and compliance["satisfied"]["tutorials"] and compliance["satisfied"]["labs"]):
-                        errors.append({
-                            "rule": "LTPSC compliance",
-                            "message": f"LTPSC requirements not met in {section_name}",
-                            "course_code": course.code,
-                            "section": section_name,
-                            "day": "",
-                            "time": "",
-                        })
-                    continue
-            compliance = verifier.verify_ltpsc_compliance(course, all_sessions, section, period=None)
-            if not (compliance["satisfied"]["lectures"] and compliance["satisfied"]["tutorials"] and compliance["satisfied"]["labs"]):
-                errors.append({
-                    "rule": "LTPSC compliance",
-                    "message": f"LTPSC requirements not met in {section_name}",
-                    "course_code": course.code,
-                    "section": section_name,
-                    "day": "",
-                    "time": "",
-                })
-            for violation in verifier.verify_phase_rules(
-                course, all_sessions, section, all_sessions,
-                elective_sessions, combined_sessions, classrooms,
-            ):
-                errors.append({
-                    "rule": "Phase rules",
-                    "message": violation,
-                    "course_code": course.code,
-                    "section": section_name,
-                    "day": "",
-                    "time": "",
-                })
+
+    # 4) 1 day 1 course rule (for lectures)
+    # A normal course should not have two lectures on the same day for the same section in the SAME period
+    course_day_counts = defaultdict(list)
+    for s in all_sessions:
+        if (s.get("session_type") or "L").upper() != "L":
+            continue
+        code = (s.get("course_code") or "").split("-")[0].strip().upper()
+        
+        # Skip elective baskets and phase 3 electives as they can have multiple sessions 
+        # (different sub-courses) in the same day naturally
+        if "ELECTIVE_BASKET" in code or str(s.get("phase", "")).startswith("Phase 3"):
+            continue
+            
+        sec = (s.get("sections") or [""])[0]
+        tb = s.get("time_block")
+        period = str(s.get("period") or "PRE").strip().upper()
+        if not tb or not sec or not code:
+            continue
+        key = (sec, code, tb.day, period)
+        course_day_counts[key].append(s)
+
+    for (sec, code, day, period), sessions in course_day_counts.items():
+        if len(sessions) > 1:
+            times = ", ".join([f"{s['time_block'].start.strftime('%H:%M')}-{s['time_block'].end.strftime('%H:%M')}" for s in sessions if s.get('time_block')])
+            _add_error(
+                "1 Day 1 Course",
+                f"Course {code} has multiple lectures on {day} in section {sec} ({period}): {times}",
+                code, sec, day, ""
+            )
+
+    # 5) Combined class synchronization, room, and faculty checks
+    # If a class is combined (same code, same instructor, multiple sections):
+    # - Must not overlap with another combined course (bottleneck: only one 240-capacity room C004)
+    # - Designated faculty must not be teaching something else
+    # - All its sections must have it at the same time (no desync)
+    # - If dragged, the target slot must be free in the 'other' sections sharing the class
+    combined_groups = defaultdict(list)
+    for s in all_sessions:
+        code = (s.get("course_code") or "").split("-")[0].strip().upper()
+        if "ELECTIVE_BASKET" in code or str(s.get("phase", "")).startswith("Phase 3"):
+            continue
+        fac = (s.get("instructor") or "").strip().upper()
+        stype = (s.get("session_type") or "L").upper()
+        if not fac or fac in ("TBD", "VARIOUS", ""):
+            continue
+        # Also, must have multiple sections to be considered "combined" for the 240 room bottleneck
+        secs = s.get("sections", [])
+        if len(secs) <= 1:
+            continue
+            
+        # Group by (Course, Instructor, SessionType)
+        key = (code, fac, stype)
+        combined_groups[key].append(s)
+
+    for (code, fac, stype), sessions in combined_groups.items():
+        # Find all unique times this combined course is scheduled
+        unique_times = {} # time_str -> list of sessions
+        for s in sessions:
+            tb = s.get("time_block")
+            if not tb: continue
+            t_str = f"{tb.day} {tb.start.strftime('%H:%M')}-{tb.end.strftime('%H:%M')}"
+            if t_str not in unique_times:
+                unique_times[t_str] = []
+            unique_times[t_str].append(s)
+            
+        all_secs = sum([s.get("sections", [""]) for s in sessions], [])
+        
+        for t_str, t_sessions in unique_times.items():
+            target_tb = t_sessions[0].get("time_block")
+            if not target_tb: continue
+            
+            # Sub-check A: 240-Capacity Room (C004) Bottleneck
+            # Check if *another* combined course (meaning len(secs) > 1) is scheduled at this exact time
+            # We ONLY loop over combined_groups to check against other combined courses!
+            for (o_code, o_fac, o_stype), o_sessions in combined_groups.items():
+                if o_code == code: continue
+                # Does the other combined course overlap this time?
+                for o_sess in o_sessions:
+                    o_tb = o_sess.get("time_block")
+                    if o_tb and o_tb.day == target_tb.day and o_tb.overlaps(target_tb):
+                        _add_error(
+                            "Room Conflict",
+                            f"Combined course {code} cannot be at {t_str} because the 240-capacity room is occupied by {o_code}",
+                            code, ", ".join(set(all_secs)), target_tb.day,
+                            f"{target_tb.start.strftime('%H:%M')}-{target_tb.end.strftime('%H:%M')}"
+                        )
+                        break # Report once per other course overlap
+            
+            # Sub-check B: Faculty availability for combined course
+            # Check if this instructor is teaching any *other* course at this time
+            for osess in all_sessions:
+                o_code = (osess.get("course_code") or "").split("-")[0].strip().upper()
+                if o_code == code: continue
+                o_fac = (osess.get("instructor") or "").strip().upper()
+                if o_fac == fac:
+                    o_tb = osess.get("time_block")
+                    if o_tb and o_tb.day == target_tb.day and o_tb.overlaps(target_tb):
+                        _add_error(
+                            "Faculty Conflict",
+                            f"Combined course {code} cannot be at {t_str} because faculty {fac} is busy teaching {o_code}",
+                            code, ", ".join(set(all_secs)), target_tb.day,
+                            f"{target_tb.start.strftime('%H:%M')}-{target_tb.end.strftime('%H:%M')}"
+                        )
+                        break
+        
+        if len(unique_times) > 1:
+            # Sub-check C: Desync and cross-section conflict check
+            # User dragged one instance but not the others.
+            for t_str, t_sessions in unique_times.items():
+                target_tb = t_sessions[0].get("time_block")
+                if not target_tb: continue
+                # Sections that have it at THIS time
+                secs_at_this_time = set(sum([s.get("sections", [""]) for s in t_sessions], []))
+                # Sections that SHOULD have it but don't (they are at the other time)
+                other_secs = set(all_secs) - secs_at_this_time
+                
+                # Check if this target_tb overlaps with ANY existing sessions in other_secs
+                for other_sec in other_secs:
+                    other_sec_sessions = [
+                        xs for xs in all_sessions 
+                        if other_sec in xs.get("sections", []) and xs.get("course_code", "").split("-")[0].strip().upper() != code
+                    ]
+                    for osess in other_sec_sessions:
+                        otb = osess.get("time_block")
+                        if otb and otb.day == target_tb.day and otb.overlaps(target_tb):
+                            o_code = osess.get("course_code", "")
+                            _add_error(
+                                "Combined Conflict",
+                                f"Cannot drag combined course {code} to {t_str} because shared section {other_sec} is already busy with {o_code}",
+                                code, other_sec, target_tb.day,
+                                f"{target_tb.start.strftime('%H:%M')}-{target_tb.end.strftime('%H:%M')}"
+                            )
+            
+            _add_error(
+                "Combined Desync",
+                f"Combined course {code} ({fac}) is scheduled at different times across its sections. Ensure all sections place it at the same time.",
+                code, ", ".join(set(all_secs)), "", ""
+            )
 
     return (len(errors) == 0, errors)
 

@@ -245,12 +245,23 @@ def add_session_to_occupied_slots(
             return
         period_raw = getattr(session, "period", "PRE")
         period = _normalize_period(period_raw)
-        section_label = str(getattr(session, "section", "")).strip()
-        if not section_label:
-            return
+        
+        # Try to use .sections list if present (added by Phase 4)
+        sections = getattr(session, "sections", None)
+        if not sections:
+            section_label = str(getattr(session, "section", "")).strip()
+            if not section_label:
+                return
+            # Split comma-separated labels if present
+            sections = [s.strip() for s in section_label.split(',')]
+            
         course_code = getattr(session, "course_code", "")
-        section_key = f"{section_label}_{period}"
-        occupied_slots.setdefault(section_key, []).append((block, str(course_code)))
+        
+        for sec in sections:
+            if not sec:
+                continue
+            section_key = f"{sec}_{period}"
+            occupied_slots.setdefault(section_key, []).append((block, str(course_code)))
 
 
 def prompt_user_for_phase7_period(
@@ -592,8 +603,9 @@ def schedule_within_group_combined(course: Course, sections: List[Section],
                                    period_assignments: Dict[Tuple[str, int, str], bool]) -> List[ScheduledSession]:
     """
     Schedule within-group combined courses
-    Section A gets PreMid, Section B gets PostMid
+    Conditionally combines if sections map to the same period and have a single instructor.
     """
+    import time
     sessions = []
     
     # Get sections for this department and semester
@@ -614,33 +626,49 @@ def schedule_within_group_combined(course: Course, sections: List[Section],
         slot_durations.append(60)  # 1 hour
     for _ in range(slots_info['practicals']):
         slot_durations.append(120)  # 2 hours
-    
-    for section in dept_sections:
-        section_label = f"{section.program}-{section.name}-Sem{section.semester}"
-        # User-driven period selection (default to PRE if missing for robustness)
-        key = (course.code.upper(), course.semester, section_label)
-        is_premid = period_assignments.get(key, True)
-        period = 'PRE' if is_premid else 'POST'
         
-        # Find available time slots for this section+period
-        available_slots = find_available_slots_phase7(
-            section.semester, section_label, period, occupied_slots, 
-            slots_info['total'], slot_durations
+    def schedule_labels(label_list: List[str], target_period: str, total_students: int):
+        # Find available time slots for the first section
+        base_slots = find_available_slots_phase7(
+            course.semester, label_list[0], target_period, occupied_slots, 
+            slots_info['total'] * 3, slot_durations
         )
         
+        # Filter for all labels
+        available_slots = []
+        for slot in base_slots:
+            valid = True
+            for lbl in label_list[1:]:
+                sec_key = f"{lbl}_{target_period}"
+                for existing in occupied_slots.get(sec_key, []):
+                    eb = existing[0] if isinstance(existing, tuple) else existing
+                    if eb and slot.overlaps(eb):
+                        valid = False
+                        break
+                if not valid:
+                    break
+            if valid:
+                available_slots.append(slot)
+                
+        # Fill strictly if we strictly need more slots (simplified fallback)
         if len(available_slots) < slots_info['total']:
-            # Try to find more slots
             additional_needed = slots_info['total'] - len(available_slots)
             additional_slots = find_available_slots_phase7(
-                section.semester, section_label, period, occupied_slots,
-                additional_needed, slot_durations
+                course.semester, label_list[0], target_period, occupied_slots,
+                additional_needed * 3, slot_durations
             )
-            if additional_slots:
-                available_slots.extend(additional_slots)
-            else:
-                continue  # Skip this section if we can't find enough slots
-        
-        # Track used days for one-session-per-day rule
+            for slot in additional_slots:
+                valid = True
+                for lbl in label_list[1:]:
+                    sec_key = f"{lbl}_{target_period}"
+                    for existing in occupied_slots.get(sec_key, []):
+                        eb = existing[0] if isinstance(existing, tuple) else existing
+                        if eb and slot.overlaps(eb):
+                            valid = False; break
+                    if not valid: break
+                if valid and slot not in available_slots:
+                    available_slots.append(slot)
+                    
         used_days_by_course = SessionRulesValidator.get_used_days_tracker()
         used_days_lectures = set()
         used_days_tutorials = set()
@@ -648,313 +676,178 @@ def schedule_within_group_combined(course: Course, sections: List[Section],
         # Schedule lectures
         slot_idx = 0
         lecture_count = 0
-        max_retries = 3  # Try up to 3 times to find more slots
+        max_retries = 3
         
         for i in range(slots_info['lectures']):
-            if lecture_count >= slots_info['lectures']:
-                break
-            
-            # Try to find a valid slot
+            if lecture_count >= slots_info['lectures']: break
             found_slot = False
             retry_count = 0
-            
             while not found_slot and retry_count < max_retries:
-                # If we've exhausted available slots, try to find more
                 if slot_idx >= len(available_slots):
-                    if retry_count < max_retries - 1:
-                        # Try to find more slots
-                        additional_slots = find_available_slots_phase7(
-                            section.semester, section_label, period, occupied_slots,
-                            slots_info['lectures'] - lecture_count, [90]  # Just need lecture slots
-                        )
-                        if additional_slots:
-                            available_slots.extend(additional_slots)
-                            slot_idx = len(available_slots) - len(additional_slots)
-                        retry_count += 1
-                    else:
-                        break
-                
-                # Find next available slot that doesn't violate one-session-per-day rule
+                    break
                 while slot_idx < len(available_slots):
                     slot = available_slots[slot_idx]
-                    
-                    # Check one-session-per-day rule
-                    if slot.day in used_days_lectures:
-                        slot_idx += 1
-                        continue
-                    
-                    if not SessionRulesValidator.can_schedule_session_type(
-                        course.code, slot.day, "L", used_days_by_course
-                    ):
-                        slot_idx += 1
-                        continue
-                    
-                    # Found valid slot
-                    room = assign_classroom(85, classrooms, slot)
-                    session = ScheduledSession(
-                        course_code=course.code,
-                        section=section_label,
-                        kind="L",
-                        block=slot,
-                        room=room.room_number,
-                        period=period,
-                        faculty=course.instructors[0] if course.instructors else 'TBD'
-                    )
-                    sessions.append(session)
-                    
-                    # Update occupied slots
-                    section_key = f"{section_label}_{period}"
-                    if section_key not in occupied_slots:
-                        occupied_slots[section_key] = []
-                    occupied_slots[section_key].append((slot, course.code))
-                    
-                    # Mark day as used
+                    if slot.day in used_days_lectures or not SessionRulesValidator.can_schedule_session_type(course.code, slot.day, "L", used_days_by_course):
+                        slot_idx += 1; continue
+                    room = assign_classroom(total_students, classrooms, slot)
+                    for lbl in label_list:
+                        session = ScheduledSession(
+                            course_code=course.code, section=lbl, kind="L", block=slot,
+                            room=room.room_number, period=target_period,
+                            faculty=course.instructors[0] if course.instructors else 'TBD'
+                        )
+                        sessions.append(session)
+                        sec_key = f"{lbl}_{target_period}"
+                        if sec_key not in occupied_slots: occupied_slots[sec_key] = []
+                        occupied_slots[sec_key].append((slot, course.code))
                     used_days_lectures.add(slot.day)
                     SessionRulesValidator.mark_day_used(course.code, slot.day, "L", used_days_by_course)
-                    
                     slot_idx += 1
                     lecture_count += 1
                     found_slot = True
                     break
-                
-                if not found_slot:
-                    retry_count += 1
+                if not found_slot: retry_count += 1
             
             if not found_slot:
-                # Last resort: try to find ANY available slot, even if it might conflict
-                # This ensures we at least schedule something
-                emergency_slots = find_available_slots_phase7(
-                    section.semester, section_label, period, occupied_slots,
-                    slots_info['lectures'] - lecture_count, [90]
-                )
+                # Emergency slots
+                emergency_slots = find_available_slots_phase7(course.semester, label_list[0], target_period, occupied_slots, 1, [90])
                 for slot in emergency_slots:
-                    # CRITICAL: Validate time range (9:00-18:00)
-                    if not validate_time_range(slot.start, slot.end):
-                        continue  # Skip invalid slot
-                    
+                    if not validate_time_range(slot.start, slot.end): continue
                     if slot.day not in used_days_lectures:
-                        room = assign_classroom(85, classrooms, slot)
-                        session = ScheduledSession(
-                            course_code=course.code,
-                            section=section_label,
-                            kind="L",
-                            block=slot,
-                            room=room.room_number,
-                            period=period,
-                            faculty=course.instructors[0] if course.instructors else 'TBD'
-                        )
-                        sessions.append(session)
-                        section_key = f"{section_label}_{period}"
-                        if section_key not in occupied_slots:
-                            occupied_slots[section_key] = []
-                        occupied_slots[section_key].append((slot, course.code))
+                        room = assign_classroom(total_students, classrooms, slot)
+                        for lbl in label_list:
+                            session = ScheduledSession(
+                                course_code=course.code, section=lbl, kind="L", block=slot,
+                                room=room.room_number, period=target_period,
+                                faculty=course.instructors[0] if course.instructors else 'TBD'
+                            )
+                            sessions.append(session)
+                            sec_key = f"{lbl}_{target_period}"
+                            if sec_key not in occupied_slots: occupied_slots[sec_key] = []
+                            occupied_slots[sec_key].append((slot, course.code))
                         used_days_lectures.add(slot.day)
                         SessionRulesValidator.mark_day_used(course.code, slot.day, "L", used_days_by_course)
                         lecture_count += 1
                         found_slot = True
-                        # Continue to schedule all remaining lectures
-                        if lecture_count >= slots_info['lectures']:
-                            break
-                if found_slot and lecture_count < slots_info['lectures']:
-                    # If we scheduled one but need more, continue the loop
-                    continue
-        
+                        break
+
         # Schedule tutorials
         tutorial_count = 0
-        max_retries = 3  # Try up to 3 times to find more slots
-        
         for i in range(slots_info['tutorials']):
-            if tutorial_count >= slots_info['tutorials']:
-                break
-            
-            # Try to find a valid slot
+            if tutorial_count >= slots_info['tutorials']: break
             found_slot = False
             retry_count = 0
-            
             while not found_slot and retry_count < max_retries:
-                # If we've exhausted available slots, try to find more
                 if slot_idx >= len(available_slots):
-                    if retry_count < max_retries - 1:
-                        # Try to find more slots
-                        additional_slots = find_available_slots_phase7(
-                            section.semester, section_label, period, occupied_slots,
-                            slots_info['tutorials'] - tutorial_count, [60]  # Just need tutorial slots
-                        )
-                        if additional_slots:
-                            available_slots.extend(additional_slots)
-                            slot_idx = len(available_slots) - len(additional_slots)
-                        retry_count += 1
-                    else:
-                        break
-                
-                # Find next available slot that doesn't violate one-session-per-day rule
+                    break
                 while slot_idx < len(available_slots):
                     slot = available_slots[slot_idx]
-                    
-                    # Check one-session-per-day rule - cannot be on same day as lecture
-                    if slot.day in used_days_tutorials or slot.day in used_days_lectures:
-                        slot_idx += 1
-                        continue
-                    
-                    if not SessionRulesValidator.can_schedule_session_type(
-                        course.code, slot.day, "T", used_days_by_course
-                    ):
-                        slot_idx += 1
-                        continue
-                    
-                    # CRITICAL: Validate time range (9:00-18:00)
+                    if slot.day in used_days_tutorials or slot.day in used_days_lectures or not SessionRulesValidator.can_schedule_session_type(course.code, slot.day, "T", used_days_by_course):
+                        slot_idx += 1; continue
                     if not validate_time_range(slot.start, slot.end):
-                        slot_idx += 1
-                        continue  # Skip invalid slot
-                    
-                    # Found valid slot
-                    room = assign_classroom(85, classrooms, slot)
-                    session = ScheduledSession(
-                        course_code=course.code,
-                        section=section_label,
-                        kind="T",
-                        block=slot,
-                        room=room.room_number,
-                        period=period,
-                        faculty=course.instructors[0] if course.instructors else 'TBD'
-                    )
-                    sessions.append(session)
-                    
-                    # Update occupied slots
-                    section_key = f"{section_label}_{period}"
-                    if section_key not in occupied_slots:
-                        occupied_slots[section_key] = []
-                    occupied_slots[section_key].append((slot, course.code))
-                    
-                    # Mark day as used
+                        slot_idx += 1; continue
+                    room = assign_classroom(total_students, classrooms, slot)
+                    for lbl in label_list:
+                        session = ScheduledSession(
+                            course_code=course.code, section=lbl, kind="T", block=slot,
+                            room=room.room_number, period=target_period,
+                            faculty=course.instructors[0] if course.instructors else 'TBD'
+                        )
+                        sessions.append(session)
+                        sec_key = f"{lbl}_{target_period}"
+                        if sec_key not in occupied_slots: occupied_slots[sec_key] = []
+                        occupied_slots[sec_key].append((slot, course.code))
                     used_days_tutorials.add(slot.day)
                     SessionRulesValidator.mark_day_used(course.code, slot.day, "T", used_days_by_course)
                     tutorial_count += 1
                     slot_idx += 1
                     found_slot = True
                     break
-                
-                if not found_slot:
-                    retry_count += 1
-            
+                if not found_slot: retry_count += 1
             if not found_slot:
-                # Last resort: try to find ANY available slot on a different day
-                emergency_slots = find_available_slots_phase7(
-                    section.semester, section_label, period, occupied_slots,
-                    slots_info['tutorials'] - tutorial_count, [60]
-                )
+                emergency_slots = find_available_slots_phase7(course.semester, label_list[0], target_period, occupied_slots, 1, [60])
                 for slot in emergency_slots:
                     if slot.day not in used_days_lectures and slot.day not in used_days_tutorials:
-                        room = assign_classroom(85, classrooms, slot)
-                        session = ScheduledSession(
-                            course_code=course.code,
-                            section=section_label,
-                            kind="T",
-                            block=slot,
-                            room=room.room_number,
-                            period=period,
-                            faculty=course.instructors[0] if course.instructors else 'TBD'
-                        )
-                        sessions.append(session)
-                        section_key = f"{section_label}_{period}"
-                        if section_key not in occupied_slots:
-                            occupied_slots[section_key] = []
-                        occupied_slots[section_key].append((slot, course.code))
+                        room = assign_classroom(total_students, classrooms, slot)
+                        for lbl in label_list:
+                            session = ScheduledSession(
+                                course_code=course.code, section=lbl, kind="T", block=slot,
+                                room=room.room_number, period=target_period,
+                                faculty=course.instructors[0] if course.instructors else 'TBD'
+                            )
+                            sessions.append(session)
+                            sec_key = f"{lbl}_{target_period}"
+                            if sec_key not in occupied_slots: occupied_slots[sec_key] = []
+                            occupied_slots[sec_key].append((slot, course.code))
                         used_days_tutorials.add(slot.day)
                         SessionRulesValidator.mark_day_used(course.code, slot.day, "T", used_days_by_course)
                         tutorial_count += 1
                         found_slot = True
-                        # Continue to schedule all remaining tutorials
-                        if tutorial_count >= slots_info['tutorials']:
-                            break
-                if found_slot and tutorial_count < slots_info['tutorials']:
-                    # If we scheduled one but need more, continue the loop
-                    continue
-        
-        # Schedule practicals (practicals can be on same day as lectures/tutorials)
+                        break
+
+        # Schedule practicals
         for i in range(slots_info['practicals']):
-            # If we've exhausted available slots, try to find more
-            if slot_idx >= len(available_slots):
-                additional_slots = find_available_slots_phase7(
-                    section.semester, section_label, period, occupied_slots,
-                    slots_info['practicals'] - i, [120]  # Just need practical slots
-                )
-                if additional_slots:
-                    available_slots.extend(additional_slots)
-                    slot_idx = len(available_slots) - len(additional_slots)
-                else:
-                    break
-                
+            if slot_idx >= len(available_slots): break
             slot = available_slots[slot_idx]
-            
-            # CRITICAL: Validate time range (9:00-18:00)
-            # For 2-hour practicals, ensure start time allows completion before 18:00
-            # Practical starting at 17:00 would end at 19:00, which is invalid
             if not validate_time_range(slot.start, slot.end):
-                slot_idx += 1
-                continue  # Skip this slot - extends beyond 18:00 or starts before 9:00
-            
-            # Additional check: For 2-hour practicals, start must be <= 16:00
-            # Check if this is a practical slot (2 hours duration)
+                slot_idx += 1; continue
             slot_duration = (slot.end.hour * 60 + slot.end.minute) - (slot.start.hour * 60 + slot.start.minute)
             if slot_duration >= 120 and (slot.start.hour > 16 or (slot.start.hour == 16 and slot.start.minute > 0)):
-                slot_idx += 1
-                continue  # Skip - practical would extend beyond 18:00
-            
-            # For practicals, use labs - find available lab room
+                slot_idx += 1; continue
             lab_rooms = [r for r in classrooms if hasattr(r, 'room_type') and r.room_type.lower() == 'lab']
             if not lab_rooms:
-                # Fallback to any classroom if no labs found
                 lab_rooms = classrooms
-            
-            # Find first available lab room (check room_occupancy if available)
             assigned_room = None
             for lab in lab_rooms:
                 room_num = lab.room_number if hasattr(lab, 'room_number') else str(lab)
-                # Check if room is available (if room_occupancy tracking exists)
                 if room_occupancy and room_num in room_occupancy:
-                    # Check for conflicts
                     has_conflict = False
                     for occupied_block in room_occupancy[room_num]:
-                        if slot.overlaps(occupied_block):
-                            has_conflict = True
-                            break
-                    if has_conflict:
-                        continue
+                        if slot.overlaps(occupied_block): has_conflict = True; break
+                    if has_conflict: continue
                 assigned_room = room_num
                 break
-            
-            # Fallback to first lab if no available one found
             if not assigned_room and lab_rooms:
                 assigned_room = lab_rooms[0].room_number if hasattr(lab_rooms[0], 'room_number') else str(lab_rooms[0])
             elif not assigned_room:
                 assigned_room = classrooms[0].room_number if classrooms and hasattr(classrooms[0], 'room_number') else 'LAB1'
             
-            session = ScheduledSession(
-                course_code=course.code,
-                section=section_label,
-                kind="P",
-                block=slot,
-                room=assigned_room,
-                period=period,
-                faculty=None  # No faculty for labs
-            )
-            sessions.append(session)
-            
-            # Update occupied slots
-            section_key = f"{section_label}_{period}"
-            if section_key not in occupied_slots:
-                occupied_slots[section_key] = []
-            occupied_slots[section_key].append((slot, course.code))
-            
-            # Update room occupancy if tracking exists
+            for lbl in label_list:
+                session = ScheduledSession(
+                    course_code=course.code, section=lbl, kind="P", block=slot,
+                    room=assigned_room, period=target_period, faculty=None
+                )
+                sessions.append(session)
+                sec_key = f"{lbl}_{target_period}"
+                if sec_key not in occupied_slots: occupied_slots[sec_key] = []
+                occupied_slots[sec_key].append((slot, course.code))
+                
             if room_occupancy is not None:
-                if assigned_room not in room_occupancy:
-                    room_occupancy[assigned_room] = []
+                if assigned_room not in room_occupancy: room_occupancy[assigned_room] = []
                 room_occupancy[assigned_room].append(slot)
-            
             slot_idx += 1
-    
+            
+    # Group sections by period
+    period_groups = {'PRE': [], 'POST': []}
+    for section in dept_sections:
+        section_label = f"{section.program}-{section.name}-Sem{section.semester}"
+        key = (course.code.upper(), course.semester, section_label)
+        is_premid = period_assignments.get(key, True)
+        period = 'PRE' if is_premid else 'POST'
+        period_groups[period].append((section, section_label))
+
+    for period, section_list in period_groups.items():
+        if not section_list: continue
+        
+        # Check if we should combine: Multiple sections mapping to same period AND single instructor
+        if len(section_list) > 1 and course.num_faculty == 1:
+            labels = [s[1] for s in section_list]
+            total_students = sum(s[0].students for s in section_list)
+            schedule_labels(labels, period, total_students)
+        else:
+            for section, section_label in section_list:
+                schedule_labels([section_label], period, section.students)
+                
     return sessions
 
 def schedule_non_combined(course: Course, sections: List[Section],

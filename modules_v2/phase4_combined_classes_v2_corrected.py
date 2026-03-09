@@ -888,16 +888,15 @@ def create_non_overlapping_schedule(unique_courses: Dict[int, List[Course]], sec
 
                         test_block = TimeBlock(day, start, end)
 
-                        if session_type == 'P':
-                            # Prevent overlaps across combined sessions in the same semester/period:
-                            # use an overlap-based occupied list in addition to (day, slot_idx).
-                            occupied_blocks_key = ("__BLOCKS__", day)
-                            for existing_block in occupied_slots.get(occupied_blocks_key, []):
-                                if test_block.overlaps(existing_block):
-                                    test_block = None
-                                    break
-                            if test_block is None:
-                                continue
+                        # Prevent overlaps across combined sessions in the same semester/period:
+                        # use an overlap-based occupied list in addition to (day, slot_idx).
+                        occupied_blocks_key = ("__BLOCKS__", day)
+                        for existing_block in occupied_slots.get(occupied_blocks_key, []):
+                            if test_block.overlaps(existing_block):
+                                test_block = None
+                                break
+                        if test_block is None:
+                            continue
 
                         # Prevent overlaps within the same course on the same day (e.g., L overlapping P,
                         # or P overlapping an already-placed L/T). This applies to ALL session types so the
@@ -1006,6 +1005,8 @@ def create_non_overlapping_schedule(unique_courses: Dict[int, List[Course]], sec
                             SessionRulesValidator.mark_day_used(course.code, retry_day, session_type, used_days_by_course)
                             mark_room_occupied(assigned_room, retry_day, start, end, global_room_occupancy)
                             occupied_slots[(retry_day, retry_slot_idx)] = course.code
+                            # CRITICAL FIX: also update __BLOCKS__ so subsequent courses see this slot
+                            occupied_slots.setdefault(("__BLOCKS__", retry_day), []).append(TimeBlock(retry_day, start, end))
                             assigned = True
                             print(f"  RETRY SUCCESS: Assigned {session_type} for {course.code} at {retry_day} {start}-{end}")
                             break
@@ -1133,6 +1134,8 @@ def create_non_overlapping_schedule(unique_courses: Dict[int, List[Course]], sec
                                         assigned_room, fallback_day, start, end, global_room_occupancy
                                     )
                                     occupied_slots[(fallback_day, fallback_slot_idx)] = course.code
+                                    # CRITICAL FIX: also update __BLOCKS__ so subsequent courses see this slot
+                                    occupied_slots.setdefault(("__BLOCKS__", fallback_day), []).append(TimeBlock(fallback_day, start, end))
                                     assigned = True
                                     print(
                                         f"  FALLBACK: Assigned {session_type} for {course.code} at "
@@ -1214,6 +1217,8 @@ def create_non_overlapping_schedule(unique_courses: Dict[int, List[Course]], sec
                                     assigned_room, retry_day, start, end, global_room_occupancy
                                 )
                                 occupied_slots[(retry_day, retry_slot_idx)] = course.code
+                                # CRITICAL FIX: also update __BLOCKS__ so subsequent courses see this slot
+                                occupied_slots.setdefault(("__BLOCKS__", retry_day), []).append(TimeBlock(retry_day, start, end))
                                 assigned = True
                                 print(
                                     f"  ULTIMATE SUCCESS: Assigned {session_type} for {course.code} at "
@@ -1252,24 +1257,22 @@ def create_non_overlapping_schedule(unique_courses: Dict[int, List[Course]], sec
                 print(f"DEBUG MA261: Scheduled - L:{scheduled_lectures}, T:{scheduled_tutorials}, P:{scheduled_practicals}")
                 print(f"DEBUG MA261: Required - L:{slots_info['lectures']}, T:{slots_info['tutorials']}, P:{slots_info['practicals']}")
             
-            # Now return the UNIQUE time slots (not replicated per section)
-            # Combined courses mean all sections attend together, so we only need
-            # the time slots once, not multiplied by number of sections
-            # Format: [(day, start, end, session_type, section, room), ...] for EACH section
-            # But we want to return them in a way that shows they're synchronized
+            # Now return ONE slot per unique time block (all sections combined, not multiplied).
+            # Format: (day, start, end, session_type, section_label, room)
+            # section_label is a comma-joined string of all sections in this group
+            # e.g. "CSE-A-Sem1,CSE-B-Sem1" — downstream mapping will expand per section.
+            section_labels = ",".join(
+                s.label for s in sections
+                if hasattr(s, "semester") and s.semester == course.semester and hasattr(s, "label")
+            )
             all_slots = []
             for slot_info in course_time_slots:
                 if len(slot_info) == 5:  # (day, start, end, session_type, room)
                     day, start, end, session_type, assigned_room = slot_info
-                else:  # Fallback for old format
+                else:
                     day, start, end, session_type = slot_info[:4]
-                    assigned_room = 'C004'  # Default fallback
-                
-                # Create ONE entry per time slot, listing ALL sections
-                # This will be handled properly when converting to sessions
-                for section in sections:
-                    if hasattr(section, 'semester') and section.semester == course.semester:
-                        all_slots.append((day, start, end, session_type, section, assigned_room))
+                    assigned_room = "C004"
+                all_slots.append((day, start, end, session_type, section_labels, assigned_room))
             
             return all_slots, occupied_slots, global_room_occupancy
         
@@ -1749,75 +1752,61 @@ def create_non_overlapping_schedule(unique_courses: Dict[int, List[Course]], sec
         # Log time slots for Phase 4
         logger = get_logger()
         
-        # PASS 2: Apply the slots directly (they already contain section info)
-        # Store slots with course code for proper mapping: (course_code, day, start, end, session_type, section, room)
+        # PASS 2: Apply slots to the schedule dict and logger.
+        # New format from generate_synchronized_course_slots:
+        #   (day, start, end, session_type, section_label_str, room)
+        # section_label_str is a comma-joined string like "CSE-A-Sem1,CSE-B-Sem1"
         for course_code, course_slots in premid_course_slots_map.items():
-            # Store slots with course code prefix
             for slot in course_slots:
-                if len(slot) == 6:  # (day, start, end, session_type, section, room)
-                    day, start, end, session_type, section, assigned_room = slot
-                    # Store as (course_code, day, start, end, session_type, section, room)
-                    semester_schedule['premid']['slots'].append((course_code, day, start, end, session_type, section, assigned_room))
-                    # Determine room based on session type - practicals get lab rooms
-                    log_room = 'L105' if session_type == 'P' else assigned_room  # Use assigned room or lab for practicals
-                    logger.log_slot("Phase 4", course_code, section.label if hasattr(section, 'label') else str(section),
-                                   day, start, end, room=log_room, period='PRE', session_type=session_type)
-                elif len(slot) == 5:  # Old format: (day, start, end, session_type, section)
-                    day, start, end, session_type, section = slot
-                    # Find available room for this slot
-                    assigned_room = find_available_room(
-                        day, start, end, premid_room_occupancy, available_large_rooms
-                    )
-                    if session_type == 'P':
-                        assigned_room = 'L105'  # Lab for practicals
-                    # Store as (course_code, day, start, end, session_type, section, room)
-                    semester_schedule['premid']['slots'].append((course_code, day, start, end, session_type, section, assigned_room))
+                if len(slot) == 6 and isinstance(slot[4], str):
+                    # New format: (day, start, end, session_type, section_str, room)
+                    day, start, end, session_type, section_str, assigned_room = slot
                     log_room = 'L105' if session_type == 'P' else assigned_room
-                    logger.log_slot("Phase 4", course_code, section.label if hasattr(section, 'label') else str(section),
-                                   day, start, end, room=log_room, period='PRE', session_type=session_type)
+                    # Store ONE slot tuple per time block (section_str may be comma-joined)
+                    semester_schedule['premid']['slots'].append((course_code, day, start, end, session_type, section_str, assigned_room))
+                    # Log once per section
+                    for sec_label in section_str.split(','):
+                        sec_label = sec_label.strip()
+                        if sec_label:
+                            logger.log_slot("Phase 4", course_code, sec_label, day, start, end,
+                                            room=log_room, period='PRE', session_type=session_type)
                 elif len(slot) == 7 and slot[0] == course_code:
-                    # Already has course code and room, store as is
+                    # Already prefixed: (course_code, day, start, end, session_type, section, room)
                     semester_schedule['premid']['slots'].append(slot)
-                    day, start, end, session_type, section, assigned_room = slot[1], slot[2], slot[3], slot[4], slot[5], slot[6]
+                    _, day, start, end, session_type, section_str, assigned_room = slot
                     log_room = 'L105' if session_type == 'P' else assigned_room
-                    logger.log_slot("Phase 4", course_code, section.label if hasattr(section, 'label') else str(section),
-                                   day, start, end, room=log_room, period='PRE', session_type=session_type)
+                    sec_name = section_str.label if hasattr(section_str, 'label') else str(section_str)
+                    for sec_label in sec_name.split(','):
+                        sec_label = sec_label.strip()
+                        if sec_label:
+                            logger.log_slot("Phase 4", course_code, sec_label, day, start, end,
+                                            room=log_room, period='PRE', session_type=session_type)
             
             print(f"  {course_code} scheduled: {len(course_slots)} sessions (synchronized across all sections)")
 
-        # PASS 2: Apply the slots directly (they already contain section info)
-        # Store slots with course code for proper mapping: (course_code, day, start, end, session_type, section, room)
+        # POST PASS 2: Apply slots to the schedule dict and logger.
         for course_code, course_slots in postmid_course_slots_map.items():
-            # Store slots with course code prefix
             for slot in course_slots:
-                if len(slot) == 6:  # (day, start, end, session_type, section, room)
-                    day, start, end, session_type, section, assigned_room = slot
-                    # Store as (course_code, day, start, end, session_type, section, room)
-                    semester_schedule['postmid']['slots'].append((course_code, day, start, end, session_type, section, assigned_room))
-                    # Determine room based on session type - practicals get lab rooms
-                    log_room = 'L105' if session_type == 'P' else assigned_room  # Use assigned room or lab for practicals
-                    logger.log_slot("Phase 4", course_code, section.label if hasattr(section, 'label') else str(section),
-                                   day, start, end, room=log_room, period='POST', session_type=session_type)
-                elif len(slot) == 5:  # Old format: (day, start, end, session_type, section)
-                    day, start, end, session_type, section = slot
-                    # Find available room for this slot
-                    assigned_room = find_available_room(
-                        day, start, end, postmid_room_occupancy, available_large_rooms
-                    )
-                    if session_type == 'P':
-                        assigned_room = 'L105'  # Lab for practicals
-                    # Store as (course_code, day, start, end, session_type, section, room)
-                    semester_schedule['postmid']['slots'].append((course_code, day, start, end, session_type, section, assigned_room))
+                if len(slot) == 6 and isinstance(slot[4], str):
+                    # New format: (day, start, end, session_type, section_str, room)
+                    day, start, end, session_type, section_str, assigned_room = slot
                     log_room = 'L105' if session_type == 'P' else assigned_room
-                    logger.log_slot("Phase 4", course_code, section.label if hasattr(section, 'label') else str(section),
-                                   day, start, end, room=log_room, period='POST', session_type=session_type)
+                    semester_schedule['postmid']['slots'].append((course_code, day, start, end, session_type, section_str, assigned_room))
+                    for sec_label in section_str.split(','):
+                        sec_label = sec_label.strip()
+                        if sec_label:
+                            logger.log_slot("Phase 4", course_code, sec_label, day, start, end,
+                                            room=log_room, period='POST', session_type=session_type)
                 elif len(slot) == 7 and slot[0] == course_code:
-                    # Already has course code and room, store as is
                     semester_schedule['postmid']['slots'].append(slot)
-                    day, start, end, session_type, section, assigned_room = slot[1], slot[2], slot[3], slot[4], slot[5], slot[6]
+                    _, day, start, end, session_type, section_str, assigned_room = slot
                     log_room = 'L105' if session_type == 'P' else assigned_room
-                    logger.log_slot("Phase 4", course_code, section.label if hasattr(section, 'label') else str(section),
-                                   day, start, end, room=log_room, period='POST', session_type=session_type)
+                    sec_name = section_str.label if hasattr(section_str, 'label') else str(section_str)
+                    for sec_label in sec_name.split(','):
+                        sec_label = sec_label.strip()
+                        if sec_label:
+                            logger.log_slot("Phase 4", course_code, sec_label, day, start, end,
+                                            room=log_room, period='POST', session_type=session_type)
             
             print(f"  {course_code} scheduled: {len(course_slots)} sessions (synchronized across all sections)")
         

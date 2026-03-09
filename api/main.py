@@ -70,21 +70,36 @@ def get_config(semesters: Optional[List[int]] = None):
 
 
 def load_timetable_from_csv(log_path: str) -> List[Dict[str, Any]]:
-    """Load timetable sessions from time_slot_log CSV. Returns list of session dicts (API schema)."""
+    """Load timetable sessions from time_slot_log CSV. Returns list of session dicts (API schema).
+    Deduplicates sessions that appear multiple times for the same slot (common with combined classes).
+    """
+    seen: set = set()
     rows = []
     with open(log_path, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
+            section = row.get("Section", "")
+            course_code = row.get("Course Code", "")
+            day = row.get("Day", "")
+            start_time = row.get("Start Time", "")
+            session_type = row.get("Session Type", "")
+            period = row.get("Period", "")
+            # Key for deduplication - same session shouldn't appear twice for the same section
+            # Include End Time to ensure sessions with different durations are not accidentally merged/dropped
+            dedup_key = (section, course_code, day, start_time, row.get("End Time", ""), session_type, period)
+            if dedup_key in seen:
+                continue
+            seen.add(dedup_key)
             rows.append({
                 "Phase": row.get("Phase", ""),
-                "Course Code": row.get("Course Code", ""),
-                "Section": row.get("Section", ""),
-                "Day": row.get("Day", ""),
-                "Start Time": row.get("Start Time", ""),
+                "Course Code": course_code,
+                "Section": section,
+                "Day": day,
+                "Start Time": start_time,
                 "End Time": row.get("End Time", ""),
                 "Room": row.get("Room", ""),
-                "Period": row.get("Period", ""),
-                "Session Type": row.get("Session Type", ""),
+                "Period": period,
+                "Session Type": session_type,
                 "Faculty": row.get("Faculty", ""),
             })
     return rows
@@ -170,18 +185,100 @@ def api_config():
 
 
 @app.post("/api/generate")
-def api_generate():
+async def api_generate():
     """
     First-time Generate: run full pipeline, return timetable + structure for UI labels.
-    Uses existing DATA/INPUT/ data.
+    Runs generate_24_sheets in a thread pool to avoid blocking the uvicorn event loop
+    (which causes Windows signal-handler to kill the process mid-request).
     """
+    import asyncio
+    from concurrent.futures import ThreadPoolExecutor
     try:
         from generate_24_sheets import generate_24_sheets
-        # Run pipeline (may take a while)
-        output_path, ts = generate_24_sheets()
+        # Run the heavy synchronous pipeline in a thread pool so uvicorn stays alive
+        loop = asyncio.get_event_loop()
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            output_path, ts = await loop.run_in_executor(pool, generate_24_sheets)
         log_path = os.path.join(REPO_ROOT, "DATA", "OUTPUT", f"time_slot_log_{ts}.csv")
         if not os.path.exists(log_path):
             raise HTTPException(status_code=500, detail=f"Time slot log not found: {log_path}")
+        timetable = load_timetable_from_csv(log_path)
+        labels = get_config()
+        excel_full_path = os.path.join(REPO_ROOT, output_path)
+        verification_table = parse_verification_tables_from_excel(excel_full_path)
+        return {
+            "success": True,
+            "timetable": timetable,
+            "labels": labels,
+            "verification_table": verification_table,
+            "log_timestamp": ts,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
+class GenerateFromSessionsRequest(BaseModel):
+    sessions: List[Dict[str, Any]]
+
+@app.post("/api/generate-from-sessions")
+async def api_generate_from_sessions(req: GenerateFromSessionsRequest):
+    """
+    Re-generate all 24 Excel sheets from the current (possibly dragged/edited) session list.
+    This preserves all manual drag changes while following existing scheduling rules for
+    room assignment and sheet formatting.
+    """
+    import asyncio
+    from concurrent.futures import ThreadPoolExecutor
+
+    sessions = req.sessions
+
+    def _do_generate():
+        import pandas as pd
+        from datetime import datetime
+        from generate_24_sheets import generate_24_sheets_from_log
+
+        # Write the sessions to a new time-slot-log CSV so generate_24_sheets
+        # can pick it up. We reuse the existing CSV format.
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_path = os.path.join(REPO_ROOT, "DATA", "OUTPUT", f"time_slot_log_{ts}.csv")
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+
+        # Build a clean DataFrame from the session list
+        rows = []
+        for s in sessions:
+            rows.append({
+                "Phase": s.get("Phase", "Manual"),
+                "Course Code": s.get("Course Code", ""),
+                "Course Name": s.get("Course Name", ""),
+                "Section": s.get("Section", ""),
+                "Day": s.get("Day", ""),
+                "Start Time": s.get("Start Time", ""),
+                "End Time": s.get("End Time", ""),
+                "Room": s.get("Room", ""),
+                "Faculty": s.get("Faculty", ""),
+                "Session Type": s.get("Session Type", "L"),
+                "Period": s.get("Period", "PRE"),
+            })
+        df = pd.DataFrame(rows)
+        df.to_csv(log_path, index=False)
+
+        # Regenerate the 24 Excel sheets from this log
+        output_path = generate_24_sheets_from_log(log_path, ts)
+        return output_path, ts, log_path
+
+    try:
+        loop = asyncio.get_event_loop()
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            output_path, ts, log_path = await loop.run_in_executor(pool, _do_generate)
+
+        if not os.path.exists(log_path):
+            raise HTTPException(status_code=500, detail=f"Time slot log not found: {log_path}")
+
         timetable = load_timetable_from_csv(log_path)
         labels = get_config()
         excel_full_path = os.path.join(REPO_ROOT, output_path)
@@ -206,8 +303,12 @@ class VerifyRequest(BaseModel):
 
 
 def _sessions_api_to_internal(sessions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Convert API time_slot_log schema to internal format (time_block, course_code, sections, etc.)."""
+    """Convert API time_slot_log schema to internal format (time_block, course_code, sections, etc.).
+    Deduplicates by (section, course_code, day, start_time, session_type, period) to avoid
+    false overlap errors from combined-class sessions logged multiple times.
+    """
     from utils.data_models import TimeBlock
+    seen: set = set()
     out = []
     for s in sessions:
         course_code = (s.get("Course Code") or "").strip()
@@ -215,8 +316,15 @@ def _sessions_api_to_internal(sessions: List[Dict[str, Any]]) -> List[Dict[str, 
         day = (s.get("Day") or "").strip()
         start_s = (s.get("Start Time") or "").strip()
         end_s = (s.get("End Time") or "").strip()
+        session_type = (s.get("Session Type") or "L").strip().upper()
+        period = (s.get("Period") or "").strip().upper() or "PRE"
         if not (course_code and section and day and start_s and end_s):
             continue
+        # Deduplicate: same section/course/day/start/type should only appear once
+        dedup_key = (section, course_code, day, start_s, session_type, period)
+        if dedup_key in seen:
+            continue
+        seen.add(dedup_key)
         try:
             hh, mm = start_s.split(":")
             start_t = time(int(hh), int(mm))
@@ -228,10 +336,10 @@ def _sessions_api_to_internal(sessions: List[Dict[str, Any]]) -> List[Dict[str, 
             "phase": s.get("Phase", ""),
             "course_code": course_code,
             "sections": [section],
-            "period": (s.get("Period") or "").strip().upper() or "PRE",
+            "period": period,
             "time_block": TimeBlock(day, start_t, end_t),
             "room": s.get("Room") or "",
-            "session_type": (s.get("Session Type") or "L").strip().upper(),
+            "session_type": session_type,
             "instructor": s.get("Faculty") or "",
         })
     return out
@@ -260,7 +368,15 @@ def run_verify(sessions: List[Dict[str, Any]]) -> Dict[str, Any]:
                 group = get_group_for_section(dept, sec_label)
                 sections.append(Section(dept, group, sec_label, sem, STUDENTS_PER_SECTION))
     success, errors = run_dv_verify(all_sessions, courses, sections, classrooms)
-    return {"success": success, "errors": errors}
+    # Deduplicate errors: same (rule, course_code, section, message) should not appear twice
+    seen_errors: set = set()
+    unique_errors = []
+    for e in errors:
+        key = (e.get("rule", ""), e.get("course_code", ""), e.get("section", ""), e.get("message", ""))
+        if key not in seen_errors:
+            seen_errors.add(key)
+            unique_errors.append(e)
+    return {"success": len(unique_errors) == 0, "errors": unique_errors}
 
 
 @app.post("/api/verify")
