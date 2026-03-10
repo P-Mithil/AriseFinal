@@ -304,12 +304,15 @@ class VerifyRequest(BaseModel):
 
 def _sessions_api_to_internal(sessions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Convert API time_slot_log schema to internal format (time_block, course_code, sections, etc.).
-    Deduplicates by (section, course_code, day, start_time, session_type, period) to avoid
-    false overlap errors from combined-class sessions logged multiple times.
+    Aggregates sections for combined-class sessions logged multiple times so deep verification
+    knows the session belongs to *all* of those sections, enabling cross-section conflict checks.
     """
     from utils.data_models import TimeBlock
-    seen: set = set()
-    out = []
+    
+    # Key: (course_code, day, start_s, session_type, period)
+    # Value: Dict representing the grouped session, with a set of sections
+    grouped_sessions = {}
+    
     for s in sessions:
         course_code = (s.get("Course Code") or "").strip()
         section = (s.get("Section") or "").strip()
@@ -318,30 +321,39 @@ def _sessions_api_to_internal(sessions: List[Dict[str, Any]]) -> List[Dict[str, 
         end_s = (s.get("End Time") or "").strip()
         session_type = (s.get("Session Type") or "L").strip().upper()
         period = (s.get("Period") or "").strip().upper() or "PRE"
+        
         if not (course_code and section and day and start_s and end_s):
             continue
-        # Deduplicate: same section/course/day/start/type should only appear once
-        dedup_key = (section, course_code, day, start_s, session_type, period)
-        if dedup_key in seen:
-            continue
-        seen.add(dedup_key)
-        try:
-            hh, mm = start_s.split(":")
-            start_t = time(int(hh), int(mm))
-            hh, mm = end_s.split(":")
-            end_t = time(int(hh), int(mm))
-        except Exception:
-            continue
-        out.append({
-            "phase": s.get("Phase", ""),
-            "course_code": course_code,
-            "sections": [section],
-            "period": period,
-            "time_block": TimeBlock(day, start_t, end_t),
-            "room": s.get("Room") or "",
-            "session_type": session_type,
-            "instructor": s.get("Faculty") or "",
-        })
+            
+        group_key = (course_code, day, start_s, session_type, period)
+        
+        if group_key not in grouped_sessions:
+            try:
+                hh, mm = start_s.split(":")
+                start_t = time(int(hh), int(mm))
+                hh, mm = end_s.split(":")
+                end_t = time(int(hh), int(mm))
+            except Exception:
+                continue
+                
+            grouped_sessions[group_key] = {
+                "phase": s.get("Phase", ""),
+                "course_code": course_code,
+                "sections": set(),
+                "period": period,
+                "time_block": TimeBlock(day, start_t, end_t),
+                "room": s.get("Room") or "",
+                "session_type": session_type,
+                "instructor": s.get("Faculty") or "",
+            }
+            
+        grouped_sessions[group_key]["sections"].add(section)
+        
+    out = []
+    for g_sess in grouped_sessions.values():
+        g_sess["sections"] = list(g_sess["sections"])
+        out.append(g_sess)
+        
     return out
 
 

@@ -137,13 +137,69 @@ const COURSE_COLORS = [
   '#f97316',
 ]
 
-function getColorForCourse(code: string): string {
-  const base = (code || '').split('-')[0]
+export function getColorForCourse(courseCode: string): string {
+  const baseCode = (courseCode || '').split('-')[0]
   let hash = 0
-  for (let i = 0; i < base.length; i += 1) {
-    hash = (hash * 31 + base.charCodeAt(i)) >>> 0
+  for (let i = 0; i < baseCode.length; i++) {
+    hash = (hash * 31 + baseCode.charCodeAt(i)) & 0xffffffff
   }
-  return COURSE_COLORS[hash % COURSE_COLORS.length]
+  return COURSE_COLORS[Math.abs(hash) % COURSE_COLORS.length]
+}
+
+export function syncAllMovedRelatedSessions(oldTimetable: Session[], newTimetable: Session[]): Session[] {
+  let finalState = [...newTimetable]
+  const movedIndices: number[] = []
+  for (let i = 0; i < oldTimetable.length; i++) {
+    const o = oldTimetable[i]
+    const n = newTimetable[i]
+    if (o.Day !== n.Day || o['Start Time'] !== n['Start Time'] || o['End Time'] !== n['End Time']) {
+      movedIndices.push(i)
+    }
+  }
+
+  for (const idx of movedIndices) {
+    const oldS = oldTimetable[idx]
+    const newS = finalState[idx]
+
+    // We want to aggressively sync Electives, Combined Classes, Tutorials, and Labs
+    // to ensure they stay glued together across all sections they belong to.
+    const isSyncablePhase =
+      oldS.Phase?.startsWith('Phase 3') ||
+      oldS.Phase?.startsWith('Phase 4');
+
+    if (!isSyncablePhase) {
+      continue
+    }
+
+    finalState = finalState.map((cand, candIdx) => {
+      if (candIdx === idx) return cand
+      const oldCand = oldTimetable[candIdx]
+      // Sync if it is the EXACT same Course Code and Session Type, AND same Group
+      // (Unless it's an Elective (Phase 3), which spans across ALL groups globally)
+      // We explicitly skip checking if oldCand.Day === oldS.Day because they 
+      // might have gotten desynced by the generator, but the user expects them to sync!
+      const isElective = oldS.Phase?.startsWith('Phase 3');
+      const isSameGroup = getGroupForSection(oldCand.Section) === getGroupForSection(oldS.Section);
+      const isSameSemester = getSemesterFromSection(oldCand.Section) === getSemesterFromSection(oldS.Section);
+
+      if (
+        oldCand['Course Code'] === oldS['Course Code'] &&
+        oldCand['Session Type'] === oldS['Session Type'] &&
+        oldCand.Phase === oldS.Phase &&
+        isSameSemester &&
+        (isElective || isSameGroup)
+      ) {
+        return {
+          ...cand,
+          Day: newS.Day,
+          'Start Time': newS['Start Time'],
+          'End Time': newS['End Time'],
+        }
+      }
+      return cand
+    })
+  }
+  return finalState
 }
 
 function getSemesterFromSection(section: string | null): number | null {
@@ -152,6 +208,14 @@ function getSemesterFromSection(section: string | null): number | null {
   if (!match) return null
   const n = Number.parseInt(match[1], 10)
   return Number.isNaN(n) ? null : n
+}
+
+function getGroupForSection(section: string | null): number {
+  if (!section) return 1
+  const s = section.toUpperCase()
+  if (s.includes('CSE-A') || s.includes('CSE-B')) return 1
+  if (s.includes('DSAI-A') || s.includes('ECE-A')) return 2
+  return 1 // Default
 }
 
 function MainContent({
@@ -352,10 +416,6 @@ function MainContent({
       const newStartMin = slotStartMin
       const newEndMin = newStartMin + duration
 
-      const dayEndMin = parseTimeToMinutes(dayEnd)
-      const lunchStartMin = lunchWindow ? parseTimeToMinutes(lunchWindow.start) : null
-      const lunchEndMin = lunchWindow ? parseTimeToMinutes(lunchWindow.end) : null
-
       // Sessions on this day, same section+period, excluding dragged
       const sameDaySessions = filteredSessions
         .filter(
@@ -375,140 +435,13 @@ function MainContent({
         .filter((c) => intervalOverlaps(c.startMin, c.endMin, newStartMin, newEndMin))
         .sort((a, b) => a.startMin - b.startMin)
 
-      let updated: Session[] = timetable
-
-      // Try push right for conflicting sessions so the dropped slot always shows the dragged course
-      const MAX_PUSH_CHAIN = 3
-
-      const tryPushRight = (
-        toMove: { session: Session; idx: number; startMin: number; endMin: number; duration: number },
-        currentState: Session[],
-        excludeIds: Set<string>,
-        depth: number,
-        minStart?: number,
-      ): Session[] | null => {
-        if (depth > MAX_PUSH_CHAIN) return null
-
-        // Evaluate overlaps against ALL sessions on the same day in currentState (except toMove itself)
-        const relevantHelpers = currentState
-          .map((s, i) => ({ session: s, idx: i }))
-          .filter(
-            (c) =>
-              c.session.Day === day &&
-              c.session.Section === selectedSection &&
-              normalizePeriod(c.session.Period) === normalizePeriod(selectedPeriod) &&
-              c.idx !== toMove.idx
-          )
-
-        let cursor = Math.max(toMove.endMin, minStart ?? 0)
-        cursor = alignTo15(cursor)
-        if (lunchStartMin != null && lunchEndMin != null && intervalOverlaps(cursor, cursor + toMove.duration, lunchStartMin, lunchEndMin)) {
-          cursor = alignTo15(lunchEndMin)
-        }
-        while (cursor + toMove.duration <= dayEndMin) {
-          const candStart = cursor
-          const candEnd = cursor + toMove.duration
-          if (lunchStartMin != null && lunchEndMin != null && intervalOverlaps(candStart, candEnd, lunchStartMin, lunchEndMin)) {
-            cursor = alignTo15(lunchEndMin)
-            continue
-          }
-          const overlaps = relevantHelpers.filter((o) => {
-            const oStart = parseTimeToMinutes(
-              currentState[o.idx]['Start Time'],
-            )
-            const oEnd = parseTimeToMinutes(currentState[o.idx]['End Time'])
-            return intervalOverlaps(candStart, candEnd, oStart, oEnd)
-          })
-          if (overlaps.length === 0) {
-            const nextState = currentState.map((s, idx) =>
-              idx === toMove.idx
-                ? {
-                  ...s,
-                  Day: day,
-                  'Start Time': minutesToTime(candStart),
-                  'End Time': minutesToTime(candEnd),
-                }
-                : s,
-            )
-            return nextState
-          }
-          if (overlaps.length === 1 && depth < MAX_PUSH_CHAIN) {
-            const overlapping = overlaps[0]
-            const oId = (overlapping.session as any).id as string
-
-            // Only try to push if the overlapping obstacle is NOT an anchored/excluded session (like the currently dragged session)
-            if (!excludeIds.has(oId)) {
-              const oStartMap = parseTimeToMinutes(currentState[overlapping.idx]['Start Time'])
-              const oEndMap = parseTimeToMinutes(currentState[overlapping.idx]['End Time'])
-              const pushed = tryPushRight(
-                { session: overlapping.session, idx: overlapping.idx, startMin: oStartMap, endMin: oEndMap, duration: oEndMap - oStartMap },
-                currentState,
-                new Set([...excludeIds, (toMove.session as any).id as string]),
-                depth + 1,
-                candEnd,
-              )
-              if (pushed) {
-                const nextState = pushed.map((s, idx) =>
-                  idx === toMove.idx
-                    ? {
-                      ...s,
-                      Day: day,
-                      'Start Time': minutesToTime(candStart),
-                      'End Time': minutesToTime(candEnd),
-                    }
-                    : s,
-                )
-                return nextState
-              }
-            }
-          }
-          cursor += 15
-        }
-        return null
-      }
-
-      if (conflicts.length > 0 && conflicts.length <= MAX_PUSH_CHAIN) {
-        const baseState = timetable.map((s, idx) =>
-          idx === draggedIndex
-            ? {
-              ...s,
-              Day: day,
-              'Start Time': minutesToTime(newStartMin),
-              'End Time': minutesToTime(newEndMin),
-            }
-            : s,
-        )
-        let pushedState: Session[] | null = baseState
-        const excludeIds = new Set<string>([sessionId])
-        for (const c of conflicts) {
-          const cSession = pushedState![c.idx]
-          const cStart = parseTimeToMinutes(cSession['Start Time'])
-          const cEnd = parseTimeToMinutes(cSession['End Time'])
-          pushedState = tryPushRight(
-            { ...c, startMin: cStart, endMin: cEnd },
-            pushedState!,
-            excludeIds,
-            0,
-          )
-          if (!pushedState) break
-          excludeIds.add((c.session as any).id as string)
-        }
-        if (pushedState) {
-          updated = pushedState
-          onTimetableChange(updated)
-          setLastMovedSessionId(sessionId)
-          return
-        }
-      }
-
-      // Fallback: move only the dragged session (reject if it would create an overlap and cause a session to vanish)
-      const wouldOverlap = sameDaySessions.some((c) =>
-        intervalOverlaps(c.startMin, c.endMin, newStartMin, newEndMin),
-      )
-      if (wouldOverlap) {
-        setMessage('Drop would create a conflict. Try a different slot.')
+      let updated: Session[] = timetable;
+      
+      // Reject if the dropped block would overlap with any existing session
+      if (conflicts.length > 0) {
         return
       }
+      
       updated = timetable.map((s, idx) =>
         idx === draggedIndex
           ? {
@@ -519,7 +452,7 @@ function MainContent({
           }
           : s,
       )
-      onTimetableChange(updated)
+      onTimetableChange(syncAllMovedRelatedSessions(timetable, updated))
       setLastMovedSessionId(sessionId)
     },
     [timetable, filteredSessions, onTimetableChange, selectedSection, dayStart, dayEnd, lunchWindow, setMessage],

@@ -3260,8 +3260,23 @@ def generate_24_sheets(sessions_from_log: List[Dict] = None):
                  faculty = orig_s.get('Faculty') or faculty
 
                 
+        # Determine Phase for UI syncing
+        orig_phase = "Final"
+        if course_display.startswith("ELECTIVE"):
+            orig_phase = "Phase 3"
+        elif comb_sess:
+            orig_phase = "Phase 4"
+        elif "-TUT" in course_display or "-LAB" in course_display:
+            orig_phase = "Phase 5"
+        else:
+            orig_phase = "Phase 7"
+            
+        # If generating from log (UI edits), preserve original Phase if available
+        if sessions_from_log is not None and orig_s and orig_s.get('Phase'):
+            orig_phase = orig_s.get('Phase')
+
         logger.log_slot(
-            phase="Final",
+            phase=orig_phase,
             course_code=course_display,
             section=s['section'],
             day=s['day'],

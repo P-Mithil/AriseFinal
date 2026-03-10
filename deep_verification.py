@@ -855,22 +855,30 @@ def run_verification_on_sessions(
     # 2) Section overlap: two DIFFERENT courses in the same section+period overlapping in time
     by_sec_period = defaultdict(list)
     for s in all_sessions:
-        key = ((s.get("sections") or [""])[0], (s.get("period") or "").strip().upper())
-        by_sec_period[key].append(s)
+        period = (s.get("period") or "").strip().upper()
+        # A session might belong to multiple sections (combined courses)
+        secs = s.get("sections") or [""]
+        if isinstance(secs, str):
+            secs = [secs]
+        for sec in secs:
+            key = (sec, period)
+            by_sec_period[key].append(s)
+            
     for key, sess_list in by_sec_period.items():
         for i, a in enumerate(sess_list):
             for b in sess_list[i + 1:]:
                 tb_a, tb_b = a.get("time_block"), b.get("time_block")
                 if not tb_a or not tb_b or tb_a.day != tb_b.day or not tb_a.overlaps(tb_b):
                     continue
-                code_a = (a.get("course_code") or "").split("-")[0].strip().upper()
-                code_b = (b.get("course_code") or "").split("-")[0].strip().upper()
-                # Skip if same base course code (combined-class duplicate entries)
-                if code_a == code_b:
+                full_code_a = (a.get("course_code") or "").strip().upper()
+                full_code_b = (b.get("course_code") or "").strip().upper()
+                # Skip if EXACT same course code and type (we shouldn't really have these anymore after grouping, 
+                # but just in case of weird data, don't flag a course as overlapping itself)
+                if full_code_a == full_code_b and a.get("session_type") == b.get("session_type"):
                     continue
                 # Skip if either is an elective basket (individual elective sub-courses
                 # are alternatives within the same basket and share their combined slot)
-                if "ELECTIVE_BASKET" in code_a or "ELECTIVE_BASKET" in code_b:
+                if "ELECTIVE_BASKET" in full_code_a or "ELECTIVE_BASKET" in full_code_b:
                     continue
                 # Skip known sub-elective course code patterns (e.g. CS261, CS262 are
                 # elective options that share the same time slot by design)
@@ -934,13 +942,16 @@ def run_verification_on_sessions(
         if "ELECTIVE_BASKET" in code or str(s.get("phase", "")).startswith("Phase 3"):
             continue
             
-        sec = (s.get("sections") or [""])[0]
         tb = s.get("time_block")
         period = str(s.get("period") or "PRE").strip().upper()
-        if not tb or not sec or not code:
+        if not tb or not code:
             continue
-        key = (sec, code, tb.day, period)
-        course_day_counts[key].append(s)
+            
+        for sec in (s.get("sections") or [""]):
+            if not sec:
+                continue
+            key = (sec, code, tb.day, period)
+            course_day_counts[key].append(s)
 
     for (sec, code, day, period), sessions in course_day_counts.items():
         if len(sessions) > 1:
@@ -992,23 +1003,6 @@ def run_verification_on_sessions(
             target_tb = t_sessions[0].get("time_block")
             if not target_tb: continue
             
-            # Sub-check A: 240-Capacity Room (C004) Bottleneck
-            # Check if *another* combined course (meaning len(secs) > 1) is scheduled at this exact time
-            # We ONLY loop over combined_groups to check against other combined courses!
-            for (o_code, o_fac, o_stype), o_sessions in combined_groups.items():
-                if o_code == code: continue
-                # Does the other combined course overlap this time?
-                for o_sess in o_sessions:
-                    o_tb = o_sess.get("time_block")
-                    if o_tb and o_tb.day == target_tb.day and o_tb.overlaps(target_tb):
-                        _add_error(
-                            "Room Conflict",
-                            f"Combined course {code} cannot be at {t_str} because the 240-capacity room is occupied by {o_code}",
-                            code, ", ".join(set(all_secs)), target_tb.day,
-                            f"{target_tb.start.strftime('%H:%M')}-{target_tb.end.strftime('%H:%M')}"
-                        )
-                        break # Report once per other course overlap
-            
             # Sub-check B: Faculty availability for combined course
             # Check if this instructor is teaching any *other* course at this time
             for osess in all_sessions:
@@ -1025,40 +1019,6 @@ def run_verification_on_sessions(
                             f"{target_tb.start.strftime('%H:%M')}-{target_tb.end.strftime('%H:%M')}"
                         )
                         break
-        
-        if len(unique_times) > 1:
-            # Sub-check C: Desync and cross-section conflict check
-            # User dragged one instance but not the others.
-            for t_str, t_sessions in unique_times.items():
-                target_tb = t_sessions[0].get("time_block")
-                if not target_tb: continue
-                # Sections that have it at THIS time
-                secs_at_this_time = set(sum([s.get("sections", [""]) for s in t_sessions], []))
-                # Sections that SHOULD have it but don't (they are at the other time)
-                other_secs = set(all_secs) - secs_at_this_time
-                
-                # Check if this target_tb overlaps with ANY existing sessions in other_secs
-                for other_sec in other_secs:
-                    other_sec_sessions = [
-                        xs for xs in all_sessions 
-                        if other_sec in xs.get("sections", []) and xs.get("course_code", "").split("-")[0].strip().upper() != code
-                    ]
-                    for osess in other_sec_sessions:
-                        otb = osess.get("time_block")
-                        if otb and otb.day == target_tb.day and otb.overlaps(target_tb):
-                            o_code = osess.get("course_code", "")
-                            _add_error(
-                                "Combined Conflict",
-                                f"Cannot drag combined course {code} to {t_str} because shared section {other_sec} is already busy with {o_code}",
-                                code, other_sec, target_tb.day,
-                                f"{target_tb.start.strftime('%H:%M')}-{target_tb.end.strftime('%H:%M')}"
-                            )
-            
-            _add_error(
-                "Combined Desync",
-                f"Combined course {code} ({fac}) is scheduled at different times across its sections. Ensure all sections place it at the same time.",
-                code, ", ".join(set(all_secs)), "", ""
-            )
 
     return (len(errors) == 0, errors)
 
