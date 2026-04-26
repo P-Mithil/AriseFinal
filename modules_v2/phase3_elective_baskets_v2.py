@@ -598,13 +598,9 @@ def create_elective_basket_sessions(group_key: str, sections: List[Section]) -> 
     # Filter sections for this semester
     semester_sections = [s for s in sections if s.semester == semester]
     
-    # Distribute rooms across multiple classrooms to avoid conflicts
-    # Available rooms: C002, C003, C101, C102, C201, C202, C203, C204, C205, C301, C302, C303, C304, C401, C402, C403, C404, C405
-    available_rooms = ["C002", "C003", "C101", "C102", "C201", "C202", "C203", "C204", "C205", 
-                       "C301", "C302", "C303", "C304", "C401", "C402", "C403", "C404", "C405"]
-    
-    # Assign different rooms to different sections to avoid conflicts
-    room_index = 0
+    # Room assignment is handled by Phase 9 (elective room assignment).
+    # Use 'TBD' as a neutral placeholder so the time-slot log does not
+    # record a spurious classroom code in the verification summary table.
     
     for section in semester_sections:
         # CRITICAL: Create independent TimeBlock copies for each session to prevent shared reference issues
@@ -614,9 +610,8 @@ def create_elective_basket_sessions(group_key: str, sections: List[Section]) -> 
             basket_slots['lecture_1'].start,
             basket_slots['lecture_1'].end
         )
-        # Assign room to this section (distribute across available rooms)
-        assigned_room = available_rooms[room_index % len(available_rooms)]
-        room_index += 1
+        # Placeholder – Phase 9 will assign the real room
+        assigned_room = 'TBD'
         
         sessions.append(ScheduledSession(
             course_code=f"ELECTIVE_BASKET_{group_key}",
@@ -698,12 +693,8 @@ def get_elective_basket_sessions_for_section(section: Section, period: str) -> L
     if not matching_groups:
         return sessions
     
-    # Distribute rooms across multiple classrooms to avoid conflicts
-    available_rooms = ["C002", "C003", "C101", "C102", "C201", "C202", "C203", "C204", "C205", 
-                       "C301", "C302", "C303", "C304", "C401", "C402", "C403", "C404", "C405"]
-    # Use section name hash to consistently assign same room to same section
-    section_hash = hash(section.label) % len(available_rooms)
-    assigned_room = available_rooms[section_hash]
+    # Room assignment is handled by Phase 9; use neutral placeholder here
+    assigned_room = 'TBD'
     
     # Create sessions for each group in this semester
     for group_key in matching_groups:
@@ -807,8 +798,34 @@ def build_faculty_elective_sessions(courses: List[Course]) -> List[ScheduledSess
         if not instructors:
             continue
 
-        # Use the same basket slots in both periods (PreMid and PostMid)
-        for period in ["PRE", "POST"]:
+        import json
+        
+        # Load the actual periods assigned in Phase 9 from the cache to prevent duplication
+        period_assignments = {}
+        cache_path = "DATA/OUTPUT/elective_assignments_cache.json"
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path, "r") as f:
+                    cache_data = json.load(f)
+                    for sem, assignments in cache_data.items():
+                        for a in assignments:
+                            c_code = a.get("course_code")
+                            if c_code:
+                                p = a.get("period", "PRE")
+                                # Prefer PRE/POST over FULL to ensure they show up in half-semester grids
+                                if p in ("PRE", "POST") or c_code not in period_assignments:
+                                    period_assignments[c_code] = p
+            except Exception:
+                pass
+
+        # Use the assigned period, defaulting to ["PRE", "POST"] only if nothing is cached
+        assigned_period = period_assignments.get(course.code)
+        # Normalize cache values: strict verification and faculty checks only understand PRE/POST.
+        if assigned_period not in ("PRE", "POST"):
+            assigned_period = None
+        periods_to_generate = [assigned_period] if assigned_period else ["PRE", "POST"]
+
+        for period in periods_to_generate:
             for slot_name, base_block in basket_slots.items():
                 name_lower = str(slot_name).lower()
                 if name_lower.startswith("lecture"):
@@ -1001,12 +1018,10 @@ def run_phase3(courses: List[Course], sections: List[Section],
     sessions_without_rooms = [s for s in all_sessions if not s.room]
     if sessions_without_rooms:
         print(f"  WARNING: {len(sessions_without_rooms)} elective sessions without rooms")
-        # Distribute rooms to sessions without rooms
-        available_rooms = ["C002", "C003", "C101", "C102", "C201", "C202", "C203", "C204", "C205", 
-                           "C301", "C302", "C303", "C304", "C401", "C402", "C403", "C404", "C405"]
-        for idx, session in enumerate(sessions_without_rooms):
-            session.room = available_rooms[idx % len(available_rooms)]
-        print(f"  Fixed: Assigned rooms to all sessions without rooms (distributed across {len(available_rooms)} rooms)")
+        # Mark as TBD; Phase 9 will assign real rooms
+        for session in sessions_without_rooms:
+            session.room = 'TBD'
+        print(f"  Fixed: Marked {len(sessions_without_rooms)} sessions as TBD (Phase 9 will assign real rooms)")
     else:
         print(f"  [OK] All {len(all_sessions)} elective sessions have rooms assigned")
     
@@ -1035,7 +1050,7 @@ if __name__ == "__main__":
     # Create sample sections using config
     from config.structure_config import DEPARTMENTS, SECTIONS_BY_DEPT, STUDENTS_PER_SECTION, get_group_for_section
     sections = []
-    for sem in [1, 3, 5]:
+    for sem in sorted(set(c.semester for c in courses)):
         for dept in DEPARTMENTS:
             for sec_label in SECTIONS_BY_DEPT.get(dept, []):
                 group = get_group_for_section(dept, sec_label)

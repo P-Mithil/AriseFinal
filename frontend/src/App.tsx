@@ -1,7 +1,7 @@
 import { useState, useCallback } from 'react'
 import Sidebar from './components/Sidebar'
 import MainContent from './components/MainContent'
-import type { Session, LabelsConfig, VerificationRow } from './types'
+import type { Session, LabelsConfig, VerificationRow, VerifyError, VerifyResponse } from './types'
 import './App.css'
 
 function attachSessionIds(sessions: Session[]): Session[] {
@@ -26,8 +26,6 @@ function App() {
   const [generateLoading, setGenerateLoading] = useState(false)
   const [verifyErrors, setVerifyErrors] = useState<Array<{ rule: string; message: string; course_code?: string; section?: string; day?: string; time?: string }>>([])
   const [verifySuccess, setVerifySuccess] = useState(false)
-  const [showConfirmReflow, setShowConfirmReflow] = useState(false)
-  const [reflowLoading, setReflowLoading] = useState(false)
   const [message, setMessage] = useState<string | null>(null)
   const [verificationTable, setVerificationTable] = useState<Record<string, VerificationRow[]>>({})
 
@@ -35,23 +33,32 @@ function App() {
     timetable: Session[],
     newLabels: LabelsConfig,
     verification_table?: Record<string, VerificationRow[]>,
+    post_generate_verify?: VerifyResponse,
   ) => {
     const withIds = attachSessionIds(timetable)
     setFirstGeneratedTimetable(withIds)
     setCurrentTimetable(withIds)
     setLabels(newLabels)
     setVerificationTable(verification_table ?? {})
-    setVerifyErrors([])
-    setVerifySuccess(false)
-    setShowConfirmReflow(false)
-    setMessage('Timetable generated. Select a section from the sidebar.')
+    if (post_generate_verify) {
+      setVerifySuccess(!!post_generate_verify.success)
+      setVerifyErrors((post_generate_verify.errors ?? []) as VerifyError[])
+      setMessage(
+        post_generate_verify.success
+          ? 'Timetable generated. Select a section from the sidebar.'
+          : 'Timetable generated, but verification found issues (see below). Select a section to review.',
+      )
+    } else {
+      setVerifyErrors([])
+      setVerifySuccess(false)
+      setMessage('Timetable generated. Select a section from the sidebar.')
+    }
   }, [])
 
   const onTimetableChange = useCallback((updated: Session[]) => {
     setCurrentTimetable(updated)
     setVerifyErrors([])
     setVerifySuccess(false)
-    setShowConfirmReflow(false)
   }, [])
 
   const onVerifyResult = useCallback((success: boolean, errors: Array<{ rule: string; message: string; course_code?: string; section?: string; day?: string; time?: string }>) => {
@@ -59,38 +66,15 @@ function App() {
     setVerifyErrors(errors)
     if (success) {
       setMessage('Timetable updated.')
-      setShowConfirmReflow(false)
     } else {
-      setShowConfirmReflow(true)
       setMessage(null)
     }
   }, [])
-
-  const onReflowResult = useCallback(
-    (success: boolean, notPossible: boolean, newTimetable?: Session[]) => {
-      if (success && newTimetable) {
-        const withIds = attachSessionIds(newTimetable)
-        setCurrentTimetable(withIds)
-        setFirstGeneratedTimetable(withIds)
-        setVerifyErrors([])
-        setVerifySuccess(true)
-        setShowConfirmReflow(false)
-        setMessage('Timetable reflowed and updated.')
-      } else if (notPossible) {
-        setCurrentTimetable(firstGeneratedTimetable)
-        setVerifyErrors([])
-        setShowConfirmReflow(false)
-        setMessage('Not possible. Reverted to first-generated timetable.')
-      }
-    },
-    [firstGeneratedTimetable],
-  )
 
   const revertToFirst = useCallback(() => {
     if (firstGeneratedTimetable) {
       setCurrentTimetable(firstGeneratedTimetable)
       setVerifyErrors([])
-      setShowConfirmReflow(false)
       setMessage('Reverted to first-generated timetable.')
     }
   }, [firstGeneratedTimetable])
@@ -117,11 +101,7 @@ function App() {
         onTimetableChange={onTimetableChange}
         verifyErrors={verifyErrors}
         verifySuccess={verifySuccess}
-        showConfirmReflow={showConfirmReflow}
-        reflowLoading={reflowLoading}
-        setReflowLoading={setReflowLoading}
         onVerifyResult={onVerifyResult}
-        onReflowResult={onReflowResult}
         revertToFirst={revertToFirst}
         message={message}
         setMessage={setMessage}

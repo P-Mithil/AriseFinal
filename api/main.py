@@ -14,6 +14,8 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO_ROOT)
 os.chdir(REPO_ROOT)
 
+from utils.period_utils import normalize_period
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -39,7 +41,7 @@ def get_config(semesters: Optional[List[int]] = None):
             courses, _, _ = run_phase1()
             semesters = sorted(set(c.semester for c in courses if c.department in DEPARTMENTS))
         except Exception:
-            semesters = [1, 3, 5]
+            semesters = [1, 2, 3, 4, 5, 6]
     program_display = {"CSE": "Computer Science", "DSAI": "Data Science & AI", "ECE": "ECE"}
     programs = []
     for dept in DEPARTMENTS:
@@ -178,6 +180,16 @@ def parse_verification_tables_from_excel(excel_path: str) -> Dict[str, List[Dict
     return result
 
 
+def _count_unsatisfied_rows(verification_table: Dict[str, List[Dict[str, Any]]]) -> int:
+    total = 0
+    for rows in (verification_table or {}).values():
+        for r in rows or []:
+            status = str((r or {}).get("status", "") or "").strip().upper()
+            if status == "UNSATISFIED":
+                total += 1
+    return total
+
+
 @app.get("/api/config")
 def api_config():
     """Working days, day start/end, lunch windows, programs and section labels for UI."""
@@ -195,10 +207,24 @@ async def api_generate():
     from concurrent.futures import ThreadPoolExecutor
     try:
         from generate_24_sheets import generate_24_sheets
+        from utils.generation_verify_bridge import GenerationViolationError
         # Run the heavy synchronous pipeline in a thread pool so uvicorn stays alive
         loop = asyncio.get_event_loop()
         with ThreadPoolExecutor(max_workers=1) as pool:
-            output_path, ts = await loop.run_in_executor(pool, generate_24_sheets)
+            try:
+                output_path, ts = await loop.run_in_executor(pool, generate_24_sheets)
+            except GenerationViolationError as gve:
+                detail = {
+                    "success": False,
+                    "message": str(gve),
+                    "errors": gve.errors,
+                }
+                if getattr(gve, "debug_faculty_path", None):
+                    detail["debug_faculty_path"] = gve.debug_faculty_path
+                raise HTTPException(
+                    status_code=422,
+                    detail=detail,
+                )
         log_path = os.path.join(REPO_ROOT, "DATA", "OUTPUT", f"time_slot_log_{ts}.csv")
         if not os.path.exists(log_path):
             raise HTTPException(status_code=500, detail=f"Time slot log not found: {log_path}")
@@ -206,12 +232,21 @@ async def api_generate():
         labels = get_config()
         excel_full_path = os.path.join(REPO_ROOT, output_path)
         verification_table = parse_verification_tables_from_excel(excel_full_path)
+        post_generate_verify = run_verify(timetable)
+        unsatisfied_count = _count_unsatisfied_rows(verification_table)
+        consistency = {
+            "unsatisfied_rows": unsatisfied_count,
+            "strict_success": bool(post_generate_verify.get("success", False)),
+            "consistent": not (post_generate_verify.get("success", False) and unsatisfied_count > 0),
+        }
         return {
             "success": True,
             "timetable": timetable,
             "labels": labels,
             "verification_table": verification_table,
             "log_timestamp": ts,
+            "post_generate_verify": post_generate_verify,
+            "consistency": consistency,
         }
     except HTTPException:
         raise
@@ -248,6 +283,12 @@ async def api_generate_from_sessions(req: GenerateFromSessionsRequest):
         log_path = os.path.join(REPO_ROOT, "DATA", "OUTPUT", f"time_slot_log_{ts}.csv")
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
 
+        debug_path = os.environ.get("TIMETABLE_DEBUG_SESSIONS_PATH")
+        if debug_path:
+            import json
+            with open(debug_path, "w", encoding="utf-8") as f:
+                json.dump(sessions, f, indent=2)
+
         # Build a clean DataFrame from the session list
         rows = []
         for s in sessions:
@@ -283,12 +324,21 @@ async def api_generate_from_sessions(req: GenerateFromSessionsRequest):
         labels = get_config()
         excel_full_path = os.path.join(REPO_ROOT, output_path)
         verification_table = parse_verification_tables_from_excel(excel_full_path)
+        post_generate_verify = run_verify(timetable)
+        unsatisfied_count = _count_unsatisfied_rows(verification_table)
+        consistency = {
+            "unsatisfied_rows": unsatisfied_count,
+            "strict_success": bool(post_generate_verify.get("success", False)),
+            "consistent": not (post_generate_verify.get("success", False) and unsatisfied_count > 0),
+        }
         return {
             "success": True,
             "timetable": timetable,
             "labels": labels,
             "verification_table": verification_table,
             "log_timestamp": ts,
+            "post_generate_verify": post_generate_verify,
+            "consistency": consistency,
         }
     except HTTPException:
         raise
@@ -308,11 +358,9 @@ def _sessions_api_to_internal(sessions: List[Dict[str, Any]]) -> List[Dict[str, 
     knows the session belongs to *all* of those sections, enabling cross-section conflict checks.
     """
     from utils.data_models import TimeBlock
-    
-    # Key: (course_code, day, start_s, session_type, period)
-    # Value: Dict representing the grouped session, with a set of sections
-    grouped_sessions = {}
-    
+    from utils.generation_verify_bridge import final_ui_rows_to_verify_sessions
+
+    rows: List[Dict[str, Any]] = []
     for s in sessions:
         course_code = (s.get("Course Code") or "").strip()
         section = (s.get("Section") or "").strip()
@@ -320,41 +368,39 @@ def _sessions_api_to_internal(sessions: List[Dict[str, Any]]) -> List[Dict[str, 
         start_s = (s.get("Start Time") or "").strip()
         end_s = (s.get("End Time") or "").strip()
         session_type = (s.get("Session Type") or "L").strip().upper()
-        period = (s.get("Period") or "").strip().upper() or "PRE"
-        
+        period = normalize_period(s.get("Period"))
+
         if not (course_code and section and day and start_s and end_s):
             continue
-            
-        group_key = (course_code, day, start_s, session_type, period)
-        
-        if group_key not in grouped_sessions:
-            try:
-                hh, mm = start_s.split(":")
-                start_t = time(int(hh), int(mm))
-                hh, mm = end_s.split(":")
-                end_t = time(int(hh), int(mm))
-            except Exception:
-                continue
-                
-            grouped_sessions[group_key] = {
-                "phase": s.get("Phase", ""),
+
+        faculty_raw = (s.get("Faculty") or "").strip()
+        room = (s.get("Room") or "").strip()
+        phase = (s.get("Phase") or "").strip()
+        try:
+            hh, mm = start_s.split(":")
+            start_t = time(int(hh), int(mm))
+            hh, mm = end_s.split(":")
+            end_t = time(int(hh), int(mm))
+        except Exception:
+            continue
+
+        rows.append(
+            {
+                "phase": phase,
                 "course_code": course_code,
-                "sections": set(),
-                "period": period,
+                "section": section,
+                "day": day,
+                "start_time": start_t,
+                "end_time": end_t,
                 "time_block": TimeBlock(day, start_t, end_t),
-                "room": s.get("Room") or "",
+                "period": period,
                 "session_type": session_type,
-                "instructor": s.get("Faculty") or "",
+                "faculty": faculty_raw,
+                "room": room,
             }
-            
-        grouped_sessions[group_key]["sections"].add(section)
-        
-    out = []
-    for g_sess in grouped_sessions.values():
-        g_sess["sections"] = list(g_sess["sections"])
-        out.append(g_sess)
-        
-    return out
+        )
+
+    return final_ui_rows_to_verify_sessions(rows)
 
 
 def run_verify(sessions: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -414,14 +460,6 @@ def api_reflow(req: ReflowRequest):
         sessions = list(req.sessions or [])
         moved = req.movedSession or {}
 
-        def _norm_period(p: str) -> str:
-            v = (p or "").strip().upper()
-            if v in ("PREMID", "PRE"):
-                return "PRE"
-            if v in ("POSTMID", "POST"):
-                return "POST"
-            return v or "PRE"
-
         def _parse_hhmm(t: str) -> int:
             hh, mm = (t or "").strip().split(":")
             return int(hh) * 60 + int(mm)
@@ -438,7 +476,7 @@ def api_reflow(req: ReflowRequest):
         moved_section = (moved.get("Section") or "").strip()
         moved_room = (moved.get("Room") or "").strip()
         moved_faculty = (moved.get("Faculty") or "").strip()
-        moved_period = _norm_period(moved.get("Period") or "PRE")
+        moved_period = normalize_period(moved.get("Period") or "PRE")
         if not (moved_day and moved_start and moved_end and moved_section):
             return {"success": False, "not_possible": True}
         moved_start_m = _parse_hhmm(moved_start)
@@ -464,7 +502,7 @@ def api_reflow(req: ReflowRequest):
             return (start_t.hour * 60 + start_t.minute, end_t.hour * 60 + end_t.minute)
 
         def _session_conflicts(s: Dict[str, Any], other: Dict[str, Any]) -> bool:
-            if _norm_period(s.get("Period")) != _norm_period(other.get("Period")):
+            if normalize_period(s.get("Period")) != normalize_period(other.get("Period")):
                 return False
             if (s.get("Day") or "").strip() != (other.get("Day") or "").strip():
                 return False
@@ -496,7 +534,7 @@ def api_reflow(req: ReflowRequest):
             return (
                 ((a.get("Course Code") or "").strip(), (a.get("Section") or "").strip(),
                  (a.get("Day") or "").strip(), a.get("Start Time") or "", a.get("End Time") or "",
-                 _norm_period(a.get("Period") or "PRE")) == key
+                 normalize_period(a.get("Period") or "PRE")) == key
             )
 
         conflicts = []
@@ -504,7 +542,7 @@ def api_reflow(req: ReflowRequest):
             if _is_same_session(s, moved_key):
                 continue
             # Ensure we only move sessions within the same period as moved (UI is scoped by period)
-            if _norm_period(s.get("Period") or "PRE") != moved_period:
+            if normalize_period(s.get("Period") or "PRE") != moved_period:
                 continue
             if _session_conflicts(moved, s):
                 conflicts.append(s)
@@ -531,7 +569,7 @@ def api_reflow(req: ReflowRequest):
             for o in sessions:
                 if o is sess:
                     continue
-                if _norm_period(o.get("Period") or "PRE") != moved_period:
+                if normalize_period(o.get("Period") or "PRE") != moved_period:
                     continue
                 if (o.get("Day") or "").strip() != cand_day:
                     continue

@@ -8,12 +8,13 @@ from collections import defaultdict
 from datetime import time
 
 from utils.data_models import TimeBlock, ScheduledSession, ClassRoom
-from config.schedule_config import WORKING_DAYS
+from config.schedule_config import WORKING_DAYS, DEFAULT_SECTION_CAPACITY
 from modules_v2.phase8_classroom_assignment import (
     detect_room_conflicts,
     check_room_conflict,
     mark_room_occupied,
     find_available_classroom,
+    calculate_section_enrollment,
 )
 
 
@@ -225,16 +226,16 @@ def _build_room_occupancy_excluding(
     return room_occupancy
 
 
-def _get_session_type_and_capacity(session, default_capacity: int = 60) -> Tuple[str, int]:
+def _get_session_type_and_capacity(session, default_capacity: int = None) -> Tuple[str, int]:
     """Infer session_type (L/T/P) and capacity from session. Returns (session_type, capacity_needed)."""
     st = "L"
-    cap = default_capacity
+    cap = default_capacity if default_capacity is not None else DEFAULT_SECTION_CAPACITY
     if isinstance(session, dict):
         st = session.get("session_type") or session.get("kind") or "L"
         cap = session.get("capacity") or default_capacity
     else:
         st = getattr(session, "kind", None) or getattr(session, "session_type", None) or "L"
-        cap = getattr(session, "capacity", None) or default_capacity
+        cap = getattr(session, "capacity", None) or (default_capacity if default_capacity is not None else DEFAULT_SECTION_CAPACITY)
     if st not in ("L", "T", "P"):
         st = "L"
     return st, cap
@@ -249,14 +250,19 @@ def _reassign_room(
     end: time,
     room_occupancy: Dict,
     classrooms: List[ClassRoom],
-    capacity_needed: int = 60,
+    capacity_needed: int = None,
     session_type: str = "L",
 ) -> Optional[str]:
     """Find another free room at same time and return room number; otherwise None."""
     period_norm = _normalize_period(period)
     time_block = TimeBlock(day, start, end)
+    # Derive course_code from the session object (fixes NameError - it's not a parameter)
+    if isinstance(session, dict):
+        cc = str(session.get("course_code", "") or "").upper()
+    else:
+        cc = str(getattr(session, "course_code", "") or "").upper()
     new_room = find_available_classroom(
-        capacity_needed, session_type, period_norm, day, time_block, room_occupancy, classrooms
+        capacity_needed, session_type, period_norm, day, time_block, room_occupancy, classrooms, course_code=cc
     )
     return new_room
 
@@ -290,11 +296,41 @@ def _find_any_available_room(
     end: time,
     room_occupancy: Dict,
     classrooms: List[ClassRoom],
+    capacity_needed: int = 1,
+    session_type: str = "L",
+    course_code: str = "",
 ) -> Optional[str]:
     """Last resort: any non-lab room free at (period, day, time)."""
     period_norm = _normalize_period(period)
     time_block = TimeBlock(day, start, end)
-    return find_available_classroom(1, "L", period_norm, day, time_block, room_occupancy, classrooms)
+    return find_available_classroom(capacity_needed, session_type, period_norm, day, time_block, room_occupancy, classrooms, course_code=course_code)
+
+
+def _capacity_needed_for_session(session, courses: List = None, sections: List = None, default_capacity: int = None) -> int:
+    """Best-effort capacity for room reassignment; avoids down-sizing large courses."""
+    # Dict sessions (electives/combined adapters) may already carry capacity.
+    if isinstance(session, dict):
+        raw = session.get("capacity", default_capacity)
+        try:
+            val = int(raw)
+            return val if val > 0 else (default_capacity if default_capacity is not None else DEFAULT_SECTION_CAPACITY)
+        except (TypeError, ValueError):
+            return default_capacity if default_capacity is not None else DEFAULT_SECTION_CAPACITY
+
+    # ScheduledSession objects: compute from section + registered_students when possible.
+    try:
+        val = calculate_section_enrollment(session, sections or [], courses or [])
+        val = int(val)
+        if val > 0:
+            return val
+    except Exception:
+        pass
+    try:
+        raw = getattr(session, "capacity", default_capacity)
+        val = int(raw)
+        return val if val > 0 else (default_capacity if default_capacity is not None else DEFAULT_SECTION_CAPACITY)
+    except Exception:
+        return default_capacity if default_capacity is not None else DEFAULT_SECTION_CAPACITY
 
 
 def _update_session_room(session, source: str, new_room: str, elective_sessions: List = None):
@@ -317,6 +353,108 @@ def _update_session_time(session, source: str, new_block: TimeBlock, elective_se
         session["time_block"] = new_block
     else:
         session.block = new_block
+
+
+def _is_missing_room_value(room_val) -> bool:
+    if room_val is None:
+        return True
+    v = str(room_val).strip()
+    return (not v) or (v.lower() in ("na", "none", "nan", "tbd"))
+
+
+def resolve_unassigned_core_classrooms(
+    phase5_sessions: List,
+    phase7_sessions: List,
+    combined_sessions: List,
+    elective_sessions: List,
+    classrooms: List[ClassRoom],
+    courses: List = None,
+    sections: List = None,
+    max_slot_attempts: int = 80,
+) -> int:
+    """
+    Try to assign/reschedule L/T sessions that still have no classroom (blank/NA).
+    Returns number of sessions recovered.
+    """
+    from modules_v2.phase8_classroom_assignment import calculate_section_enrollment
+
+    fixed = 0
+    candidates = []
+    for src_name, src_list in (("phase5", phase5_sessions or []), ("phase7", phase7_sessions or [])):
+        for sess in src_list:
+            if not getattr(sess, "block", None):
+                continue
+            kind = getattr(sess, "kind", "L") or "L"
+            cc_u = str(getattr(sess, "course_code", "") or "").upper()
+            session_type = "P" if ("-LAB" in cc_u or kind == "P") else ("T" if "-TUT" in cc_u or kind == "T" else "L")
+            
+            if _is_missing_room_value(getattr(sess, "room", None)):
+                candidates.append((src_name, sess, session_type))
+
+    if not candidates:
+        return 0
+
+    print(f"  Attempting recovery for {len(candidates)} unassigned core session(s)...")
+
+    for source_name, session_obj, session_type in candidates:
+        period = _normalize_period(getattr(session_obj, "period", "PRE"))
+        day = session_obj.block.day
+        start = session_obj.block.start
+        end = session_obj.block.end
+
+        enrollment = DEFAULT_SECTION_CAPACITY
+        try:
+            # Calculate num_sections to avoid treating every section as the full course
+            course_code = getattr(session_obj, "course_code", "") or (session_obj.get("course_code") if isinstance(session_obj, dict) else "")
+            base_code = str(course_code).split('-')[0]
+            dept_prefix = ""
+            section_lbl = getattr(session_obj, "section", "")
+            if section_lbl and "-" in str(section_lbl):
+                dept_prefix = str(section_lbl).split("-")[0].strip()
+                
+            unique_sections = set()
+            for s in (phase5_sessions or []) + (phase7_sessions or []):
+                cc = getattr(s, "course_code", "") or (s.get("course_code") if isinstance(s, dict) else "")
+                if str(cc).split('-')[0] == base_code:
+                    sec = getattr(s, "section", "")
+                    if sec and (not dept_prefix or str(sec).startswith(dept_prefix)):
+                        unique_sections.add(sec)
+            
+            num_sections = max(1, len(unique_sections))
+            enrollment = calculate_section_enrollment(session_obj, sections or [], courses or [], num_sections=num_sections)
+        except Exception:
+            pass
+        if enrollment <= 0:
+            enrollment = DEFAULT_SECTION_CAPACITY
+
+        cc_u = str(getattr(session_obj, "course_code", "") or (session_obj.get("course_code") if isinstance(session_obj, dict) else "")).upper()
+        
+        occ = _build_room_occupancy_excluding(
+            phase5_sessions, phase7_sessions, combined_sessions, elective_sessions,
+            session_obj, source_name, classrooms,
+        )
+        replacement = find_available_classroom(
+            enrollment, session_type, period, day, TimeBlock(day, start, end), occ, classrooms, course_code=cc_u
+        )
+        if replacement:
+            _update_session_room(session_obj, source_name, replacement, elective_sessions)
+            fixed += 1
+            continue
+
+        moved = _try_reschedule(
+            session_obj, source_name, period, occ,
+            phase5_sessions, phase7_sessions, combined_sessions, elective_sessions,
+            classrooms, enrollment, session_type, max_slot_attempts=max_slot_attempts,
+        )
+        if moved:
+            fixed += 1
+        else:
+            cc = getattr(session_obj, "course_code", "") or (session_obj.get("course_code") if isinstance(session_obj, dict) else "")
+            print(f"    [Strict] Could not assign compliant room for {cc}; kept unassigned for strict verification.")
+
+    if fixed > 0:
+        print(f"  Recovered {fixed} unassigned core session(s) via room assign/reschedule.")
+    return fixed
 
 
 def _try_reschedule(
@@ -411,9 +549,41 @@ def _try_reschedule(
             session_to_move, source_to_move, classrooms,
         )
         new_room = find_available_classroom(
-            capacity_needed, session_type, period_norm, slot.day, slot, occ, classrooms
+            capacity_needed, session_type, period_norm, slot.day, slot, occ, classrooms, course_code=course_code
         )
         if new_room:
+            # Keep room-reschedule moves faculty-safe for lecture/tutorial sessions.
+            if session_type in ("L", "T"):
+                faculty_val = ""
+                if isinstance(session_to_move, dict):
+                    faculty_val = (
+                        session_to_move.get("instructor")
+                        or session_to_move.get("faculty")
+                        or session_to_move.get("Faculty")
+                        or ""
+                    )
+                else:
+                    faculty_val = (
+                        getattr(session_to_move, "faculty", None)
+                        or getattr(session_to_move, "instructor", None)
+                        or ""
+                    )
+                if faculty_val:
+                    try:
+                        from utils.faculty_conflict_utils import check_faculty_availability_in_period
+                        if not check_faculty_availability_in_period(
+                            str(faculty_val),
+                            slot.day,
+                            slot.start,
+                            slot.end,
+                            period_norm,
+                            phase5_sessions + phase7_sessions + (combined_sessions or []) + (elective_sessions or []),
+                            exclude_session=session_to_move,
+                            candidate_session_type=session_type,
+                        ):
+                            continue
+                    except Exception:
+                        pass
             _update_session_time(session_to_move, source_to_move, slot, elective_sessions)
             _update_session_room(session_to_move, source_to_move, new_room, elective_sessions)
             occupied_slots[section_key].append((slot, course_code))
@@ -427,6 +597,8 @@ def resolve_room_conflicts(
     combined_sessions: List,
     elective_sessions: List,
     classrooms: List[ClassRoom],
+    courses: List = None,
+    sections: List = None,
     max_passes: int = 5,
 ) -> Tuple[int, List[Dict]]:
     """
@@ -521,12 +693,13 @@ def resolve_room_conflicts(
             if not session1 or not session2:
                 print(f"    [skip] session not found: {conflict.get('course1')}/{conflict.get('section1')} vs {conflict.get('course2')}/{conflict.get('section2')} @ {room} {day} {time_str}")
                 continue
-            if _move_priority(source1) > _move_priority(source2):
+            if _move_priority(source1) < _move_priority(source2):
                 session_to_move, source_to_move = session1, source1
             else:
                 session_to_move, source_to_move = session2, source2
 
             session_type, capacity_needed = _get_session_type_and_capacity(session_to_move)
+            capacity_needed = _capacity_needed_for_session(session_to_move, courses=courses, sections=sections, default_capacity=capacity_needed)
             room_occupancy = _build_room_occupancy_excluding(
                 phase5_sessions, phase7_sessions, combined_sessions, elective_sessions,
                 session_to_move, source_to_move, classrooms,
@@ -572,20 +745,22 @@ def resolve_room_conflicts(
                     course = getattr(session_to_move, "course_code", None) or (session_to_move.get("course_code") if isinstance(session_to_move, dict) else None)
                     print(f"    Rescheduled {course} to new slot and assigned room")
                 else:
-                    # Last resort: 240-seater, then any free classroom
-                    fallback_room = _find_available_240_seater(period, day, start, end, room_occupancy, classrooms)
-                    if not fallback_room:
-                        fallback_room = _find_any_available_room(period, day, start, end, room_occupancy, classrooms)
+                    # Last resort: any free classroom (NEVER C004)
+                    fallback_room = _find_any_available_room(
+                        period, day, start, end, room_occupancy, classrooms,
+                        capacity_needed=capacity_needed, session_type=session_type
+                    )
                     if fallback_room:
                         _update_session_room(session_to_move, source_to_move, fallback_room, elective_sessions)
                         resolved_count += 1
                         resolved_this_pass += 1
                         course = getattr(session_to_move, "course_code", None) or (session_to_move.get("course_code") if isinstance(session_to_move, dict) else None)
-                        print(f"    Assigned 240-seater {fallback_room} for {course} (last resort)")
+                        print(f"    Assigned fallback room {fallback_room} for {course} (last resort)")
                     else:
                         # Try moving the other session in the conflict
                         other_session, other_source = (session2, source2) if (session_to_move is session1) else (session1, source1)
                         other_type, other_cap = _get_session_type_and_capacity(other_session)
+                        other_cap = _capacity_needed_for_session(other_session, courses=courses, sections=sections, default_capacity=other_cap)
                         other_occupancy = _build_room_occupancy_excluding(
                             phase5_sessions, phase7_sessions, combined_sessions, elective_sessions,
                             other_session, other_source, classrooms,
@@ -614,9 +789,10 @@ def resolve_room_conflicts(
                                 course = getattr(other_session, "course_code", None) or (other_session.get("course_code") if isinstance(other_session, dict) else None)
                                 print(f"    Rescheduled other {course} to new slot")
                             else:
-                                fallback_room = _find_available_240_seater(period, day, start, end, other_occupancy, classrooms)
-                                if not fallback_room:
-                                    fallback_room = _find_any_available_room(period, day, start, end, other_occupancy, classrooms)
+                                fallback_room = _find_any_available_room(
+                                    period, day, start, end, other_occupancy, classrooms,
+                                    capacity_needed=other_cap, session_type=other_type
+                                )
                                 if fallback_room:
                                     _update_session_room(other_session, other_source, fallback_room, elective_sessions)
                                     resolved_count += 1
@@ -640,23 +816,7 @@ def resolve_room_conflicts(
         phase5_sessions, phase7_sessions, combined_sessions, elective_sessions, classrooms
     )
 
-    # Treat same-course multi-section use of a large room as acceptable:
-    # ignore conflicts where the base course codes match.
-    filtered_remaining = []
-    for c in remaining or []:
-        c1 = (c.get("course1") or "").split("-")[0]
-        c2 = (c.get("course2") or "").split("-")[0]
-        if c1 == c2:
-            continue
-        filtered_remaining.append(c)
+    if remaining:
+        print(f"  WARNING: {len(remaining)} room conflict(s) remain after {max_passes} passes.")
 
-    if filtered_remaining:
-        print(f"  WARNING: {len(filtered_remaining)} room conflict(s) remain after {max_passes} passes.")
-    else:
-        if remaining:
-            print(
-                "  Note: remaining same-course multi-section uses of the same room "
-                "are treated as non-conflicting."
-            )
-
-    return resolved_count, filtered_remaining
+    return resolved_count, remaining

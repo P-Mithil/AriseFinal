@@ -13,7 +13,14 @@ import {
   type DragEndEvent,
   type DragCancelEvent,
 } from '@dnd-kit/core'
-import type { Session, LabelsConfig, GenerateResponse, VerifyError, VerifyResponse, ReflowResponse, VerificationRow } from '../types'
+import type {
+  Session,
+  LabelsConfig,
+  GenerateResponse,
+  VerifyError,
+  VerifyResponse,
+  VerificationRow,
+} from '../types'
 import './MainContent.css'
 
 const API_BASE = 'http://127.0.0.1:8000'
@@ -58,8 +65,9 @@ function DraggableSessionBlock({
   return (
     <div ref={setNodeRef} className="grid-block" style={style} {...listeners} {...attributes}>
       <div className="grid-block-code">{session['Course Code']}</div>
-      <div className="grid-block-room">{session.Room}</div>
+      {session.Room && <div className="grid-block-room">{session.Room}</div>}
       <div className="grid-block-type">{session['Session Type']}</div>
+      <div className="grid-block-time">{session['Start Time']} – {session['End Time']}</div>
     </div>
   )
 }
@@ -73,15 +81,16 @@ interface MainContentProps {
   selectedPeriod: string
   generateLoading: boolean
   setGenerateLoading: (val: boolean) => void
-  onGenerateFirst: (timetable: Session[], labels: LabelsConfig, verification_table?: Record<string, VerificationRow[]>) => void
+  onGenerateFirst: (
+    timetable: Session[],
+    labels: LabelsConfig,
+    verification_table?: Record<string, VerificationRow[]>,
+    post_generate_verify?: VerifyResponse,
+  ) => void
   onTimetableChange: (updated: Session[]) => void
   verifyErrors: VerifyError[]
   verifySuccess: boolean
-  showConfirmReflow: boolean
-  reflowLoading: boolean
-  setReflowLoading: (val: boolean) => void
   onVerifyResult: (success: boolean, errors: VerifyError[]) => void
-  onReflowResult: (success: boolean, notPossible: boolean, newTimetable?: Session[]) => void
   revertToFirst: () => void
   message: string | null
   setMessage: (msg: string | null) => void
@@ -105,9 +114,7 @@ function minutesToTime(m: number): string {
   return `${hh}:${mm}`
 }
 
-function alignTo15(mins: number): number {
-  return Math.ceil(mins / 15) * 15
-}
+
 
 function intervalOverlaps(aStart: number, aEnd: number, bStart: number, bEnd: number): boolean {
   return aStart < bEnd && bStart < aEnd
@@ -157,38 +164,58 @@ export function syncAllMovedRelatedSessions(oldTimetable: Session[], newTimetabl
     }
   }
 
+  // Build a lookup to detect combined courses by actual data:
+  // If the same course code + day + start time + session type exists in ANOTHER section,
+  // it's a combined / shared course that needs syncing (regardless of Phase label).
+  const combinedLookup = new Map<string, number[]>()
+  for (let i = 0; i < oldTimetable.length; i++) {
+    const s = oldTimetable[i]
+    const key = `${s['Course Code']}|${s.Day}|${s['Start Time']}|${s['Session Type']}`
+    if (!combinedLookup.has(key)) combinedLookup.set(key, [])
+    combinedLookup.get(key)!.push(i)
+  }
+
   for (const idx of movedIndices) {
     const oldS = oldTimetable[idx]
     const newS = finalState[idx]
 
-    // We want to aggressively sync Electives, Combined Classes, Tutorials, and Labs
-    // to ensure they stay glued together across all sections they belong to.
-    const isSyncablePhase =
-      oldS.Phase?.startsWith('Phase 3') ||
-      oldS.Phase?.startsWith('Phase 4');
+    // Phase 3 (Electives): sync across ALL sections of the same semester
+    const isPhase3 = oldS.Phase?.startsWith('Phase 3')
 
-    if (!isSyncablePhase) {
+    // Detect combined course by data: same course+day+time exists in other sections
+    const dataKey = `${oldS['Course Code']}|${oldS.Day}|${oldS['Start Time']}|${oldS['Session Type']}`
+    const sharedIndices = combinedLookup.get(dataKey) ?? []
+    const uniqueSections = new Set(sharedIndices.map(i => oldTimetable[i].Section))
+    const isCombinedByData = uniqueSections.size > 1  // exists in multiple sections
+
+    // Also check Phase label as fallback
+    const isPhase4Label = oldS.Phase?.startsWith('Phase 4')
+    const isCombined = isCombinedByData || isPhase4Label
+
+    if (!isPhase3 && !isCombined) {
       continue
     }
 
     finalState = finalState.map((cand, candIdx) => {
       if (candIdx === idx) return cand
       const oldCand = oldTimetable[candIdx]
-      // Sync if it is the EXACT same Course Code and Session Type, AND same Group
-      // (Unless it's an Elective (Phase 3), which spans across ALL groups globally)
-      // We explicitly skip checking if oldCand.Day === oldS.Day because they 
-      // might have gotten desynced by the generator, but the user expects them to sync!
-      const isElective = oldS.Phase?.startsWith('Phase 3');
-      const isSameGroup = getGroupForSection(oldCand.Section) === getGroupForSection(oldS.Section);
-      const isSameSemester = getSemesterFromSection(oldCand.Section) === getSemesterFromSection(oldS.Section);
 
-      if (
+      const isSameSemester = getSemesterFromSection(oldCand.Section) === getSemesterFromSection(oldS.Section)
+      const isSameGroup = getGroupForSection(oldCand.Section) === getGroupForSection(oldS.Section)
+      // Only sync sessions that were on the SAME original day.
+      // Without this, DS161 on Monday AND DS161 on Thursday (two separate lectures per week)
+      // would BOTH get moved to the new slot, causing the Thursday block to vanish.
+      const isSameDay = oldCand.Day === oldS.Day
+
+      const shouldSync =
         oldCand['Course Code'] === oldS['Course Code'] &&
         oldCand['Session Type'] === oldS['Session Type'] &&
-        oldCand.Phase === oldS.Phase &&
+        oldCand['Start Time'] === oldS['Start Time'] &&  // must be same original time slot
         isSameSemester &&
-        (isElective || isSameGroup)
-      ) {
+        isSameDay && // must be same original day — prevents vanishing of other weekly occurrences
+        (isPhase3 || isSameGroup) // Phase 3: all sections; Combined: same group only
+
+      if (shouldSync) {
         return {
           ...cand,
           Day: newS.Day,
@@ -231,17 +258,12 @@ function MainContent({
   onTimetableChange,
   verifyErrors,
   verifySuccess,
-  showConfirmReflow,
-  reflowLoading,
-  setReflowLoading,
   onVerifyResult,
-  onReflowResult,
   revertToFirst,
   message,
   setMessage,
 }: MainContentProps) {
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null)
-  const [lastMovedSessionId, setLastMovedSessionId] = useState<string | null>(null)
   const [generateSheetsLoading, setGenerateSheetsLoading] = useState(false)
 
   const selectedSemester = useMemo(() => getSemesterFromSection(selectedSection), [selectedSection])
@@ -318,9 +340,12 @@ function MainContent({
       if (!data.success) {
         throw new Error('Generation failed')
       }
-      console.log('[DEBUG] VT keys:', Object.keys(data.verification_table ?? {}))
-      console.log('[DEBUG] sectionPeriodKey would be:', selectedSection ? `${selectedSection}-${normalizePeriod(selectedPeriod)}` : null)
-      onGenerateFirst(data.timetable, data.labels, data.verification_table)
+      onGenerateFirst(
+        data.timetable,
+        data.labels,
+        data.verification_table,
+        data.post_generate_verify,
+      )
     } catch (err: any) {
       setMessage(`Generate failed: ${err.message ?? String(err)}`)
     } finally {
@@ -366,8 +391,17 @@ function MainContent({
       const data = (await res.json()) as GenerateResponse
       if (!data.success) throw new Error('Sheet generation failed')
       // Update timetable with refreshed data
-      onGenerateFirst(data.timetable, data.labels, data.verification_table)
-      setMessage('✅ 24 sheets generated successfully from your changes!')
+      onGenerateFirst(
+        data.timetable,
+        data.labels,
+        data.verification_table,
+        data.post_generate_verify,
+      )
+      setMessage(
+        data.post_generate_verify?.success
+          ? '24 sheets generated successfully from your changes.'
+          : 'Sheets regenerated; verification reported issues (see below).',
+      )
     } catch (err: any) {
       setMessage(`Generate sheets failed: ${err.message ?? String(err)}`)
     } finally {
@@ -375,34 +409,6 @@ function MainContent({
     }
   }, [timetable, onGenerateFirst, setMessage])
 
-  const handleReflow = useCallback(async () => {
-    if (!timetable || !lastMovedSessionId) return
-    setReflowLoading(true)
-    setMessage(null)
-    try {
-      const movedSession =
-        timetable.find((s) => (s as any).id === lastMovedSessionId) ?? null
-      if (!movedSession) {
-        return
-      }
-      const res = await fetch(`${API_BASE}/api/reflow`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sessions: timetable, movedSession }),
-      })
-      if (!res.ok) {
-        const text = await res.text()
-        throw new Error(text || res.statusText)
-      }
-      const data = (await res.json()) as ReflowResponse
-      onReflowResult(data.success, !!data.not_possible, data.timetable)
-    } catch (err: any) {
-      setMessage(`Reflow failed: ${err.message ?? String(err)}`)
-      onReflowResult(false, true)
-    } finally {
-      setReflowLoading(false)
-    }
-  }, [timetable, lastMovedSessionId, onReflowResult, setReflowLoading, setMessage])
 
   const applyDrop = useCallback(
     (sessionId: string, day: string, slotStart: string) => {
@@ -436,11 +442,30 @@ function MainContent({
         .sort((a, b) => a.startMin - b.startMin)
 
       let updated: Session[] = timetable;
-      
+
       // Reject if the dropped block would overlap with any existing session
       if (conflicts.length > 0) {
+        setMessage(`Cannot move: Overlaps with an existing session in this room/schedule.`)
         return
       }
+      
+      // Reject if it overlaps with lunch or goes past the end of the day
+      if (newEndMin > parseTimeToMinutes(dayEnd)) {
+        setMessage(`Cannot move: Session would end past the maximum day time (${dayEnd}).`)
+        return
+      }
+      if (lunchWindow) {
+        const lunchStart = parseTimeToMinutes(lunchWindow.start)
+        const lunchEnd = parseTimeToMinutes(lunchWindow.end)
+        if (intervalOverlaps(newStartMin, newEndMin, lunchStart, lunchEnd)) {
+          setMessage(`Cannot move: Session overlaps with the designated lunch break.`)
+          return
+        }
+      }
+
+      setMessage(null) // clear message on valid drop
+      // Clear stale verification state — a new verify will run automatically after drop
+      onVerifyResult(false, [])
       
       updated = timetable.map((s, idx) =>
         idx === draggedIndex
@@ -452,10 +477,29 @@ function MainContent({
           }
           : s,
       )
-      onTimetableChange(syncAllMovedRelatedSessions(timetable, updated))
-      setLastMovedSessionId(sessionId)
+      // Update with sync: Phase 3 syncs across all sections, Phase 4 syncs within group
+      // Phase 5 & 7 are individual — only the dragged block moves
+      const synced = syncAllMovedRelatedSessions(timetable, updated)
+      onTimetableChange(synced)
+
+      // Auto-verify after every drop to catch cross-section / faculty / room conflicts
+      ;(async () => {
+        try {
+          const res = await fetch(`${API_BASE}/api/verify`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ sessions: synced }),
+          })
+          if (res.ok) {
+            const data = (await res.json()) as VerifyResponse
+            onVerifyResult(data.success, data.errors ?? [])
+          }
+        } catch (_err) {
+          // silence — user can still manually verify
+        }
+      })()
     },
-    [timetable, filteredSessions, onTimetableChange, selectedSection, dayStart, dayEnd, lunchWindow, setMessage],
+    [timetable, filteredSessions, onTimetableChange, onVerifyResult, selectedSection, dayStart, dayEnd, lunchWindow, setMessage],
   )
 
   const handleDndDragStart = useCallback((e: DragStartEvent) => {
@@ -531,15 +575,7 @@ function MainContent({
                       parseTimeToMinutes(a['Start Time']) - parseTimeToMinutes(b['Start Time']),
                   )
 
-                // Compute 15-minute break starts between consecutive sessions
-                const breakStarts = new Set<string>()
-                for (let idx = 0; idx < sessionsForDay.length - 1; idx += 1) {
-                  const currentEnd = parseTimeToMinutes(sessionsForDay[idx]['End Time'])
-                  const nextStart = parseTimeToMinutes(sessionsForDay[idx + 1]['Start Time'])
-                  if (nextStart - currentEnd === 15) {
-                    breakStarts.add(minutesToTime(currentEnd))
-                  }
-                }
+
 
                 const rowCells: ReactNode[] = []
                 let i = 0
@@ -552,7 +588,7 @@ function MainContent({
                   if (lunchWindow && normalizeTimeStr(lunchWindow.start) === slotStart) {
                     const startMin = parseTimeToMinutes(lunchWindow.start)
                     const endMin = parseTimeToMinutes(lunchWindow.end)
-                    const span = Math.max(1, Math.floor((endMin - startMin) / 15))
+                    const span = Math.max(1, Math.ceil((endMin - startMin) / 15))
                     rowCells.push(
                       <td
                         key={`${day}-lunch-${slotStart}`}
@@ -574,7 +610,20 @@ function MainContent({
                   if (session) {
                     const startMin = parseTimeToMinutes(session['Start Time'])
                     const endMin = parseTimeToMinutes(session['End Time'])
-                    const span = Math.max(1, Math.floor((endMin - startMin) / 15))
+                    const baseSpan = Math.max(1, Math.ceil((endMin - startMin) / 15))
+                    const endTimeStr = normalizeTimeStr(session['End Time'])
+
+                    // Check if the slot right after this session is occupied or is lunch.
+                    // If empty, extend the block visually by 1 extra slot so the end time
+                    // aligns with its column marker (fixes the "15-minute gap" appearance).
+                    const nextSlotHasSession = sessionsForDay.some(
+                      (s) => normalizeTimeStr(s['Start Time']) === endTimeStr,
+                    )
+                    const nextSlotIsLunch =
+                      lunchWindow && normalizeTimeStr(lunchWindow.start) === endTimeStr
+                    const span =
+                      nextSlotHasSession || nextSlotIsLunch ? baseSpan : baseSpan + 1
+
                     const droppableId = slotDroppableId(day, slotStart)
 
                     rowCells.push(
@@ -591,21 +640,7 @@ function MainContent({
                     continue
                   }
 
-                  // Temporary 15-min BREAK block (droppable)
-                  if (breakStarts.has(slotStart)) {
-                    const droppableId = slotDroppableId(day, slotStart)
-                    rowCells.push(
-                      <DroppableCellTd
-                        key={`${day}-break-${slotStart}`}
-                        className="grid-cell break"
-                        droppableId={droppableId}
-                      >
-                        <div className="grid-block grid-block-break">BREAK</div>
-                      </DroppableCellTd>,
-                    )
-                    i += 1
-                    continue
-                  }
+
 
                   // Empty slot
                   {
@@ -706,14 +741,6 @@ function MainContent({
         </div>
       )}
 
-      {showConfirmReflow && (
-        <div className="main-reflow">
-          <div>Verification failed. You can confirm to change timetable and try reflow.</div>
-          <button type="button" onClick={handleReflow} disabled={reflowLoading}>
-            {reflowLoading ? 'Reflowing…' : 'Confirm to change timetable'}
-          </button>
-        </div>
-      )}
 
       <div className="grid-section">
         {labels && (

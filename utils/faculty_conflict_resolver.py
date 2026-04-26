@@ -4,6 +4,7 @@ Handles rescheduling of faculty conflicts across all session types
 while respecting rules: protect combined/elective baskets, prefer moving regular/core.
 """
 
+import random
 from typing import List, Dict, Optional, Tuple
 from collections import defaultdict
 from datetime import time
@@ -11,8 +12,10 @@ from datetime import time
 from utils.data_models import TimeBlock, ScheduledSession
 from utils.faculty_conflict_utils import (
     check_faculty_availability_in_period,
-    get_session_move_priority,
+    faculty_name_tokens,
     find_alternative_slot_for_faculty,
+    get_session_move_priority,
+    try_reassign_away_from_busy_instructor,
     _normalize_period,
 )
 from modules_v2.phase6_faculty_conflicts import detect_faculty_conflicts, FacultyConflict
@@ -22,7 +25,8 @@ def resolve_all_faculty_conflicts(
     all_sessions: List,
     classrooms: List,
     occupied_slots: Dict[str, List],
-    max_passes: int = 3
+    max_passes: int = 10,
+    rng: Optional[random.Random] = None,
 ) -> Tuple[List, List[FacultyConflict]]:
     """
     Resolve all faculty conflicts by rescheduling sessions.
@@ -65,10 +69,12 @@ def resolve_all_faculty_conflicts(
             else:
                 regular_sessions.append(session)
     
-    # Track which sessions we've already tried to move (to avoid infinite loops)
-    moved_sessions = set()
-    
+    consecutive_without_progress = 0
     for pass_num in range(max_passes):
+        # Reset moved_sessions each pass so previously-tried sessions can be retried
+        # after other sessions have moved (enabling cascading resolution)
+        moved_sessions = set()
+        
         # Detect current conflicts
         conflicts = detect_faculty_conflicts(all_sessions)
         
@@ -90,11 +96,18 @@ def resolve_all_faculty_conflicts(
             conflicts_by_faculty_period[(faculty, period)].append(conflict)
         
         conflicts_resolved_this_pass = 0
-        
+
+        # Optional shuffle explores different resolution orders (escape local minima)
+        group_items = list(conflicts_by_faculty_period.items())
+        if rng is not None:
+            rng.shuffle(group_items)
+
         # Process conflicts, prioritizing by move cost
-        for (faculty, period), conflict_list in conflicts_by_faculty_period.items():
-            # For each conflict, find the conflicting sessions
-            for conflict in conflict_list:
+        for (faculty, period), conflict_list in group_items:
+            conflict_iter = list(conflict_list)
+            if rng is not None:
+                rng.shuffle(conflict_iter)
+            for conflict in conflict_iter:
                 # Parse conflict time slot to get day, start, end
                 time_slot_str = conflict.time_slot
                 day = conflict.day
@@ -150,11 +163,15 @@ def resolve_all_faculty_conflicts(
                         session_period = _normalize_period(getattr(session, 'period', 'PRE'))
                         session_block = getattr(session, 'block', None)
                     
-                    if (session_faculty == faculty and 
-                        session_period == period and
-                        session_block and
-                        session_block.day == day and
-                        session_block.overlaps(TimeBlock(day, start_time, end_time))):
+                    ff = (faculty or "").strip().lower()
+                    toks = set(faculty_name_tokens(str(session_faculty or "")))
+                    if (
+                        ff in toks
+                        and session_period == period
+                        and session_block
+                        and session_block.day == day
+                        and session_block.overlaps(TimeBlock(day, start_time, end_time))
+                    ):
                         conflicting_sessions.append(session)
                 
                 if len(conflicting_sessions) < 2:
@@ -162,7 +179,13 @@ def resolve_all_faculty_conflicts(
                 
                 # Rank sessions by move priority (lower = easier to move)
                 conflicting_sessions.sort(key=lambda s: get_session_move_priority(s))
-                
+                # Occasionally try the second-easiest first to escape local minima
+                if rng is not None and len(conflicting_sessions) >= 2 and rng.random() < 0.4:
+                    conflicting_sessions[0], conflicting_sessions[1] = (
+                        conflicting_sessions[1],
+                        conflicting_sessions[0],
+                    )
+
                 # Try to move the easiest-to-move session (first in sorted list)
                 session_to_move = conflicting_sessions[0]
                 
@@ -199,7 +222,7 @@ def resolve_all_faculty_conflicts(
                 
                 # Find alternative slot (aggressive search - try many slots)
                 new_slot = find_alternative_slot_for_faculty(
-                    session_to_move, all_sessions, occupied_slots, classrooms, period, max_attempts=100
+                    session_to_move, all_sessions, occupied_slots, classrooms, period, max_attempts=220
                 )
                 
                 if new_slot:
@@ -211,25 +234,62 @@ def resolve_all_faculty_conflicts(
                         session_to_move.block = new_slot
                         # Room assignment will be re-checked in Phase 8
                     
-                    # Update occupied_slots
-                    section_key = f"{section}_{period}"
-                    # Remove old slot
-                    occupied_slots[section_key] = [
-                        (blk, c) for blk, c in occupied_slots.get(section_key, [])
-                        if not (blk.day == old_block.day and blk.start == old_block.start and blk.end == old_block.end and c == course_code)
-                    ]
-                    # Add new slot
-                    occupied_slots[section_key].append((new_slot, course_code))
+                    # Update occupied_slots (all sections for combined dict sessions)
+                    if isinstance(session_to_move, dict):
+                        section_list = session_to_move.get("sections") or []
+                        if not section_list:
+                            section_list = [section] if section else []
+                    else:
+                        section_list = [section] if section else []
+                    for sec in section_list:
+                        if not sec:
+                            continue
+                        sk = f"{sec}_{period}"
+                        occupied_slots[sk] = [
+                            (blk, c)
+                            for blk, c in occupied_slots.get(sk, [])
+                            if not (
+                                blk.day == old_block.day
+                                and blk.start == old_block.start
+                                and blk.end == old_block.end
+                                and c == course_code
+                            )
+                        ]
+                        occupied_slots[sk].append((new_slot, course_code))
                     
                     conflicts_resolved_this_pass += 1
                     print(f"    SUCCESS: Moved to {new_slot.day} {new_slot.start}-{new_slot.end}")
                 else:
-                    print(f"    WARNING: Could not find alternative slot for {course_code}")
+                    reassigned = False
+                    for cand in conflicting_sessions:
+                        if try_reassign_away_from_busy_instructor(
+                            cand, ff, all_sessions, period
+                        ):
+                            conflicts_resolved_this_pass += 1
+                            cc = (
+                                cand.get("course_code", "")
+                                if isinstance(cand, dict)
+                                else getattr(cand, "course_code", "")
+                            )
+                            print(
+                                f"    SUCCESS: Reassigned co-instructor on {cc} "
+                                f"(freed {ff} at same slot)"
+                            )
+                            reassigned = True
+                            break
+                    if not reassigned:
+                        print(f"    WARNING: Could not find alternative slot for {course_code}")
         
         if conflicts_resolved_this_pass == 0:
-            # No progress made this pass - stop to avoid infinite loop
-            print(f"  No conflicts resolved in pass {pass_num + 1} - stopping")
-            break
+            consecutive_without_progress += 1
+            print(
+                f"  No conflicts resolved in pass {pass_num + 1} "
+                f"({consecutive_without_progress} consecutive) — continuing..."
+            )
+            if consecutive_without_progress >= 8:
+                break
+        else:
+            consecutive_without_progress = 0
     
     # Final conflict check
     final_conflicts = detect_faculty_conflicts(all_sessions)

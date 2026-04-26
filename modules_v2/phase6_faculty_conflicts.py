@@ -3,10 +3,14 @@ Phase 6: Faculty Conflict Detection
 Ensures no faculty member is double-booked (assigned to multiple classes at the same time).
 """
 
-from typing import List, Dict, Tuple, Set
+from typing import List, Dict, Tuple, Set, Any
 from dataclasses import dataclass
 from datetime import time
-import pandas as pd
+from collections.abc import Mapping
+
+from utils.data_models import ScheduledSession
+from utils.period_utils import normalize_period
+from utils.faculty_conflict_utils import faculty_name_tokens
 
 @dataclass
 class FacultyConflict:
@@ -16,67 +20,131 @@ class FacultyConflict:
     conflicting_sessions: List[str]
     conflict_type: str  # "DOUBLE_BOOKING" or "OVERLAP"
 
+
+def _is_session_mapping(session: Any) -> bool:
+    """True for dict / UserDict / other Mappings; False for ScheduledSession."""
+    if session is None:
+        return False
+    if isinstance(session, ScheduledSession):
+        return False
+    if isinstance(session, dict):
+        return True
+    return isinstance(session, Mapping)
+
+
+def _session_course_section_key(session: Any) -> str:
+    """Stable key for conflict dedup: ScheduledSession or combined-class dict / mapping."""
+    if _is_session_mapping(session):
+        cc = str(
+            session.get("course_code")
+            or session.get("Course Code")
+            or ""
+        ).strip()
+        secs = session.get("sections") or session.get("Section")
+        if isinstance(secs, str) and secs:
+            secs = [x.strip() for x in secs.split(",") if x.strip()]
+        if isinstance(secs, (list, tuple)) and secs:
+            sec = str(secs[0]).strip()
+        else:
+            sec = str(secs).strip() if secs else ""
+        return f"{cc}_{sec}"
+    return f"{getattr(session, 'course_code', '')}_{getattr(session, 'section', '')}"
+
+
 def detect_faculty_conflicts(all_sessions: List) -> List[FacultyConflict]:
     """
-    Detect faculty conflicts - IGNORE PreMid/PostMid overlaps, NO DUPLICATES.
-    Only reports conflicts where same faculty teaches different courses/sections 
-    at the same time within the same period.
-    
-    Args:
-        all_sessions: List of all scheduled sessions from all phases
-        
-    Returns:
-        List of FacultyConflict objects representing detected conflicts
+    Detect faculty conflicts using the same overlap semantics as post-generate verification:
+    same instructor, same normalized period (PRE/POST), overlapping TimeBlocks on the same day,
+    different course/section keys. Partial overlaps (e.g. 08:00-09:30 vs 09:00-10:30) are included.
     """
     from collections import defaultdict
-    
-    # Group sessions by faculty, time, AND period
-    faculty_schedule = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
-    
+
+    # (faculty_lower, period_norm, day) -> list of (session, block, course_section_key)
+    by_bucket: Dict[Tuple[str, str, str], List[Tuple[Any, Any, str]]] = defaultdict(list)
+
     for session in all_sessions:
-        # Handle both ScheduledSession objects and dictionaries
-        if isinstance(session, dict):
-            # Combined sessions are dictionaries - they don't have faculty conflicts
+        if _is_session_mapping(session):
+            st = (
+                session.get("session_type")
+                or session.get("Session Type")
+                or session.get("kind")
+                or "L"
+            )
+            if str(st).strip().upper() == "P":
+                continue
+            faculty = (
+                session.get("instructor")
+                or session.get("faculty")
+                or session.get("Faculty")
+                or ""
+            )
+            if isinstance(faculty, str):
+                faculty = faculty.strip()
+            if not faculty or str(faculty).upper() in ["TBD", "VARIOUS", ""]:
+                continue
+            tb = session.get("time_block") or session.get("block")
+            if not tb:
+                continue
+            raw_period = session.get("period") or session.get("Period")
+            period_norm = normalize_period(raw_period)
+            for fac_lower in faculty_name_tokens(str(faculty)):
+                by_bucket[(fac_lower, period_norm, str(tb.day))].append(
+                    (session, tb, _session_course_section_key(session))
+                )
             continue
-        if session.kind == 'P':  # Skip labs
+
+        faculty = getattr(session, "faculty", "") or getattr(session, "instructor", "")
+        if str(getattr(session, "kind", "")).strip().upper() == "P":
             continue
-        
-        faculty = getattr(session, 'faculty', '')
-        if not faculty or faculty in ['TBD', 'Various']:
+        if isinstance(faculty, str):
+            faculty = faculty.strip()
+        if not faculty or faculty in ["TBD", "Various", "-"]:
             continue
-        
-        period = getattr(session, 'period', 'UNKNOWN')
-        time_key = f"{session.block.day}_{session.block.start}_{session.block.end}"
-        
-        # Group by faculty -> time -> period
-        faculty_schedule[faculty][time_key][period].append(session)
-    
-    # Find conflicts - only within same period
-    conflicts = []
-    for faculty, time_slots in faculty_schedule.items():
-        for time_key, periods in time_slots.items():
-            # Check each period separately
-            for period, sessions in periods.items():
-                if len(sessions) > 1:
-                    # Check if different courses/sections (use set to eliminate duplicates)
-                    unique_sessions = {}
-                    for s in sessions:
-                        key = f"{s.course_code}_{s.section}"
-                        if key not in unique_sessions:
-                            unique_sessions[key] = s
-                    
-                    # Only report if more than one unique course/section
-                    if len(unique_sessions) > 1:
-                        # Real conflict - same faculty, same time, same period, different courses/sections
-                        day, start, end = time_key.split('_')
-                        conflicts.append(FacultyConflict(
-                            faculty_name=faculty,
-                            time_slot=f"{day} {start}-{end} ({period})",
-                            day=day,
-                            conflicting_sessions=list(unique_sessions.keys()),
-                            conflict_type="DOUBLE_BOOKING"
-                        ))
-    
+        tb = getattr(session, "block", None)
+        if not tb:
+            continue
+        period_norm = normalize_period(getattr(session, "period", None))
+        for fac_lower in faculty_name_tokens(str(faculty)):
+            by_bucket[(fac_lower, period_norm, str(tb.day))].append(
+                (session, tb, _session_course_section_key(session))
+            )
+
+    conflicts: List[FacultyConflict] = []
+    seen_pair: Set[Tuple[str, str, frozenset]] = set()
+
+    for (faculty_lower, period_norm, day), items in by_bucket.items():
+        n = len(items)
+        for i in range(n):
+            _sess_i, block_i, key_i = items[i]
+            for j in range(i + 1, n):
+                _sess_j, block_j, key_j = items[j]
+                if _sess_i is _sess_j:
+                    continue
+                if key_i == key_j:
+                    continue
+                if not block_i.overlaps(block_j):
+                    continue
+                dedup = (faculty_lower, day, frozenset((key_i, key_j)))
+                if dedup in seen_pair:
+                    continue
+                seen_pair.add(dedup)
+
+                ov_start = max(block_i.start, block_j.start)
+                ov_end = min(block_i.end, block_j.end)
+                time_slot = (
+                    f"{day} {ov_start.strftime('%H:%M:%S')}-{ov_end.strftime('%H:%M:%S')} "
+                    f"({period_norm})"
+                )
+                conflicts.append(
+                    FacultyConflict(
+                        faculty_name=faculty_lower,
+                        time_slot=time_slot,
+                        day=day,
+                        conflicting_sessions=sorted([key_i, key_j]),
+                        conflict_type="OVERLAP",
+                    )
+                )
+
     return conflicts
 
 def check_faculty_availability(faculty: str, day: str, start_time: time, end_time: time, 
@@ -152,7 +220,8 @@ def generate_faculty_conflict_report(conflicts: List[FacultyConflict]) -> str:
     
     for i, conflict in enumerate(conflicts, 1):
         report += f"Conflict #{i}: {conflict.faculty_name}\n"
-        report += f"  Time: {conflict.day} {conflict.time_slot}\n"
+        # time_slot already includes day (required by resolver parser)
+        report += f"  Time: {conflict.time_slot}\n"
         report += f"  Type: {conflict.conflict_type}\n"
         report += f"  Conflicting Sessions: {', '.join(conflict.conflicting_sessions)}\n\n"
     

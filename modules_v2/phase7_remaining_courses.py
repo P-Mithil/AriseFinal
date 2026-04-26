@@ -20,9 +20,15 @@ import openpyxl
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from utils.data_models import Course, Section, TimeBlock, ClassRoom, ScheduledSession, section_has_time_conflict
+from utils.interactive_prompts import skip_interactive_prompts, default_period_is_pre_mid
 from utils.time_slot_logger import get_logger
 from utils.session_rules_validator import SessionRulesValidator
-from utils.time_validator import validate_time_range
+from utils.time_validator import validate_time_range, slot_end_within_day
+from utils.room_priority_policy import (
+    ordered_classroom_candidates,
+    should_prefer_top_large_rooms,
+    top_large_classrooms,
+)
 from config.schedule_config import WORKING_DAYS, LUNCH_WINDOWS, DAY_START_TIME, DAY_END_TIME
 
 def calculate_slots_from_ltpsc(ltpsc: str) -> Dict[str, int]:
@@ -54,10 +60,23 @@ def get_phase7_period_assignments_path() -> str:
     """
     Return absolute path for Phase 7 period assignment Excel file.
 
-    File: DATA/INPUT/phase7_period_assignments.xlsx
+    File: DATA/INPUT/phase7_period_assignments_<odd|even>.xlsx (when offering is set)
     """
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    return os.path.join(base_dir, "DATA", "INPUT", "phase7_period_assignments.xlsx")
+
+    raw_variant = (
+        os.environ.get("ARISE_COURSE_DATA_VARIANT", "").strip()
+        or os.environ.get("ARISE_OFFERING", "").strip()
+    ).lower()
+    if raw_variant in ("odd", "1"):
+        fn = "phase7_period_assignments_odd.xlsx"
+    elif raw_variant in ("even", "2"):
+        fn = "phase7_period_assignments_even.xlsx"
+    else:
+        # Backward compatible default (also used when UI doesn't pass offering)
+        fn = "phase7_period_assignments.xlsx"
+
+    return os.path.join(base_dir, "DATA", "INPUT", fn)
 
 
 def load_phase7_period_assignments(path: str) -> Dict[Tuple[str, int, str], bool]:
@@ -283,6 +302,12 @@ def prompt_user_for_phase7_period(
         f"Enter 1 or 2 (or 'pre'/'post'): "
     )
 
+    if skip_interactive_prompts():
+        pre = default_period_is_pre_mid("ARISE_PHASE7_DEFAULT_PERIOD")
+        label = "PreMid" if pre else "PostMid"
+        print(f"[non-interactive] Phase 7 period for {course.code} / {section_label} -> {label}")
+        return pre
+
     while True:
         try:
             choice = input(prompt).strip().lower()
@@ -312,6 +337,10 @@ def get_phase7_period_assignments(
         - assignments: {(course_code, semester, section_label): True for PreMid, False for PostMid}
         - any_prompted: True if at least one prompt was shown this run
     """
+    import os
+
+    force_prompts = os.environ.get("ARISE_FORCE_PHASE_PROMPTS", "").strip().lower() in ("1", "true", "yes")
+
     existing = load_phase7_period_assignments(assignments_path)
     assignments: Dict[Tuple[str, int, str], bool] = dict(existing)
     any_prompted = False
@@ -320,7 +349,7 @@ def get_phase7_period_assignments(
     def ensure_assignment(course: Course, section_label: str) -> None:
         nonlocal any_prompted
         key = (course.code.upper(), course.semester, section_label)
-        if key in assignments:
+        if (not force_prompts) and (key in assignments):
             return
         is_premid = prompt_user_for_phase7_period(course, section_label)
         assignments[key] = is_premid
@@ -353,8 +382,16 @@ def get_phase7_period_assignments(
             continue
         seen_non[key] = course
 
-        # Phase 7 currently assumes A-section for departments with only one section
-        section_label = f"{course.department}-A-Sem{course.semester}"
+        # Resolve section labels dynamically from structure config / generated sections.
+        matching_sections = [
+            s for s in sections
+            if s.program == course.department and s.semester == course.semester
+        ]
+        if not matching_sections:
+            # No known section metadata for this course-semester; skip prompting safely.
+            continue
+        matching_sections.sort(key=lambda s: s.name)
+        section_label = f"{matching_sections[0].program}-{matching_sections[0].name}-Sem{matching_sections[0].semester}"
         ensure_assignment(course, section_label)
 
     return assignments, any_prompted
@@ -430,7 +467,7 @@ def get_lunch_blocks() -> Dict[int, TimeBlock]:
         blocks[sem] = TimeBlock("Monday", start_t, end_t)
     return blocks
 
-def is_slot_available(slot: TimeBlock, section: str, period: str, occupied_slots: Dict, lunch_block: TimeBlock) -> bool:
+def is_slot_available(slot: TimeBlock, section: str, period: str, occupied_slots: Dict, lunch_block: TimeBlock, faculty: str = None, all_sessions: List = None, is_lab: bool = False) -> bool:
     """Check if a time slot is available"""
     # Check lunch overlap
     if lunch_block:
@@ -448,7 +485,17 @@ def is_slot_available(slot: TimeBlock, section: str, period: str, occupied_slots
     # Extra safety: handle any legacy occupied-slot formats
     if section_has_time_conflict(occupied_slots, section, period, slot):
         return False
-    
+        
+    # Check faculty conflicts (skip for labs)
+    if faculty and faculty not in ['TBD', 'Various', '-'] and all_sessions and not is_lab:
+        from utils.faculty_conflict_utils import check_faculty_availability_in_period
+        from utils.period_utils import normalize_period
+        period_n = normalize_period(period)
+        if not check_faculty_availability_in_period(
+            faculty, slot.day, slot.start, slot.end, period_n, all_sessions
+        ):
+            return False
+            
     return True
 
 
@@ -485,7 +532,9 @@ def check_elective_conflict_phase7(day: str, start: time, end: time, semester: i
 def find_available_slots_phase7(semester: int, section: str, period: str,
                                 occupied_slots: Dict,
                                 num_slots: int,
-                                slot_durations: List[int]) -> List[TimeBlock]:
+                                slot_durations: List[int],
+                                faculty: str = None,
+                                all_sessions: List = None) -> List[TimeBlock]:
     """
     Find available time slots avoiding:
     - Electives (Phase 3)
@@ -506,37 +555,35 @@ def find_available_slots_phase7(semester: int, section: str, period: str,
     iteration_count = 0
     
     # Generate time slots dynamically across full day with 15-minute intervals.
-    # Start/end are driven by schedule_config.DAY_START_TIME / DAY_END_TIME.
-    start_hour, end_hour = DAY_START_TIME.hour, DAY_END_TIME.hour
-    
+    # Start/end honor schedule_config.DAY_START_TIME / DAY_END_TIME (including minutes).
+    work_end_dt = datetime.combine(datetime.min, DAY_END_TIME)
+
     for duration in slot_durations:
         if len(available_slots) >= num_slots:
             break
-            
+
         for day in days:
             if len(available_slots) >= num_slots:
                 break
-                
+
             if day in used_days:
                 continue
-            
-            # Try all 15-minute intervals from 9:00 to 18:00 (excluding lunch)
-            current_time = time(start_hour, 0)
-            
-            while current_time.hour < end_hour:
+
+            current_dt = datetime.combine(datetime.min, DAY_START_TIME)
+
+            while current_dt + timedelta(minutes=duration) <= work_end_dt:
                 iteration_count += 1
                 if iteration_count > max_iterations:
                     print(f"  WARNING: Max iterations reached in find_available_slots_phase7")
                     return available_slots
-                
-                # Calculate end time
-                start_minutes = current_time.hour * 60 + current_time.minute
-                end_minutes = start_minutes + duration
-                
-                if end_minutes > end_hour * 60:
-                    break  # Slot would extend beyond working hours
-                
-                end_time = time(end_minutes // 60, end_minutes % 60)
+
+                current_time = current_dt.time()
+                end_dt = current_dt + timedelta(minutes=duration)
+                end_time = end_dt.time()
+                if not validate_time_range(current_time, end_time):
+                    current_dt += timedelta(minutes=15)
+                    continue
+
                 slot = TimeBlock(day, current_time, end_time)
                 
                 # Check if slot overlaps with lunch
@@ -546,38 +593,25 @@ def find_available_slots_phase7(semester: int, section: str, period: str,
                     lunch_block = None
 
                 if lunch_block and slot.overlaps(lunch_block):
-                    # Skip to after lunch
                     if current_time < lunch_block.start:
-                        current_time = lunch_block.end
+                        current_dt = datetime.combine(datetime.min, lunch_block.end)
                     else:
-                        # Already past lunch, move to next interval
-                        current_dt = datetime.combine(datetime.min, current_time)
                         current_dt += timedelta(minutes=15)
-                        current_time = current_dt.time()
                     continue
-                
+
                 # CRITICAL: Check elective basket conflict
                 if check_elective_conflict_phase7(day, current_time, end_time, semester):
-                    # Skip to after elective time
-                    current_dt = datetime.combine(datetime.min, current_time)
                     current_dt += timedelta(minutes=15)
-                    current_time = current_dt.time()
                     continue
-                
+
                 # Check if slot is available
-                if is_slot_available(slot, section, period, occupied_slots, lunch_block):
+                if is_slot_available(slot, section, period, occupied_slots, lunch_block, faculty, all_sessions):
                     available_slots.append(slot)
                     used_days.add(day)
-                    # Move to next 15-minute interval for next slot
-                    current_dt = datetime.combine(datetime.min, current_time)
                     current_dt += timedelta(minutes=15)
-                    current_time = current_dt.time()
                     break  # Found slot for this duration, move to next duration
-                
-                # Move to next 15-minute interval
-                current_dt = datetime.combine(datetime.min, current_time)
+
                 current_dt += timedelta(minutes=15)
-                current_time = current_dt.time()
             
             if len(available_slots) >= num_slots:
                 return available_slots
@@ -586,21 +620,29 @@ def find_available_slots_phase7(semester: int, section: str, period: str,
 
 def assign_classroom(capacity_needed: int, classrooms: List[ClassRoom], slot: TimeBlock) -> ClassRoom:
     """Assign a classroom based on capacity"""
-    # Filter classrooms that can accommodate the capacity
-    suitable_rooms = [r for r in classrooms if r.capacity >= capacity_needed and r.room_type == 'classroom']
-    
-    if not suitable_rooms:
-        return classrooms[0]  # Fallback
-    
-    # Sort by capacity (prefer closest match)
-    suitable_rooms.sort(key=lambda r: r.capacity)
-    return suitable_rooms[0]
+    top2 = top_large_classrooms(classrooms, n=2)
+    prefer_top = should_prefer_top_large_rooms(capacity_needed, top2)
+    candidates = ordered_classroom_candidates(
+        classrooms, capacity_needed, prefer_top_large=prefer_top, top_rooms=top2
+    )
+
+    suitable = [r for r in candidates if int(getattr(r, "capacity", 0) or 0) >= int(capacity_needed or 0)]
+    if suitable:
+        return suitable[0]
+
+    # Hard fallback: any classroom candidate, then any room object if malformed input.
+    if candidates:
+        return candidates[0]
+    if classrooms:
+        return classrooms[0]
+    return ClassRoom(room_number="UNASSIGNED", room_type="classroom", capacity=0)
 
 def schedule_within_group_combined(course: Course, sections: List[Section],
                                    occupied_slots: Dict,
                                    classrooms: List[ClassRoom],
                                    room_occupancy: Dict,
-                                   period_assignments: Dict[Tuple[str, int, str], bool]) -> List[ScheduledSession]:
+                                   period_assignments: Dict[Tuple[str, int, str], bool],
+                                   all_sessions: List = None) -> List[ScheduledSession]:
     """
     Schedule within-group combined courses
     Conditionally combines if sections map to the same period and have a single instructor.
@@ -627,11 +669,14 @@ def schedule_within_group_combined(course: Course, sections: List[Section],
     for _ in range(slots_info['practicals']):
         slot_durations.append(120)  # 2 hours
         
+    lunch_block_base = get_lunch_blocks().get(course.semester)
+
     def schedule_labels(label_list: List[str], target_period: str, total_students: int):
         # Find available time slots for the first section
         base_slots = find_available_slots_phase7(
             course.semester, label_list[0], target_period, occupied_slots, 
-            slots_info['total'] * 3, slot_durations
+            slots_info['total'] * 3, slot_durations,
+            course.instructors[0] if course.instructors else None, all_sessions
         )
         
         # Filter for all labels
@@ -655,7 +700,8 @@ def schedule_within_group_combined(course: Course, sections: List[Section],
             additional_needed = slots_info['total'] - len(available_slots)
             additional_slots = find_available_slots_phase7(
                 course.semester, label_list[0], target_period, occupied_slots,
-                additional_needed * 3, slot_durations
+                additional_needed * 3, slot_durations,
+                course.instructors[0] if course.instructors else None, all_sessions
             )
             for slot in additional_slots:
                 valid = True
@@ -697,6 +743,8 @@ def schedule_within_group_combined(course: Course, sections: List[Section],
                             faculty=course.instructors[0] if course.instructors else 'TBD'
                         )
                         sessions.append(session)
+                        if all_sessions is not None:
+                            all_sessions.append(session)
                         sec_key = f"{lbl}_{target_period}"
                         if sec_key not in occupied_slots: occupied_slots[sec_key] = []
                         occupied_slots[sec_key].append((slot, course.code))
@@ -710,7 +758,7 @@ def schedule_within_group_combined(course: Course, sections: List[Section],
             
             if not found_slot:
                 # Emergency slots
-                emergency_slots = find_available_slots_phase7(course.semester, label_list[0], target_period, occupied_slots, 1, [90])
+                emergency_slots = find_available_slots_phase7(course.semester, label_list[0], target_period, occupied_slots, 1, [90], course.instructors[0] if course.instructors else 'TBD', all_sessions)
                 for slot in emergency_slots:
                     if not validate_time_range(slot.start, slot.end): continue
                     if slot.day not in used_days_lectures:
@@ -722,6 +770,8 @@ def schedule_within_group_combined(course: Course, sections: List[Section],
                                 faculty=course.instructors[0] if course.instructors else 'TBD'
                             )
                             sessions.append(session)
+                            if all_sessions is not None:
+                                all_sessions.append(session)
                             sec_key = f"{lbl}_{target_period}"
                             if sec_key not in occupied_slots: occupied_slots[sec_key] = []
                             occupied_slots[sec_key].append((slot, course.code))
@@ -754,6 +804,8 @@ def schedule_within_group_combined(course: Course, sections: List[Section],
                             faculty=course.instructors[0] if course.instructors else 'TBD'
                         )
                         sessions.append(session)
+                        if all_sessions is not None:
+                            all_sessions.append(session)
                         sec_key = f"{lbl}_{target_period}"
                         if sec_key not in occupied_slots: occupied_slots[sec_key] = []
                         occupied_slots[sec_key].append((slot, course.code))
@@ -765,7 +817,7 @@ def schedule_within_group_combined(course: Course, sections: List[Section],
                     break
                 if not found_slot: retry_count += 1
             if not found_slot:
-                emergency_slots = find_available_slots_phase7(course.semester, label_list[0], target_period, occupied_slots, 1, [60])
+                emergency_slots = find_available_slots_phase7(course.semester, label_list[0], target_period, occupied_slots, 1, [60], course.instructors[0] if course.instructors else 'TBD', all_sessions)
                 for slot in emergency_slots:
                     if slot.day not in used_days_lectures and slot.day not in used_days_tutorials:
                         room = assign_classroom(total_students, classrooms, slot)
@@ -776,6 +828,8 @@ def schedule_within_group_combined(course: Course, sections: List[Section],
                                 faculty=course.instructors[0] if course.instructors else 'TBD'
                             )
                             sessions.append(session)
+                            if all_sessions is not None:
+                                all_sessions.append(session)
                             sec_key = f"{lbl}_{target_period}"
                             if sec_key not in occupied_slots: occupied_slots[sec_key] = []
                             occupied_slots[sec_key].append((slot, course.code))
@@ -789,11 +843,25 @@ def schedule_within_group_combined(course: Course, sections: List[Section],
         for i in range(slots_info['practicals']):
             if slot_idx >= len(available_slots): break
             slot = available_slots[slot_idx]
+            lunch_block = (
+                TimeBlock(slot.day, lunch_block_base.start, lunch_block_base.end)
+                if lunch_block_base else None
+            )
+            faculty_name = course.instructors[0] if course.instructors else 'TBD'
+            if not all(
+                is_slot_available(
+                    slot, lbl, target_period, occupied_slots, lunch_block, faculty_name, all_sessions, is_lab=True
+                )
+                for lbl in label_list
+            ):
+                slot_idx += 1
+                continue
             if not validate_time_range(slot.start, slot.end):
                 slot_idx += 1; continue
             slot_duration = (slot.end.hour * 60 + slot.end.minute) - (slot.start.hour * 60 + slot.start.minute)
-            if slot_duration >= 120 and (slot.start.hour > 16 or (slot.start.hour == 16 and slot.start.minute > 0)):
-                slot_idx += 1; continue
+            if slot_duration >= 120 and not slot_end_within_day(slot.start, 120):
+                slot_idx += 1
+                continue
             lab_rooms = [r for r in classrooms if hasattr(r, 'room_type') and r.room_type.lower() == 'lab']
             if not lab_rooms:
                 lab_rooms = classrooms
@@ -815,9 +883,12 @@ def schedule_within_group_combined(course: Course, sections: List[Section],
             for lbl in label_list:
                 session = ScheduledSession(
                     course_code=course.code, section=lbl, kind="P", block=slot,
-                    room=assigned_room, period=target_period, faculty=None
+                    room=assigned_room, period=target_period,
+                    faculty=faculty_name
                 )
                 sessions.append(session)
+                if all_sessions is not None:
+                    all_sessions.append(session)
                 sec_key = f"{lbl}_{target_period}"
                 if sec_key not in occupied_slots: occupied_slots[sec_key] = []
                 occupied_slots[sec_key].append((slot, course.code))
@@ -854,7 +925,8 @@ def schedule_non_combined(course: Course, sections: List[Section],
                          occupied_slots: Dict,
                          classrooms: List[ClassRoom],
                          room_occupancy: Dict,
-                         period_assignments: Dict[Tuple[str, int, str], bool]) -> List[ScheduledSession]:
+                         period_assignments: Dict[Tuple[str, int, str], bool],
+                         all_sessions: List = None) -> List[ScheduledSession]:
     """
     Schedule non-combined section-specific courses
     Schedule in EITHER PreMid OR PostMid (not both) - half-semester courses
@@ -877,8 +949,18 @@ def schedule_non_combined(course: Course, sections: List[Section],
     for _ in range(slots_info['practicals']):
         slot_durations.append(120)  # 2 hours
     
-    # Find the section for this course (Phase 7 uses A-section for single-section depts)
-    section_label = f"{course.department}-A-Sem{course.semester}"
+    # Resolve target section dynamically from available section metadata.
+    matching_sections = [
+        s for s in sections
+        if s.program == course.department and s.semester == course.semester
+    ]
+    if not matching_sections:
+        return sessions
+    matching_sections.sort(key=lambda s: s.name)
+    section_obj = matching_sections[0]
+    section_label = f"{section_obj.program}-{section_obj.name}-Sem{section_obj.semester}"
+    section_students = int(getattr(section_obj, "students", 0) or 0)
+    capacity_needed = max(1, section_students)
     
     # User-driven period selection (default to PRE if missing for robustness)
     key = (course.code.upper(), course.semester, section_label)
@@ -894,7 +976,8 @@ def schedule_non_combined(course: Course, sections: List[Section],
     for period in periods_to_try:
         available_slots = find_available_slots_phase7(
             course.semester, section_label, period, occupied_slots,
-            slots_info['total'], slot_durations
+            slots_info['total'], slot_durations,
+            course.instructors[0] if course.instructors else 'TBD', all_sessions
         )
         
         if len(available_slots) >= slots_info['total']:
@@ -909,7 +992,8 @@ def schedule_non_combined(course: Course, sections: List[Section],
             if additional_needed > 0:
                 additional_slots = find_available_slots_phase7(
                     course.semester, section_label, period_retry, occupied_slots,
-                    additional_needed, slot_durations
+                    additional_needed, slot_durations,
+                    course.instructors[0] if course.instructors else 'TBD', all_sessions
                 )
                 if additional_slots:
                     available_slots.extend(additional_slots)
@@ -952,10 +1036,10 @@ def schedule_non_combined(course: Course, sections: List[Section],
             # If we've exhausted available slots, try to find more
             if slot_idx >= len(available_slots):
                 if retry_count < max_retries - 1:
-                    # Try to find more slots
                     additional_slots = find_available_slots_phase7(
                         course.semester, section_label, period, occupied_slots,
-                        slots_info['lectures'] - lecture_count, [90]  # Just need lecture slots
+                        slots_info['lectures'] - lecture_count, [90],  # Just need lecture slots
+                        course.instructors[0] if course.instructors else 'TBD', all_sessions
                     )
                     if additional_slots:
                         available_slots.extend(additional_slots)
@@ -989,7 +1073,7 @@ def schedule_non_combined(course: Course, sections: List[Section],
                     continue
                 
                 # Found valid slot
-                room = assign_classroom(85, classrooms, slot)
+                room = assign_classroom(capacity_needed, classrooms, slot)
                 session = ScheduledSession(
                     course_code=course.code,
                     section=section_label,
@@ -1000,6 +1084,8 @@ def schedule_non_combined(course: Course, sections: List[Section],
                     faculty=course.instructors[0] if course.instructors else 'TBD'
                 )
                 sessions.append(session)
+                if all_sessions is not None:
+                    all_sessions.append(session)
                 
                 # Update occupied slots
                 section_key = f"{section_label}_{period}"
@@ -1023,11 +1109,12 @@ def schedule_non_combined(course: Course, sections: List[Section],
             # Last resort: try to find ANY available slot
             emergency_slots = find_available_slots_phase7(
                 course.semester, section_label, period, occupied_slots,
-                slots_info['lectures'] - lecture_count, [90]
+                slots_info['lectures'] - lecture_count, [90],
+                course.instructors[0] if course.instructors else 'TBD', all_sessions
             )
             for slot in emergency_slots:
                 if slot.day not in used_days_lectures:
-                    room = assign_classroom(85, classrooms, slot)
+                    room = assign_classroom(capacity_needed, classrooms, slot)
                     session = ScheduledSession(
                         course_code=course.code,
                         section=section_label,
@@ -1038,6 +1125,8 @@ def schedule_non_combined(course: Course, sections: List[Section],
                         faculty=course.instructors[0] if course.instructors else 'TBD'
                     )
                     sessions.append(session)
+                    if all_sessions is not None:
+                        all_sessions.append(session)
                     section_key = f"{section_label}_{period}"
                     if section_key not in occupied_slots:
                         occupied_slots[section_key] = []
@@ -1069,10 +1158,10 @@ def schedule_non_combined(course: Course, sections: List[Section],
             # If we've exhausted available slots, try to find more
             if slot_idx >= len(available_slots):
                 if retry_count < max_retries - 1:
-                    # Try to find more slots
                     additional_slots = find_available_slots_phase7(
                         course.semester, section_label, period, occupied_slots,
-                        slots_info['tutorials'] - tutorial_count, [60]  # Just need tutorial slots
+                        slots_info['tutorials'] - tutorial_count, [60],  # Just need tutorial slots
+                        course.instructors[0] if course.instructors else 'TBD', all_sessions
                     )
                     if additional_slots:
                         available_slots.extend(additional_slots)
@@ -1106,7 +1195,7 @@ def schedule_non_combined(course: Course, sections: List[Section],
                     continue
                 
                 # Found valid slot
-                room = assign_classroom(85, classrooms, slot)
+                room = assign_classroom(capacity_needed, classrooms, slot)
                 session = ScheduledSession(
                     course_code=course.code,
                     section=section_label,
@@ -1117,6 +1206,8 @@ def schedule_non_combined(course: Course, sections: List[Section],
                     faculty=course.instructors[0] if course.instructors else 'TBD'
                 )
                 sessions.append(session)
+                if all_sessions is not None:
+                    all_sessions.append(session)
                 
                 # Update occupied slots
                 section_key = f"{section_label}_{period}"
@@ -1139,11 +1230,13 @@ def schedule_non_combined(course: Course, sections: List[Section],
             # Last resort: try to find ANY available slot on a different day
             emergency_slots = find_available_slots_phase7(
                 course.semester, section_label, period, occupied_slots,
-                slots_info['tutorials'] - tutorial_count, [60]
+                slots_info['tutorials'] - tutorial_count, [60],
+                course.instructors[0] if course.instructors else 'TBD',
+                all_sessions
             )
             for slot in emergency_slots:
                 if slot.day not in used_days_lectures and slot.day not in used_days_tutorials:
-                    room = assign_classroom(85, classrooms, slot)
+                    room = assign_classroom(capacity_needed, classrooms, slot)
                     session = ScheduledSession(
                         course_code=course.code,
                         section=section_label,
@@ -1154,6 +1247,8 @@ def schedule_non_combined(course: Course, sections: List[Section],
                         faculty=course.instructors[0] if course.instructors else 'TBD'
                     )
                     sessions.append(session)
+                    if all_sessions is not None:
+                        all_sessions.append(session)
                     section_key = f"{section_label}_{period}"
                     if section_key not in occupied_slots:
                         occupied_slots[section_key] = []
@@ -1170,6 +1265,7 @@ def schedule_non_combined(course: Course, sections: List[Section],
         return sessions
     
     # Schedule practicals (practicals can be on same day as lectures/tutorials)
+    lunch_block_base = get_lunch_blocks().get(course.semester)
     for i in range(slots_info['practicals']):
         if time.time() - start_time > timeout:
             break
@@ -1178,7 +1274,9 @@ def schedule_non_combined(course: Course, sections: List[Section],
         if slot_idx >= len(available_slots):
             additional_slots = find_available_slots_phase7(
                 course.semester, section_label, period, occupied_slots,
-                slots_info['practicals'] - i, [120]  # Just need practical slots
+                slots_info['practicals'] - i, [120],  # Just need practical slots
+                course.instructors[0] if course.instructors else 'TBD',
+                all_sessions
             )
             if additional_slots:
                 available_slots.extend(additional_slots)
@@ -1187,6 +1285,22 @@ def schedule_non_combined(course: Course, sections: List[Section],
                 break
             
         slot = available_slots[slot_idx]
+        lunch_block = (
+            TimeBlock(slot.day, lunch_block_base.start, lunch_block_base.end)
+            if lunch_block_base else None
+        )
+        if not is_slot_available(
+            slot,
+            section_label,
+            period,
+            occupied_slots,
+            lunch_block,
+            course.instructors[0] if course.instructors else 'TBD',
+            all_sessions,
+            is_lab=True
+        ):
+            slot_idx += 1
+            continue
         
         # CRITICAL: Validate time range (9:00-18:00)
         # For 2-hour practicals, ensure start time allows completion before 18:00
@@ -1198,9 +1312,9 @@ def schedule_non_combined(course: Course, sections: List[Section],
         # Additional check: For 2-hour practicals, start must be <= 16:00
         # Check if this is a practical slot (2 hours duration)
         slot_duration = (slot.end.hour * 60 + slot.end.minute) - (slot.start.hour * 60 + slot.start.minute)
-        if slot_duration >= 120 and (slot.start.hour > 16 or (slot.start.hour == 16 and slot.start.minute > 0)):
+        if slot_duration >= 120 and not slot_end_within_day(slot.start, 120):
             slot_idx += 1
-            continue  # Skip - practical would extend beyond 18:00
+            continue
         
         # For practicals, use labs - find available lab room
         lab_rooms = [r for r in classrooms if hasattr(r, 'room_type') and r.room_type.lower() == 'lab']
@@ -1238,9 +1352,11 @@ def schedule_non_combined(course: Course, sections: List[Section],
             block=slot,
             room=assigned_room,
             period=period,
-            faculty=None  # No faculty for labs
+            faculty=course.instructors[0] if course.instructors else 'TBD'
         )
         sessions.append(session)
+        if all_sessions is not None:
+            all_sessions.append(session)
         
         # Update occupied slots
         section_key = f"{section_label}_{period}"
@@ -1263,6 +1379,7 @@ def run_phase7(courses: List[Course], sections: List[Section],
               occupied_slots: Dict,
               room_occupancy: Dict,
               combined_sessions: List = None,
+              context_sessions: List = None,
               timeout_seconds: int = 60) -> List[ScheduledSession]:
     """Main Phase 7 execution with timeout protection"""
     
@@ -1302,7 +1419,9 @@ def run_phase7(courses: List[Course], sections: List[Section],
         assignments_path,
     )
 
-    all_sessions = []
+    context_seed = list(context_sessions or [])
+    all_sessions = list(context_seed)
+    scheduled_sessions = []
     
     # Schedule within-group combined
     print("\nScheduling within-group combined courses...")
@@ -1322,8 +1441,9 @@ def run_phase7(courses: List[Course], sections: List[Section],
             classrooms,
             room_occupancy,
             period_assignments,
+            all_sessions=all_sessions,
         )
-        all_sessions.extend(sessions)
+        scheduled_sessions.extend(sessions)
         print(f"[OK] {len(sessions)} sessions scheduled")
     
     # Schedule non-combined
@@ -1343,11 +1463,12 @@ def run_phase7(courses: List[Course], sections: List[Section],
             classrooms,
             room_occupancy,
             period_assignments,
+            all_sessions=all_sessions,
         )
-        all_sessions.extend(sessions)
+        scheduled_sessions.extend(sessions)
         print(f"[OK] {len(sessions)} sessions scheduled")
     
-    print(f"\nPhase 7 completed: {len(all_sessions)} sessions scheduled")
+    print(f"\nPhase 7 completed: {len(scheduled_sessions)} sessions scheduled")
     
     # Persist any newly entered period assignments
     if any_prompted:
@@ -1355,7 +1476,7 @@ def run_phase7(courses: List[Course], sections: List[Section],
 
     # Log time slots
     logger = get_logger()
-    for session in all_sessions:
+    for session in scheduled_sessions:
         logger.log_session("Phase 7", session)
     
     # Print time slot logging summary
@@ -1369,7 +1490,7 @@ def run_phase7(courses: List[Course], sections: List[Section],
         print(f"  - By day: {phase7_summary['by_day']}")
         print(f"  - By session type: {phase7_summary['by_session_type']}")
     
-    return all_sessions
+    return scheduled_sessions
 
 if __name__ == "__main__":
     # Test the implementation

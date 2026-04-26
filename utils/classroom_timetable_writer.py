@@ -81,13 +81,18 @@ def _collect_room_sessions(
             period_raw = session.get("period", "PRE")
             course_code = session.get("course_code", "UNKNOWN")
             sections = session.get("sections") or []
+            single_section = session.get("section")
             room = session.get("room")
             faculty = session.get("instructor") or session.get("faculty") or ""
 
             if sections and isinstance(sections, (list, tuple)):
                 section_str = ",".join(str(s) for s in sections)
+            elif sections:
+                 section_str = str(sections)
+            elif single_section:
+                 section_str = str(single_section)
             else:
-                section_str = str(sections) if sections else ""
+                 section_str = ""
         else:
             block = getattr(session, "block", None)
             period_raw = getattr(session, "period", "PRE")

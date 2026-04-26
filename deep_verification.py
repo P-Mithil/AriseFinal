@@ -29,6 +29,15 @@ from config.structure_config import (
     STUDENTS_PER_SECTION,
     get_group_for_section,
 )
+from config.schedule_config import (
+    DAY_START_TIME,
+    DAY_END_TIME,
+    FACULTY_PARALLEL_SAME_COURSE_CREDIT_THRESHOLD,
+    FACULTY_VERIFY_REQUIRE_SHARED_PROGRAM_SEMESTER,
+)
+from utils.period_utils import normalize_period
+from utils.section_cohort_utils import program_semester_numbers_from_session_payload
+from utils.faculty_conflict_utils import faculty_name_tokens
 
 
 def find_latest_excel_file():
@@ -87,8 +96,9 @@ class DeepVerification:
         Verify LTPSC compliance for a course.
 
         period:
-          - None -> count across BOTH PRE+POST (full semester)
-          - 'PRE'/'POST' -> filter to that period only
+          - None -> count across BOTH PRE+POST; required L/T/P totals are 2× the per-half
+            slot counts from LTPSC for full-semester (non-elective, non-half-semester) courses.
+          - 'PRE'/'POST' -> filter to that period only (required counts are per-half slots)
         """
         ltpsc = course.ltpsc
         slots_needed = calculate_slots_needed(ltpsc)
@@ -126,9 +136,12 @@ class DeepVerification:
             # Check section match
             section_match = False
             if isinstance(s, dict):
-                # For dict format, check if section_label is in the sections list
-                if section_label in session_section:
-                    section_match = True
+                secs_raw = session_section
+                if isinstance(secs_raw, str):
+                    labels_norm = [x.strip() for x in secs_raw.split(",") if x.strip()]
+                else:
+                    labels_norm = [str(x).strip() for x in (secs_raw or []) if str(x).strip()]
+                section_match = section_label in labels_norm
             elif hasattr(s, 'section'):
                 session_section_str = str(session_section)
                 for pattern in section_patterns:
@@ -151,6 +164,25 @@ class DeepVerification:
             if section_match and period_match:
                 course_sessions.append(s)
         
+        # Full-semester (period=None) non-elective courses that run both PreMid and PostMid
+        # carry the same L/T/P *slot counts in each half*. Required totals are 2× the
+        # per-half slots from LTPSC (half-semester and elective courses stay 1×).
+        def _full_semester_ltpsc_multiplier(crs: Course, per: Optional[str]) -> int:
+            if per is not None:
+                return 1
+            if getattr(crs, "is_elective", False):
+                return 1
+            if getattr(crs, "half_semester", False):
+                return 1
+            # Phase 4 combined courses (<=2 credits, core) are inherently half-semester courses
+            # (they run either in PreMid or PostMid for a given group).
+            credits = getattr(crs, "credits", 0)
+            if credits is not None and credits <= 2:
+                return 1
+            return 2
+
+        mult = _full_semester_ltpsc_multiplier(course, period)
+
         # Count scheduled sessions by type
         scheduled_lectures = 0
         scheduled_tutorials = 0
@@ -175,10 +207,10 @@ class DeepVerification:
                 else:
                     scheduled_lectures += 1
         
-        # Requirements are defined per course for the full semester.
-        required_lectures = slots_needed['lectures']
-        required_tutorials = slots_needed['tutorials']
-        required_labs = slots_needed['practicals']
+        # Requirements: per-half slots from LTPSC × multiplier (2 for full-semester PRE+POST).
+        required_lectures = int(slots_needed['lectures']) * mult
+        required_tutorials = int(slots_needed['tutorials']) * mult
+        required_labs = int(slots_needed['practicals']) * mult
         
         compliance = {
             'ltpsc': ltpsc,
@@ -193,9 +225,9 @@ class DeepVerification:
                 'labs': scheduled_labs
             },
             'satisfied': {
-                'lectures': scheduled_lectures >= required_lectures,
-                'tutorials': scheduled_tutorials >= required_tutorials,
-                'labs': scheduled_labs >= required_labs
+                'lectures': scheduled_lectures == required_lectures,
+                'tutorials': scheduled_tutorials == required_tutorials,
+                'labs': scheduled_labs == required_labs
             },
             'sessions': course_sessions
         }
@@ -308,8 +340,8 @@ class DeepVerification:
         if not block:
             return violations
         
-        # Check time range (9:00-18:00)
-        if block.start < time(9, 0) or block.end > time(18, 0):
+        # Check time range against config
+        if block.start < DAY_START_TIME or block.end > DAY_END_TIME:
             violations.append(f"Session outside college hours: {block.start}-{block.end}")
         
         # Check lunch break
@@ -556,18 +588,85 @@ class DeepVerification:
                         c1,
                         f"Faculty {faculty} overlap: {c1} ({p1}) vs {c2} ({p2}) on {b1.day} {b1.start}-{b1.end}",
                     )
-        
+
+        def _session_calendar_key(sess: Any) -> Optional[tuple]:
+            """
+            Same calendar slot across parallel sections is often logged once per section row.
+            Include base course code so two different courses sharing a slot are not merged.
+            """
+            if isinstance(sess, dict):
+                tb = sess.get("time_block")
+                if not tb:
+                    return None
+                code = str(sess.get("course_code", "")).split("-")[0].strip().upper()
+                p = normalize_period(sess.get("period"))
+                st = str(sess.get("session_type", "L")).strip().upper()
+                if st == "ELECTIVE":
+                    st = "L"
+                return (code, p, tb.day, tb.start, tb.end, st)
+            block = getattr(sess, "block", None)
+            if block is not None:
+                code = str(getattr(sess, "course_code", "") or "").split("-")[0].strip().upper()
+                p = normalize_period(getattr(sess, "period", None))
+                kind = str(getattr(sess, "kind", "L")).strip().upper()
+                return (code, p, block.day, block.start, block.end, kind)
+            return None
+
+        def _session_applies_to_course(sess: Any, crs: Course) -> bool:
+            """True if this session belongs to crs's department + semester (CSV rows are per-section)."""
+            want_pref = f"{crs.department}-"
+            want_sem = f"-Sem{crs.semester}"
+            if isinstance(sess, dict):
+                secs = sess.get("sections") or []
+                if isinstance(secs, str):
+                    secs = [secs]
+                for sec in secs:
+                    s = str(sec).strip()
+                    if s.startswith(want_pref) and want_sem in s:
+                        return True
+                return False
+            sec_one = str(getattr(sess, "section", "") or "").strip()
+            if sec_one:
+                return sec_one.startswith(want_pref) and want_sem in sec_one
+            return True
+
         # Step 4: Course-by-course verification
         print("\n[STEP 4] Verifying each course in detail...")
         print("-"*100)
         
-        total_courses = len(courses)
+        # Legacy-compatible course-row stabilization:
+        # For duplicate Phase-5 rows with same (code, dept, sem, credits) and no Offering_ID,
+        # verify one representative only to avoid contradictory LTPSC checks.
+        verification_courses: List[Course] = []
+        seen_verify_keys: Dict[Tuple[str, str, int, int], Course] = {}
+        for c in courses:
+            if c.is_elective:
+                continue
+            key = (str(c.code).strip().upper(), str(c.department).strip().upper(), int(c.semester), int(c.credits))
+            oid = (getattr(c, "offering_id", None) or "").strip()
+            if oid:
+                verification_courses.append(c)
+                continue
+            if key not in seen_verify_keys:
+                seen_verify_keys[key] = c
+                verification_courses.append(c)
+                continue
+            existing = seen_verify_keys[key]
+            a = str(getattr(existing, "ltpsc", "") or "").strip()
+            b = str(getattr(c, "ltpsc", "") or "").strip()
+            if a != b:
+                self.log_warning(
+                    "DATA_QUALITY",
+                    str(c.code),
+                    f"Duplicate course row {c.code} {c.department} Sem{c.semester} has LTPSC variants "
+                    f"({a!r} vs {b!r}); verifying first row only."
+                )
+
+        total_courses = len(verification_courses)
         scheduled_courses = set()
         unscheduled_courses = []
         
-        for course in courses:
-            if course.is_elective:
-                continue  # Skip electives for now
+        for course in verification_courses:
             
             # Find sessions for this course - handle different session formats
             course_sessions = []
@@ -578,11 +677,11 @@ class DeepVerification:
                     if isinstance(session_code, str):
                         # Remove suffixes like -TUT, -LAB
                         base_code = session_code.split('-')[0]
-                        if base_code == course.code:
+                        if base_code == course.code and _session_applies_to_course(s, course):
                             course_sessions.append(s)
                 # Handle ScheduledSession objects
                 elif hasattr(s, 'course_code'):
-                    if s.course_code == course.code:
+                    if s.course_code == course.code and _session_applies_to_course(s, course):
                         course_sessions.append(s)
                 # Handle string course codes
                 elif isinstance(s, str) and s == course.code:
@@ -690,11 +789,22 @@ class DeepVerification:
         print(f"  Phase 5 sessions: {len(phase5_sessions)}")
         print(f"  Phase 7 sessions: {len(phase7_sessions)}")
         
-        # Count by type
-        lectures = sum(1 for s in all_sessions if hasattr(s, 'kind') and s.kind == 'L')
-        tutorials = sum(1 for s in all_sessions if hasattr(s, 'kind') and s.kind == 'T')
-        labs = sum(1 for s in all_sessions if hasattr(s, 'kind') and s.kind == 'P')
-        print(f"  By type: {lectures} lectures, {tutorials} tutorials, {labs} labs")
+        # Count by type (dict sessions from CSV use session_type; dedupe shared calendar slots)
+        lectures = tutorials = labs = 0
+        _seen_slot: Set[tuple] = set()
+        for s in all_sessions:
+            key = _session_calendar_key(s)
+            if key is None or key in _seen_slot:
+                continue
+            _seen_slot.add(key)
+            _, _, _, _, _, st = key
+            if st == "P":
+                labs += 1
+            elif st == "T":
+                tutorials += 1
+            else:
+                lectures += 1
+        print(f"  By type (unique slots): {lectures} lectures, {tutorials} tutorials, {labs} labs")
         
         # Step 6: Issues report
         print(f"\n[ISSUES REPORT]")
@@ -725,60 +835,84 @@ class DeepVerification:
         print(f"\n[DETAILED COURSE REPORT]")
         print("-"*100)
         
-        for course in sorted(courses, key=lambda c: (c.department, c.semester, c.code)):
-            if course.is_elective:
-                continue
+        for course in sorted(verification_courses, key=lambda c: (c.department, c.semester, c.code)):
             
-            # Include both ScheduledSession objects and dict-based sessions (Phase 4 combined)
+            # Same code can be scheduled for multiple departments (e.g. EC307 DSAI + ECE): only
+            # count sessions for *this* course row's department + semester (matches Step 4).
             course_sessions: List[Any] = []
             for s in all_sessions:
                 if isinstance(s, dict):
                     code = str(s.get("course_code", "")).split("-")[0]
-                    if code == course.code:
+                    if code == course.code and _session_applies_to_course(s, course):
                         course_sessions.append(s)
                 elif hasattr(s, "course_code"):
                     code = str(getattr(s, "course_code", "")).split("-")[0]
-                    if code == course.code:
+                    if code == course.code and _session_applies_to_course(s, course):
                         course_sessions.append(s)
-            
+
+            matching_sections = [
+                sec for sec in sections
+                if sec.program == course.department and sec.semester == course.semester
+            ]
+
             print(f"\n{course.code}: {course.name}")
             print(f"  Department: {course.department}, Semester: {course.semester}, Credits: {course.credits}")
             print(f"  LTPSC: {course.ltpsc}")
             slots_needed = calculate_slots_needed(course.ltpsc)
             print(f"  Required: {slots_needed['lectures']}L + {slots_needed['tutorials']}T + {slots_needed['practicals']}P")
-            print(f"  Scheduled sessions: {len(course_sessions)}")
-            
-            # Count by type
-            course_lectures = 0
-            course_tutorials = 0
-            course_labs = 0
+
+            _seen_course: Set[tuple] = set()
+            course_slots: List[Any] = []
             for s in course_sessions:
-                if isinstance(s, dict):
-                    st = str(s.get("session_type", "L")).upper()
-                    if st == "P":
-                        course_labs += 1
-                    elif st == "T":
-                        course_tutorials += 1
-                    else:
-                        course_lectures += 1
-                else:
-                    kind = str(getattr(s, "kind", "L")).upper()
-                    if kind == "P":
-                        course_labs += 1
-                    elif kind == "T":
-                        course_tutorials += 1
-                    else:
-                        course_lectures += 1
-            print(f"  Scheduled: {course_lectures}L + {course_tutorials}T + {course_labs}P")
-            
-            # Check compliance
-            # This report is full-semester: required LTPSC is compared against totals
-            # across both PRE and POST.
-            if (
-                course_lectures >= slots_needed["lectures"]
-                and course_tutorials >= slots_needed["tutorials"]
-                and course_labs >= slots_needed["practicals"]
-            ):
+                key = _session_calendar_key(s)
+                if key is None or key in _seen_course:
+                    continue
+                _seen_course.add(key)
+                course_slots.append(s)
+            print(
+                f"  Scheduled sessions: {len(course_sessions)} log rows, "
+                f"{len(course_slots)} unique calendar slots (this dept/sem only)"
+            )
+
+            if not matching_sections:
+                print("  Status: [SKIP] No configured sections for this department/semester")
+                continue
+
+            all_sat = True
+            failing_labels: List[str] = []
+            display_comp = None
+            for sec in matching_sections:
+                comp = self.verify_ltpsc_compliance(course, all_sessions, sec, period=None)
+                ok = (
+                    comp["satisfied"]["lectures"]
+                    and comp["satisfied"]["tutorials"]
+                    and comp["satisfied"]["labs"]
+                )
+                if not ok:
+                    all_sat = False
+                    failing_labels.append(sec.label)
+                    if display_comp is None:
+                        display_comp = comp
+            if display_comp is None:
+                display_comp = self.verify_ltpsc_compliance(
+                    course, all_sessions, matching_sections[0], period=None
+                )
+
+            sch = display_comp["scheduled"]
+            course_lectures = sch["lectures"]
+            course_tutorials = sch["tutorials"]
+            course_labs = sch["labs"]
+            ref_label = (
+                failing_labels[0]
+                if failing_labels
+                else matching_sections[0].label
+            )
+            print(
+                f"  Scheduled (verify_ltpsc, section {ref_label}): "
+                f"{course_lectures}L + {course_tutorials}T + {course_labs}P"
+            )
+
+            if all_sat:
                 print(f"  Status: [OK] LTPSC requirements met")
             else:
                 print(f"  Status: [ISSUE] LTPSC requirements NOT met")
@@ -786,6 +920,8 @@ class DeepVerification:
                     f"    Expected: {slots_needed['lectures']}L + {slots_needed['tutorials']}T + {slots_needed['practicals']}P"
                 )
                 print(f"    Got: {course_lectures}L + {course_tutorials}T + {course_labs}P")
+                if len(failing_labels) > 1:
+                    print(f"    Sections with mismatch: {', '.join(sorted(failing_labels))}")
         
         print("\n" + "="*100)
         print("DEEP VERIFICATION COMPLETE")
@@ -814,19 +950,112 @@ def run_verification_on_sessions(
 ) -> Tuple[bool, List[Dict[str, Any]]]:
     """
     Run post-drag verification on in-memory sessions (internal dict format).
-    Only checks rules that a manual drag can break:
+    Checks rules that a manual drag (or bad generator output) can break:
       1) Time constraints (session outside day bounds or inside lunch)
       2) Section overlap  (two DIFFERENT courses in same section at same time)
-      3) Faculty conflict (same instructor teaching two courses at same time)
-    Room conflicts and LTPSC are pre-existing generator state and not checked here.
+      3) Faculty conflict (two different courses at same time; plus same course on parallel
+         sections when course credits exceed FACULTY_PARALLEL_SAME_COURSE_CREDIT_THRESHOLD)
+      4) Classroom conflicts (missing/unknown room, capacity, double-booking)
+      5) One-day lecture caps vs LTPSC
+      6) Combined-class synchronization / faculty bottlenecks
+      7) LTPSC compliance (full semester PRE+POST) for each scheduled course/section pair
     Returns (success, errors).
     """
     errors: List[Dict[str, Any]] = []
     verifier = DeepVerification()
     seen_errors: set = set()
 
+    # Canonical periods so PREMID vs POSTMID match generator/CSV semantics
+    for s in all_sessions:
+        s["period"] = normalize_period(s.get("period"))
+
+    def _section_semester_dept(sec: str) -> Tuple[Optional[int], Optional[str]]:
+        sem, dept = None, None
+        if not sec or not isinstance(sec, str):
+            return sem, dept
+        if "Sem" in sec:
+            try:
+                sem = int(sec.split("Sem")[1].split("-")[0])
+            except (ValueError, IndexError):
+                pass
+        if "-" in sec:
+            dept = sec.split("-")[0].strip()
+        return sem, dept
+
+    def _max_lectures_same_day_allowed(code: str, sec: str) -> int:
+        """Align with Phase 5 Pass 2: allow multiple L same day up to LTPSC lecture slot count."""
+        sem, dept = _section_semester_dept(sec)
+        course_obj = None
+        for c in courses:
+            if str(c.code).upper() != str(code).upper():
+                continue
+            if sem is not None and getattr(c, "semester", None) != sem:
+                continue
+            if dept and getattr(c, "department", None) == dept:
+                course_obj = c
+                break
+        if course_obj is None:
+            for c in courses:
+                if str(c.code).upper() != str(code).upper():
+                    continue
+                if sem is None or getattr(c, "semester", None) == sem:
+                    course_obj = c
+                    break
+        if course_obj is None or not getattr(course_obj, "ltpsc", None):
+            return 1
+        sn = calculate_slots_needed(course_obj.ltpsc)
+        return max(1, int(sn.get("lectures", 1)))
+
+    def _course_credits_for_code_section(code: str, sec: str) -> Optional[int]:
+        """Match Phase1 course row by code + section semester/dept; None if not found."""
+        sem, dept = _section_semester_dept(sec)
+        course_obj = None
+        for c in courses:
+            if str(c.code).upper() != str(code).upper():
+                continue
+            if sem is not None and getattr(c, "semester", None) != sem:
+                continue
+            if dept and getattr(c, "department", None) == dept:
+                course_obj = c
+                break
+        if course_obj is None:
+            for c in courses:
+                if str(c.code).upper() != str(code).upper():
+                    continue
+                if sem is None or getattr(c, "semester", None) == sem:
+                    course_obj = c
+                    break
+        if course_obj is None:
+            return None
+        return int(getattr(course_obj, "credits", 0) or 0)
+
+    def _find_course_for_section(code: str, sec: Section) -> Optional[Course]:
+        """Match course_data row by code + section semester (and department when available)."""
+        code_u = str(code).strip().upper()
+        sem = getattr(sec, "semester", None)
+        prog = str(getattr(sec, "program", "") or "").strip().upper()
+        best: Optional[Course] = None
+        for c in courses or []:
+            if str(getattr(c, "code", "")).strip().upper() != code_u:
+                continue
+            if sem is not None and getattr(c, "semester", None) != sem:
+                continue
+            dept = str(getattr(c, "department", "") or "").strip().upper()
+            if prog and dept and dept != prog:
+                continue
+            return c
+        for c in courses or []:
+            if str(getattr(c, "code", "")).strip().upper() != code_u:
+                continue
+            if sem is None or getattr(c, "semester", None) == sem:
+                best = c
+        return best
+
     def _add_error(rule: str, message: str, course_code: str, section: str, day: str, time: str) -> None:
-        key = (rule, course_code, section, message)
+        # Deduplicate robustly: faculty conflict can be reported from multiple sub-checks
+        # with only casing differences (e.g. "ramesh athe" vs "Ramesh Athe") in the message.
+        msg_key = message.lower() if str(rule).strip().lower() == "faculty conflict" else message
+        key = (rule, course_code, section, msg_key)
         if key not in seen_errors:
             seen_errors.add(key)
             errors.append({
@@ -855,7 +1084,7 @@ def run_verification_on_sessions(
     # 2) Section overlap: two DIFFERENT courses in the same section+period overlapping in time
     by_sec_period = defaultdict(list)
     for s in all_sessions:
-        period = (s.get("period") or "").strip().upper()
+        period = normalize_period(s.get("period"))
         # A session might belong to multiple sections (combined courses)
         secs = s.get("sections") or [""]
         if isinstance(secs, str):
@@ -894,42 +1123,255 @@ def run_verification_on_sessions(
                 )
 
     # 3) Faculty conflict: same instructor teaching two different courses at same time
+    # (comma-separated team lists are split so e.g. Sunil on CS161 vs CS262 is detected.)
     faculty_map: Dict[str, List[tuple]] = defaultdict(list)
     faculty_seen: Set[tuple] = set()
     for s in all_sessions:
-        fac = (s.get("instructor") or "").strip()
-        if not fac or fac.upper() in ("TBD", "VARIOUS", ""):
+        fac_raw = (s.get("instructor") or "").strip()
+        if not fac_raw or fac_raw.upper() in ("TBD", "VARIOUS", ""):
             continue
         block = s.get("time_block")
         if not block:
             continue
-        code = (s.get("course_code") or "").split("-")[0].upper()
-        period = str(s.get("period") or "").upper()
-        fkey = (fac, code, block.day, block.start.strftime("%H:%M"), block.end.strftime("%H:%M"))
-        if fkey in faculty_seen:
-            continue
-        faculty_seen.add(fkey)
-        faculty_map[fac].append((block, code, period))
+        code = (s.get("course_code") or "").split("-")[0].strip().upper()
+        period = normalize_period(s.get("period"))
+        sem_cohorts = program_semester_numbers_from_session_payload(s)
+        for fac in faculty_name_tokens(fac_raw):
+            fkey = (fac, code, block.day, block.start.strftime("%H:%M"), block.end.strftime("%H:%M"))
+            if fkey in faculty_seen:
+                continue
+            faculty_seen.add(fkey)
+            faculty_map[fac].append((block, code, period, sem_cohorts))
+    # Track pairs we've already reported so each (faculty, course_pair, day) produces exactly ONE error
+    _fac_pair_seen: Set[tuple] = set()
     for fac, items in faculty_map.items():
         items_sorted = sorted(items, key=lambda x: (x[0].day, x[0].start))
         for i in range(len(items_sorted) - 1):
-            b1, c1, p1 = items_sorted[i]
+            b1, c1, p1, sem1 = items_sorted[i]
             for j in range(i + 1, len(items_sorted)):
-                b2, c2, p2 = items_sorted[j]
+                b2, c2, p2, sem2 = items_sorted[j]
                 if c1 == c2:
                     continue  # Same course, different sections - fine
-                if p1 and p2 and p1 != p2:
-                    continue  # Different periods
+                if normalize_period(p1) != normalize_period(p2):
+                    continue  # Different periods (half-semesters)
+                if FACULTY_VERIFY_REQUIRE_SHARED_PROGRAM_SEMESTER:
+                    if sem1 and sem2 and not (sem1 & sem2):
+                        continue
                 if b1.day != b2.day or not b1.overlaps(b2):
                     continue
+                # Canonical pair key - order-independent so A+B and B+A are the same pair
+                pair_key = (fac, frozenset([c1, c2]), b1.day)
+                if pair_key in _fac_pair_seen:
+                    continue
+                _fac_pair_seen.add(pair_key)
+                ca, cb = sorted([c1, c2])  # alphabetical so message is consistent
                 _add_error(
                     "Faculty conflict",
-                    f"Faculty {fac} has overlapping sessions: {c1} and {c2} on {b1.day} {b1.start.strftime('%H:%M')}-{b1.end.strftime('%H:%M')}",
-                    c1, "", b1.day,
+                    f"Faculty {fac} has overlapping sessions: {ca} and {cb} on {b1.day} {b1.start.strftime('%H:%M')}-{b1.end.strftime('%H:%M')}",
+                    ca, "", b1.day,
                     f"{b1.start.strftime('%H:%M')}-{b1.end.strftime('%H:%M')}",
                 )
 
-    # 4) 1 day 1 course rule (for lectures)
+    # 3b) Same instructor + same course + overlapping time for different parallel sections,
+    # when the course is NOT combinable (credits > threshold — e.g. 3-credit HS161 cannot be
+    # one joint lecture for CSE-A and CSE-B).
+    exploded_parallel: List[Tuple[str, str, str, Any, str]] = []
+    for s in all_sessions:
+        fac_raw = (s.get("instructor") or "").strip()
+        if not fac_raw or fac_raw.upper() in ("TBD", "VARIOUS", ""):
+            continue
+        block = s.get("time_block")
+        if not block:
+            continue
+        code = (s.get("course_code") or "").split("-")[0].strip().upper()
+        if not code or "ELECTIVE_BASKET" in code:
+            continue
+        if str(s.get("phase", "")).startswith("Phase 3"):
+            continue
+        period = normalize_period(s.get("period"))
+        secs = s.get("sections") or [""]
+        if isinstance(secs, str):
+            secs = [secs]
+        for sec in secs:
+            if not sec:
+                continue
+            for fac in faculty_name_tokens(fac_raw):
+                exploded_parallel.append((fac, code, period, block, sec))
+
+    _par_pair_seen: Set[Tuple[str, str, str, str, str]] = set()
+    thr = FACULTY_PARALLEL_SAME_COURSE_CREDIT_THRESHOLD
+    for i, tup_a in enumerate(exploded_parallel):
+        fa, ca, pa, ba, sea = tup_a
+        for j in range(i + 1, len(exploded_parallel)):
+            fb, cb, pb, bb, seb = exploded_parallel[j]
+            if fa != fb or ca != cb:
+                continue
+            if normalize_period(pa) != normalize_period(pb):
+                continue
+            if sea == seb:
+                continue
+            prog_a = sea.split("-", 1)[0].strip().upper() if sea else ""
+            prog_b = seb.split("-", 1)[0].strip().upper() if seb else ""
+            if prog_a and prog_b and prog_a != prog_b:
+                continue  # Cross-dept: joint offering, not illegal parallel overload.
+            sem_a, _ = _section_semester_dept(sea)
+            sem_b, _ = _section_semester_dept(seb)
+            if sem_a is None or sem_a != sem_b:
+                continue
+            if ba.day != bb.day or not ba.overlaps(bb):
+                continue
+            credits = _course_credits_for_code_section(ca, sea)
+            if credits is None or credits <= thr:
+                continue
+            s1, s2 = sorted([sea, seb])
+            par_key = (fa, ca, s1, s2, ba.day)
+            if par_key in _par_pair_seen:
+                continue
+            _par_pair_seen.add(par_key)
+            _add_error(
+                "Faculty conflict",
+                (
+                    f"Faculty {fa} cannot teach {ca} ({credits} cr, not a combinable/joint lecture) "
+                    f"for parallel sections {sea} and {seb} at overlapping times on {ba.day} "
+                    f"{ba.start.strftime('%H:%M')}-{ba.end.strftime('%H:%M')}"
+                ),
+                ca,
+                f"{sea} / {seb}",
+                ba.day,
+                f"{ba.start.strftime('%H:%M')}-{ba.end.strftime('%H:%M')}",
+            )
+
+    # 4) Classroom conflicts:
+    #   a) Missing/blank room assignment is a strict error
+    #   b) Room double-booking in same normalized period is a strict error
+    #   c) Room capacity must be sufficient for the session's sections
+    room_capacity_by_name: Dict[str, int] = {}
+    for r in classrooms or []:
+        room_no = str(getattr(r, "room_number", "") or "").strip()
+        if not room_no:
+            continue
+        try:
+            room_capacity_by_name[room_no] = int(getattr(r, "capacity", 0) or 0)
+        except (TypeError, ValueError):
+            room_capacity_by_name[room_no] = 0
+
+    section_students_by_label: Dict[str, int] = {}
+    for sec_obj in sections or []:
+        label = str(getattr(sec_obj, "label", "") or "").strip()
+        if not label:
+            continue
+        try:
+            section_students_by_label[label] = int(getattr(sec_obj, "students", 0) or 0)
+        except (TypeError, ValueError):
+            section_students_by_label[label] = 0
+
+    by_room_period: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
+    def _is_unassigned_room_value(room_val: str) -> bool:
+        s = str(room_val or "").strip().lower()
+        return s in ("", "na", "none", "nan", "tbd")
+
+    for s in all_sessions:
+        tb = s.get("time_block")
+        if not tb:
+            continue
+        period = normalize_period(s.get("period"))
+        room_raw = str(s.get("room") or "").strip()
+        code = (s.get("course_code") or "").strip()
+        code_base = code.split("-")[0].strip().upper()
+        session_type = str(s.get("session_type") or "L").strip().upper()
+        secs = s.get("sections") or [""]
+        if isinstance(secs, str):
+            secs = [secs]
+        sec_list = [str(x).strip() for x in secs if str(x).strip()]
+        sec_repr = " / ".join(sec_list) if sec_list else ""
+        time_str = f"{tb.start.strftime('%H:%M')}-{tb.end.strftime('%H:%M')}"
+
+        # 4a) Missing room assignment
+        if _is_unassigned_room_value(room_raw):
+            _add_error(
+                "Classroom conflict",
+                f"Missing room assignment for {code}",
+                code,
+                sec_repr,
+                tb.day,
+                time_str,
+            )
+            continue
+
+        # Some lab rows carry comma-separated room lists (parallel section labs).
+        # Treat each listed room as a valid allocation target for conflict/capacity checks.
+        room_list = [r.strip() for r in room_raw.split(",") if r.strip()]
+        if not room_list:
+            room_list = [room_raw]
+
+        # 4c) Room existence + capacity
+        unknown_rooms = [r for r in room_list if r not in room_capacity_by_name]
+        if unknown_rooms:
+            _add_error(
+                "Classroom conflict",
+                f"Unknown room(s) '{', '.join(unknown_rooms)}' for {code}",
+                code,
+                sec_repr,
+                tb.day,
+                time_str,
+            )
+        else:
+            # Capacity rule (strict):
+            # If the session needs N seats and the assigned room capacity < N, it is an error.
+            # Apply to lectures/tutorials only; labs/practicals are handled separately by lab assignment logic.
+            if session_type in ("L", "T") and "ELECTIVE_BASKET" not in code_base:
+                needed = sum(section_students_by_label.get(sec, 0) for sec in sec_list)
+                cap = max(room_capacity_by_name.get(r, 0) for r in room_list)
+                if needed > 0 and cap < needed:
+                    _add_error(
+                        "Classroom conflict",
+                        f"Room capacity {cap} < required {needed} for {code}",
+                        code,
+                        sec_repr,
+                        tb.day,
+                        time_str,
+                    )
+
+        for room in room_list:
+            by_room_period[(room, period)].append(s)
+
+    # 4b) Room double-booking
+    for (room, period), sess_list in by_room_period.items():
+        for i, a in enumerate(sess_list):
+            for b in sess_list[i + 1:]:
+                tb_a, tb_b = a.get("time_block"), b.get("time_block")
+                if not tb_a or not tb_b:
+                    continue
+                if tb_a.day != tb_b.day or not tb_a.overlaps(tb_b):
+                    continue
+                code_a = (a.get("course_code") or "").strip()
+                code_b = (b.get("course_code") or "").strip()
+                secs_a = a.get("sections") or [""]
+                secs_b = b.get("sections") or [""]
+                if isinstance(secs_a, str):
+                    secs_a = [secs_a]
+                if isinstance(secs_b, str):
+                    secs_b = [secs_b]
+                # Skip exact duplicates of same grouped session payload
+                if (
+                    code_a == code_b
+                    and set(str(x).strip() for x in secs_a if str(x).strip())
+                    == set(str(x).strip() for x in secs_b if str(x).strip())
+                    and (a.get("session_type") or "L") == (b.get("session_type") or "L")
+                ):
+                    continue
+                overlap_start = max(tb_a.start, tb_b.start).strftime("%H:%M")
+                overlap_end = min(tb_a.end, tb_b.end).strftime("%H:%M")
+                _add_error(
+                    "Classroom conflict",
+                    f"Room {room} is double-booked in {period}: {code_a} and {code_b}",
+                    code_a,
+                    "",
+                    tb_a.day,
+                    f"{overlap_start}-{overlap_end}",
+                )
+
+    # 5) 1 day 1 course rule (for lectures)
     # A normal course should not have two lectures on the same day for the same section in the SAME period
     course_day_counts = defaultdict(list)
     for s in all_sessions:
@@ -943,7 +1385,7 @@ def run_verification_on_sessions(
             continue
             
         tb = s.get("time_block")
-        period = str(s.get("period") or "PRE").strip().upper()
+        period = normalize_period(s.get("period"))
         if not tb or not code:
             continue
             
@@ -954,15 +1396,16 @@ def run_verification_on_sessions(
             course_day_counts[key].append(s)
 
     for (sec, code, day, period), sessions in course_day_counts.items():
-        if len(sessions) > 1:
+        cap = _max_lectures_same_day_allowed(code, sec)
+        if len(sessions) > cap:
             times = ", ".join([f"{s['time_block'].start.strftime('%H:%M')}-{s['time_block'].end.strftime('%H:%M')}" for s in sessions if s.get('time_block')])
             _add_error(
                 "1 Day 1 Course",
-                f"Course {code} has multiple lectures on {day} in section {sec} ({period}): {times}",
+                f"Course {code} has {len(sessions)} lectures on {day} in section {sec} ({period}) but LTPSC allows at most {cap}: {times}",
                 code, sec, day, ""
             )
 
-    # 5) Combined class synchronization, room, and faculty checks
+    # 6) Combined class synchronization, room, and faculty checks
     # If a class is combined (same code, same instructor, multiple sections):
     # - Must not overlap with another combined course (bottleneck: only one 240-capacity room C004)
     # - Designated faculty must not be teaching something else
@@ -1005,6 +1448,9 @@ def run_verification_on_sessions(
             
             # Sub-check B: Faculty availability for combined course
             # Check if this instructor is teaching any *other* course at this time
+            # Use the original-cased faculty name (not .upper()) so the _add_error dedup key
+            # matches with the pair already reported by Section 3's faculty conflict check above.
+            fac_orig = next((s.get('instructor') or '' for s in t_sessions if s.get('instructor')), fac)
             for osess in all_sessions:
                 o_code = (osess.get("course_code") or "").split("-")[0].strip().upper()
                 if o_code == code: continue
@@ -1012,13 +1458,77 @@ def run_verification_on_sessions(
                 if o_fac == fac:
                     o_tb = osess.get("time_block")
                     if o_tb and o_tb.day == target_tb.day and o_tb.overlaps(target_tb):
+                        if FACULTY_VERIFY_REQUIRE_SHARED_PROGRAM_SEMESTER:
+                            sem_o = program_semester_numbers_from_session_payload(osess)
+                            sem_t = set()
+                            for ts in t_sessions:
+                                sem_t |= set(program_semester_numbers_from_session_payload(ts))
+                            sem_tf = frozenset(sem_t)
+                            if sem_o and sem_tf and not (sem_o & sem_tf):
+                                continue
+                        ca, cb = sorted([code, o_code])  # alphabetical - consistent with Section 3
                         _add_error(
-                            "Faculty Conflict",
-                            f"Combined course {code} cannot be at {t_str} because faculty {fac} is busy teaching {o_code}",
-                            code, ", ".join(set(all_secs)), target_tb.day,
+                            "Faculty conflict",  # lowercase - matches Section 3 rule name for dedup
+                            f"Faculty {fac_orig} has overlapping sessions: {ca} and {cb} on {target_tb.day} {target_tb.start.strftime('%H:%M')}-{target_tb.end.strftime('%H:%M')}",
+                            ca, "", target_tb.day,
                             f"{target_tb.start.strftime('%H:%M')}-{target_tb.end.strftime('%H:%M')}"
                         )
                         break
+
+    # 7) LTPSC compliance: full semester (PRE+POST) totals vs course_data for every
+    #    course code that actually appears on the schedule for that section.
+    for sec_obj in sections or []:
+        sec_label = str(getattr(sec_obj, "label", "") or "").strip()
+        if not sec_label:
+            continue
+        codes: Set[str] = set()
+        for s in all_sessions:
+            if str(s.get("phase", "")).startswith("Phase 3"):
+                continue
+            raw = (s.get("course_code") or "").strip()
+            if not raw:
+                continue
+            code = raw.split("-")[0].strip().upper()
+            if not code or "ELECTIVE_BASKET" in code:
+                continue
+            secs = s.get("sections") or []
+            if isinstance(secs, str):
+                secs = [secs]
+            if sec_label not in [str(x).strip() for x in secs if str(x).strip()]:
+                continue
+            codes.add(code)
+
+        seen_ltpsc: Set[Tuple[str, str]] = set()
+        for code in sorted(codes):
+            course_obj = _find_course_for_section(code, sec_obj)
+            if course_obj is None or not getattr(course_obj, "ltpsc", None):
+                continue
+            ltpsc_key = str(getattr(course_obj, "ltpsc", "") or "")
+            dedup = (str(course_obj.code).strip().upper(), ltpsc_key)
+            if dedup in seen_ltpsc:
+                continue
+            seen_ltpsc.add(dedup)
+            compliance = verifier.verify_ltpsc_compliance(
+                course_obj, all_sessions, sec_obj, period=None
+            )
+            sat = compliance.get("satisfied") or {}
+            if sat.get("lectures") and sat.get("tutorials") and sat.get("labs"):
+                continue
+            req = compliance.get("required") or {}
+            got = compliance.get("scheduled") or {}
+            _add_error(
+                "LTPSC compliance",
+                (
+                    f"LTPSC mismatch for {course_obj.code} in {sec_label}: "
+                    f"expected L/T/P={req.get('lectures')}/{req.get('tutorials')}/{req.get('labs')}, "
+                    f"scheduled {got.get('lectures')}/{got.get('tutorials')}/{got.get('labs')} "
+                    f"(full semester PRE+POST)"
+                ),
+                str(course_obj.code),
+                sec_label,
+                "",
+                "",
+            )
 
     return (len(errors) == 0, errors)
 

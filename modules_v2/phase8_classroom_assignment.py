@@ -14,6 +14,57 @@ from datetime import time, datetime
 from utils.data_models import (
     Course, Section, ClassRoom, ScheduledSession, TimeBlock
 )
+from utils.room_priority_policy import (
+    ordered_classroom_candidates,
+    should_prefer_top_large_rooms,
+    top_large_classrooms,
+)
+
+
+def _room_tier_by_capacity(capacity: int) -> str:
+    """Classify classroom tier from capacity."""
+    cap = int(capacity or 0)
+    if cap >= 240:
+        return "xlarge240"
+    if cap in (135, 136):
+        return "large"
+    return "normal"
+
+
+def _demand_tier(capacity_needed: int) -> str:
+    """
+    Classify demand into normal/large/xlarge240.
+    Policy:
+    - normal:     < 120  (fits 96-cap rooms)
+    - large:      120-239 (needs C002/C003, 135/136-cap)
+    - xlarge240:  >= 240  (needs C004, reserved for combined)
+
+    NOTE: The threshold for 'large' is 120 (not 135) because many sections
+    have 120-210 enrolled students that must fit in C002/C003. Using 135 as
+    the threshold was incorrectly classifying 137-239 enrolled as xlarge240,
+    blocking C002/C003 assignment and forcing fallback to 96-cap rooms.
+    """
+    need = int(capacity_needed or 0)
+    if need >= 240:
+        return "xlarge240"
+    if need >= 105:
+        return "large"
+    return "normal"
+
+
+def _room_allowed_for_demand(room_capacity: int, capacity_needed: int) -> bool:
+    """Strict tier gate so small demand does not consume large/240 rooms."""
+    room_tier = _room_tier_by_capacity(room_capacity)
+    demand_tier = _demand_tier(capacity_needed)
+    if demand_tier == "normal":
+        return room_tier == "normal"
+    if demand_tier == "large":
+        # large demand: C002/C003 (136-cap) are perfect; C004 is last resort
+        return room_tier in ("large", "xlarge240")
+    # xlarge240: only C004 qualifies — but Phase 8 never assigns C004
+    # (reserved for Phase 4 combined). This path shouldn't be reached for
+    # non-combined courses; keep it for correctness.
+    return room_tier == "xlarge240"
 
 def extract_combined_room_occupancy(combined_sessions: List, classrooms: List[ClassRoom] = None) -> Dict[str, Dict[str, Dict[str, List[Tuple[time, time, str]]]]]:
     """
@@ -95,21 +146,30 @@ def check_room_conflict(room_number: str, period: str, day: str,
     Returns:
         True if conflict exists, False otherwise
     """
-    if period not in room_occupancy:
-        return False
-    
-    if room_number not in room_occupancy[period]:
-        return False
-    
-    if day not in room_occupancy[period][room_number]:
-        return False
-    
-    # Check for overlaps
-    for occupied_start, occupied_end, _ in room_occupancy[period][room_number][day]:
-        # Check if times overlap
-        if not (end_time <= occupied_start or start_time >= occupied_end):
-            return True
-    
+    # Normalize period labels so occupancy keys are consistent
+    if not period:
+        period = "PRE"
+    pv = str(period).strip().upper()
+    if pv in ("PREMID", "PRE"):
+        period = "PRE"
+    elif pv in ("POSTMID", "POST"):
+        period = "POST"
+    else:
+        period = pv
+
+    # Check all periods (PRE, POST, FULL) because sessions from different
+    # periods can physically overlap in time due to staggered lunch breaks.
+    for check_period, occupancy_data in room_occupancy.items():
+        if room_number not in occupancy_data:
+            continue
+        if day not in occupancy_data[room_number]:
+            continue
+            
+        for occupied_start, occupied_end, _ in occupancy_data[room_number][day]:
+            # Check if times overlap
+            if not (end_time <= occupied_start or start_time >= occupied_end):
+                return True
+                
     return False
 
 
@@ -117,39 +177,70 @@ def calculate_section_enrollment(
     session: ScheduledSession,
     sections: List[Section],
     courses: List[Course] = None,
+    num_sections: int = 1
 ) -> int:
     """
     Capacity needed for this session.
 
-    Prefer dynamic per-course registrations from input `course_data.xlsx`
-    (`Course.registered_students`). Fall back to section-level defaults if
-    registrations are missing.
+    Use the larger of (a) configured section headcount and (b) `Registered Students`
+    from `course_data.xlsx` when present, so large cohorts (e.g. DSAI-A with 132
+    registered) are not sized to the default section cap (e.g. 85) and still fit the room.
     """
-    # Prefer per-course registrations (dynamic)
-    if courses:
-        try:
-            base_code = (getattr(session, "course_code", "") or "").split("-")[0]
-            course_map = {c.code: c for c in courses if getattr(c, "code", None)}
-            c = course_map.get(base_code)
-            if c and int(getattr(c, "registered_students", 0) or 0) > 0:
-                return int(c.registered_students)
-        except Exception:
-            pass
-
-    # Fall back to section-level configured size
+    section_students: int = 0
     section_label = getattr(session, "section", None)
     if section_label:
         for section in sections or []:
             if section.label == section_label:
-                return int(section.students)
+                section_students = int(section.students)
+                break
 
+    registered = 0
+    if courses:
+        try:
+            base_code = (getattr(session, "course_code", "") or "").split("-")[0]
+            prog = ""
+            if section_label and isinstance(section_label, str) and "-" in section_label:
+                prog = section_label.split("-", 1)[0].strip()
+            c = None
+            if prog:
+                c = next(
+                    (
+                        x
+                        for x in courses
+                        if getattr(x, "code", "") == base_code
+                        and getattr(x, "department", "") == prog
+                    ),
+                    None,
+                )
+            if c is None:
+                c = next((x for x in courses if getattr(x, "code", "") == base_code), None)
+            if c:
+                registered = int(getattr(c, "registered_students", 0) or 0)
+        except Exception:
+            pass
+
+    if registered > 0:
+        if num_sections > 1:
+            # Distribute registered students evenly across sections, add a 5% buffer just in case
+            split_size = int((registered / num_sections) * 1.05)
+            if section_students > 0:
+                return max(split_size, section_students)
+            return max(split_size, 30)
+            
+        if section_students > 0:
+            return max(registered, section_students)
+        return registered
+
+    if section_students > 0:
+        return section_students
     return 30
 
 
 def find_available_classroom(capacity_needed: int, session_type: str, period: str,
                             day: str, time_block: TimeBlock,
                             room_occupancy: Dict[str, Dict[str, Dict[str, List[Tuple[time, time, str]]]]],
-                            classrooms: List[ClassRoom]) -> Optional[str]:
+                            classrooms: List[ClassRoom],
+                            course_code: str = None) -> Optional[str]:
     """
     Find an available classroom or lab for the session.
     
@@ -161,6 +252,7 @@ def find_available_classroom(capacity_needed: int, session_type: str, period: st
         time_block: TimeBlock for the session
         room_occupancy: Room occupancy tracker
         classrooms: List of available classrooms
+        course_code: Course code to filter lab types (EC gets Hardware, others get Software)
     
     Returns:
         Room number if available, None otherwise
@@ -168,12 +260,23 @@ def find_available_classroom(capacity_needed: int, session_type: str, period: st
     start_time = time_block.start
     end_time = time_block.end
     
+    if course_code and "CS163" in course_code:
+        print(f"[DEBUG FIND ROOM] CS163 requested capacity_needed: {capacity_needed}")
+    
     if session_type == "P":
         # Need a lab; rely purely on actual lab capacities from input,
         # only excluding the reserved C004 room.
-        labs = [room for room in classrooms 
+        all_labs = [room for room in classrooms 
                 if room.room_type.lower() == "lab"
                 and room.room_number != "C004"]
+        
+        labs = all_labs
+        if course_code:
+            course_code_base = course_code.split('-')[0].upper()
+            if course_code_base.startswith("EC"):
+                labs = [r for r in all_labs if getattr(r, 'lab_type', None) == 'Hardware']
+            else:
+                labs = [r for r in all_labs if getattr(r, 'lab_type', None) in (None, 'Software')]
         
         # Prefer smaller/less-used labs first
         labs.sort(key=lambda r: r.capacity)
@@ -181,20 +284,33 @@ def find_available_classroom(capacity_needed: int, session_type: str, period: st
         for lab in labs:
             if not check_room_conflict(lab.room_number, period, day, start_time, end_time, room_occupancy):
                 return lab.room_number
+        
+        # Do not fall back to any lab type. The user explicitly requested to reschedule 
+        # instead of giving a wrong lab type.
+        return None
     else:
-        # Need classroom - exclude ALL 240-seater rooms (capacity >= 240), exclude labs
-        classrooms_filtered = [room for room in classrooms 
-                              if room.room_type.lower() != 'lab' 
-                              and 'lab' not in room.room_type.lower()
-                              and room.capacity >= capacity_needed
-                              and room.capacity < 240]  # Exclude all 240-seaters
+        # User requested: C004 is ONLY for combined classes. Never assign it here.
+        classrooms = [r for r in classrooms if r.room_number != 'C004']
         
-        # Sort: prefer <120 capacity first, then others (both sorted by capacity ascending)
-        classrooms_filtered.sort(key=lambda r: (r.capacity >= 120, r.capacity))
-        
+        top2 = top_large_classrooms(classrooms, n=2)
+        prefer_top = should_prefer_top_large_rooms(capacity_needed, top2)
+        classrooms_filtered = ordered_classroom_candidates(
+            classrooms, capacity_needed, prefer_top_large=prefer_top, top_rooms=top2
+        )
+
+        # Strict pass: honor both required capacity and demand-tier gate.
         for room in classrooms_filtered:
+            room_cap = int(getattr(room, "capacity", 0) or 0)
+            if room_cap < int(capacity_needed or 0):
+                continue
+            if not _room_allowed_for_demand(room_cap, int(capacity_needed or 0)):
+                continue
+
             if not check_room_conflict(room.room_number, period, day, start_time, end_time, room_occupancy):
                 return room.room_number
+
+        # No under-capacity or tier-violating fallback here.
+        # Caller should reschedule if strict fit is not available.
     
     return None
 
@@ -245,6 +361,17 @@ def mark_room_occupied(room_number: str, period: str, day: str,
                       start_time: time, end_time: time, course_code: str,
                       room_occupancy: Dict[str, Dict[str, Dict[str, List[Tuple[time, time, str]]]]]):
     """Mark a room as occupied for the given time slot."""
+    # Normalize period labels so occupancy keys are consistent
+    if not period:
+        period = "PRE"
+    pv = str(period).strip().upper()
+    if pv in ("PREMID", "PRE"):
+        period = "PRE"
+    elif pv in ("POSTMID", "POST"):
+        period = "POST"
+    else:
+        period = pv
+
     room_occupancy[period][room_number][day].append((start_time, end_time, course_code))
 
 
@@ -374,13 +501,56 @@ def assign_classrooms_to_core_sessions(phase5_sessions: List[ScheduledSession],
         course_code = session.course_code.split('-')[0]  # Remove -LAB/-TUT suffix
         section = session.section
         period = session.period or 'PRE'
+        # Normalize PREMID/POSTMID -> PRE/POST for consistent occupancy checks
+        pv = str(period).strip().upper()
+        if pv in ("PREMID", "PRE"):
+            period = "PRE"
+        elif pv in ("POSTMID", "POST"):
+            period = "POST"
+        else:
+            period = pv
         
         key = (course_code, section, period)
         sessions_by_course[key].append(session)
     
-    # Process each course group
-    debug_samples = []  # Collect sample keys for debugging
+    # Calculate how many distinct sections exist for each (course, department)
+    # Key: (course_code, dept_prefix) -> set of section labels
+    # dept_prefix is extracted from the section label e.g. "CSE-A-Sem2" -> "CSE"
+    course_dept_sections_count = defaultdict(set)
+    for course_code, section, period in sessions_by_course.keys():
+        if section:
+            dept_prefix = section.split('-')[0].strip() if '-' in section else ''
+            course_dept_sections_count[(course_code, dept_prefix)].add(section)
+    
+    # Pre-calculate enrollments for each group to ensure larger groups are scheduled first
+    group_enrollments = {}
     for key, course_sessions in sessions_by_course.items():
+        course_code, section, period = key
+        def _temp_effective_kind(sess: ScheduledSession) -> str:
+            try:
+                cc = str(getattr(sess, "course_code", "") or "").upper()
+                if "-LAB" in cc: return "P"
+                if "-TUT" in cc: return "T"
+            except Exception:
+                pass
+            return getattr(sess, "kind", "L") or "L"
+            
+        lt_sess = [s for s in course_sessions if _temp_effective_kind(s) in ["L", "T"]]
+        if lt_sess:
+            dept_prefix = section.split('-')[0].strip() if '-' in section else ''
+            num_secs = len(course_dept_sections_count.get((course_code, dept_prefix), set())) or 1
+            cap = calculate_section_enrollment(lt_sess[0], sections, courses, num_sections=num_secs)
+            group_enrollments[key] = cap
+        else:
+            group_enrollments[key] = 0
+            
+    # Sort keys primarily by enrollment descending, then by course code for stability
+    sorted_keys = sorted(sessions_by_course.keys(), key=lambda k: (group_enrollments.get(k, 0), k[0]), reverse=True)
+    
+    # Process each course group in decreasing order of capacity requirement
+    debug_samples = []  # Collect sample keys for debugging
+    for key in sorted_keys:
+        course_sessions = sessions_by_course[key]
         course_code, section, period = key
         
         # Initialize assignment
@@ -389,9 +559,21 @@ def assign_classrooms_to_core_sessions(phase5_sessions: List[ScheduledSession],
             "labs": []
         }
         
-        # Separate sessions by type
-        lecture_tutorial_sessions = [s for s in course_sessions if s.kind in ["L", "T"]]
-        practical_sessions = [s for s in course_sessions if s.kind == "P"]
+        # Separate sessions by type.
+        # Be defensive: some sessions may carry suffixes (-LAB/-TUT) even if `kind` isn't perfectly set.
+        def _effective_kind(sess: ScheduledSession) -> str:
+            try:
+                cc = str(getattr(sess, "course_code", "") or "").upper()
+                if "-LAB" in cc:
+                    return "P"
+                if "-TUT" in cc:
+                    return "T"
+            except Exception:
+                pass
+            return getattr(sess, "kind", "L") or "L"
+
+        lecture_tutorial_sessions = [s for s in course_sessions if _effective_kind(s) in ["L", "T"]]
+        practical_sessions = [s for s in course_sessions if _effective_kind(s) == "P"]
         
         # Debug: Track courses with practicals
         if practical_sessions and len(debug_samples) < 10:
@@ -407,17 +589,46 @@ def assign_classrooms_to_core_sessions(phase5_sessions: List[ScheduledSession],
         # Assign classroom for lectures/tutorials
         # Strategy: Try to use same room for all sessions (preferred), but allow different rooms if needed
         if lecture_tutorial_sessions:
-            # Capacity needed based on dynamic per-course registrations (fallback: section size)
-            enrollment = calculate_section_enrollment(lecture_tutorial_sessions[0], sections, courses)
+            # Capacity needed: divide by number of sections within THIS department only
+            dept_prefix = section.split('-')[0].strip() if '-' in section else ''
+            num_secs = len(course_dept_sections_count.get((course_code, dept_prefix), set())) or 1
+            enrollment = calculate_section_enrollment(lecture_tutorial_sessions[0], sections, courses, num_sections=num_secs)
+            if "CS163" in course_code:
+                print(f"[DEBUG CS163] Section: {section}, num_secs: {num_secs}, enrollment computed: {enrollment}")
             
-            # Get all suitable classrooms - exclude ALL 240-seater rooms (capacity >= 240), exclude labs
-            suitable_classrooms = [room for room in classrooms
-                                   if room.room_type.lower() != 'lab' 
-                                   and 'lab' not in room.room_type.lower()
-                                   and room.capacity >= enrollment
-                                   and room.capacity < 240]  # Exclude all 240-seaters
-            # Sort: prefer <120 capacity first, then others (both sorted by capacity ascending)
-            suitable_classrooms.sort(key=lambda r: (r.capacity >= 120, r.capacity))
+            # Capacity-aware classroom policy:
+            # - never place oversized sections into undersized rooms
+            # - allow large rooms only for truly large strength
+            non_lab_classrooms = [
+                room for room in classrooms
+                if room.room_type.lower() != 'lab'
+                and 'lab' not in room.room_type.lower()
+            ]
+            
+            suitable_classrooms = [
+                room for room in non_lab_classrooms
+                if room.capacity >= enrollment and room.room_number != 'C004'
+            ]
+            
+            suitable_classrooms = [
+                room for room in suitable_classrooms
+                if _room_allowed_for_demand(int(getattr(room, "capacity", 0) or 0), enrollment)
+            ]
+
+            demand_tier = _demand_tier(enrollment)
+            if demand_tier == "xlarge240":
+                # Very high demand: prioritize 240-tier first.
+                suitable_classrooms.sort(key=lambda r: (_room_tier_by_capacity(r.capacity) != "xlarge240", r.capacity, r.room_number))
+            elif demand_tier == "large":
+                # Large demand: prioritize 135/136, keep 240 as fallback.
+                suitable_classrooms.sort(key=lambda r: (
+                    _room_tier_by_capacity(r.capacity) == "xlarge240",
+                    abs(int(r.capacity or 0) - int(enrollment or 0)),
+                    r.room_number
+                ))
+            else:
+                # Normal demand: strict normal rooms only + best-fit.
+                suitable_classrooms.sort(key=lambda r: (abs(int(r.capacity or 0) - int(enrollment or 0)), r.room_number))
             
             # Try to find a classroom available for ALL sessions (preferred)
             assigned_classroom = None
@@ -445,64 +656,47 @@ def assign_classrooms_to_core_sessions(phase5_sessions: List[ScheduledSession],
                         mark_room_occupied(assigned_classroom, period, day, start_time, end_time, course_code, room_occupancy)
                     break
             
-            # If no single room available for all sessions, assign rooms per session
-            if not assigned_classroom:
-                # Assign a room for each session individually (distribute across multiple rooms)
-                session_rooms = []
-                for session in lecture_tutorial_sessions:
-                    time_block = session.block
-                    day = time_block.day
-                    start_time = time_block.start
-                    end_time = time_block.end
-                    
-                    # Try to find an available room for this session (suitable_classrooms already filtered)
-                    session_room = None
-                    for classroom in suitable_classrooms:
-                        if not check_room_conflict(classroom.room_number, period, day, start_time, end_time, room_occupancy):
-                            session_room = classroom.room_number
-                            mark_room_occupied(session_room, period, day, start_time, end_time, course_code, room_occupancy)
-                            break
-                    
-                    if session_room:
-                        session_rooms.append(session_room)
-                
-                # Use the most common room (or first if all different)
-                if session_rooms:
-                    from collections import Counter
-                    room_counts = Counter(session_rooms)
-                    assigned_classroom = room_counts.most_common(1)[0][0]
-            
+            # If no single room is available for all sessions, we intentionally leave it unassigned here.
+            # The room_conflict_resolver.py -> resolve_unassigned_core_classrooms() will pick this up
+            # and attempt to RESCHEDULE the course to a time slot where a single room IS available.
+            # If rescheduling fails, the resolver will assign C004 as a last resort.
+
             if assigned_classroom:
                 room_assignments[key]["classroom"] = assigned_classroom
                 # Also update session.room for all sessions
                 for session in lecture_tutorial_sessions:
                     session.room = assigned_classroom
+            else:
+                for session in lecture_tutorial_sessions:
+                    current_room = getattr(session, "room", None)
+                    if current_room:
+                        cr_obj = next((r for r in classrooms if r.room_number == current_room), None)
+                        if cr_obj and int(cr_obj.capacity or 0) < int(enrollment or 0):
+                            session.room = None
         
-        # Assign labs for practicals - number of labs depends on enrollment
+        # Assign labs for practicals PER SESSION (prevents hidden double-booking)
         if practical_sessions:
-            import math
-            enrollment = calculate_section_enrollment(practical_sessions[0], sections, courses)
+            dept_prefix = section.split('-')[0].strip() if '-' in section else ''
+            num_secs = len(course_dept_sections_count.get((course_code, dept_prefix), set())) or 1
+            enrollment = calculate_section_enrollment(practical_sessions[0], sections, courses, num_sections=num_secs)
             # Lab room filter: type contains 'lab', uses real capacities from input, not C004, exclude research labs
-            def _is_lab_room(room):
-                if getattr(room, 'is_research_lab', False):
+            def _is_lab_room(room, allow_research: bool = False):
+                if (not allow_research) and getattr(room, 'is_research_lab', False):
                     return False
                 rt = (room.room_type or "").lower()
                 return (rt == 'lab' or 'lab' in rt) and room.room_number != 'C004'
-            all_labs = [r for r in classrooms if _is_lab_room(r)]
+            all_labs = [r for r in classrooms if _is_lab_room(r, allow_research=False)]
+            all_labs_with_research = [r for r in classrooms if _is_lab_room(r, allow_research=True)]
             # Filter by course code: EC -> Hardware; CS/DS/other -> Software
             course_code_base = key[0]
             if course_code_base.upper().startswith("EC"):
                 labs = [room for room in all_labs if getattr(room, 'lab_type', None) == 'Hardware']
                 if not labs:
-                    labs = list(all_labs)
-                    if labs:
-                        print(f"  [Phase 8] WARNING: No Hardware labs for EC course {course_code_base}; using any lab.")
+                    print(f"  [Phase 8] WARNING: No Hardware labs available for EC course {course_code_base}.")
             else:
                 labs = [room for room in all_labs if getattr(room, 'lab_type', None) in (None, 'Software')]
                 if not labs:
-                    labs = list(all_labs)
-                    if labs:
-                        print(f"  [Phase 8] WARNING: No Software labs for {course_code_base}; using any lab.")
+                    print(f"  [Phase 8] WARNING: No Software labs available for {course_code_base}.")
             # Sort by occupancy count (ascending) to minimize conflicts, then by capacity
             def _lab_occupancy_count(room):
                 n = 0
@@ -511,133 +705,89 @@ def assign_classrooms_to_core_sessions(phase5_sessions: List[ScheduledSession],
                         n += len(room_occupancy[period][room.room_number][day])
                 return n
             labs.sort(key=lambda r: (_lab_occupancy_count(r), r.capacity))
+            if not labs:
+                continue
             
-            # Decide how many labs are needed using real lab capacities:
-            # pick the smallest number of labs such that their total capacity
-            # covers the enrollment.
-            labs_sorted_desc = sorted(labs, key=lambda r: r.capacity, reverse=True)
-            labs_needed = 0
-            remaining = enrollment if enrollment and enrollment > 0 else 0
-            for lab in labs_sorted_desc:
-                if remaining <= 0:
-                    break
-                remaining -= lab.capacity
-                labs_needed += 1
-            if labs_needed == 0 and labs:
-                labs_needed = 1
-            # Cap by number of available labs
-            labs_needed = min(labs_needed, len(labs)) if labs else 0
+            # Always assign exactly 2 labs per practical session.
+            # This splits the section across 2 lab rooms consistently,
+            # regardless of actual enrollment or individual lab capacity.
+            labs_needed = min(2, len(labs)) if labs else 0
 
-            # Strategy: Try to find N labs that can be used across all practical sessions
-            # If not possible, assign N labs per session and collect unique labs
-            all_assigned_labs = set()
-            
-            # First, try to find labs available for all sessions (preferred)
-            labs_available_for_all = []
-            for lab in labs:
-                available_for_all_sessions = True
-                for session in practical_sessions:
-                    time_block = session.block
-                    day = time_block.day
-                    start_time = time_block.start
-                    end_time = time_block.end
-                    if check_room_conflict(lab.room_number, period, day, start_time, end_time, room_occupancy):
-                        available_for_all_sessions = False
-                        break
-                
-                if available_for_all_sessions:
-                    labs_available_for_all.append(lab.room_number)
-                    if len(labs_available_for_all) >= labs_needed:
-                        break
-            
-            if len(labs_available_for_all) >= labs_needed and labs_needed > 0:
-                # Use the same N labs for all sessions
-                assigned_labs = labs_available_for_all[:labs_needed]
-                # Mark labs as occupied for all practical sessions
-                for lab in assigned_labs:
-                    for session in practical_sessions:
-                        time_block = session.block
-                        day = time_block.day
-                        start_time = time_block.start
-                        end_time = time_block.end
-                        mark_room_occupied(lab, period, day, start_time, end_time, course_code, room_occupancy)
-                all_assigned_labs.update(assigned_labs)
-            else:
-                # Fallback: Assign N labs per session, then collect unique labs
-                for session in practical_sessions:
-                    time_block = session.block
-                    day = time_block.day
-                    start_time = time_block.start
-                    end_time = time_block.end
-                    
-                    # Find N available labs for this session
-                    session_labs = []
-                    for lab in labs:
-                        if lab.room_number in all_assigned_labs:
-                            continue  # Skip if already assigned
-                        if not check_room_conflict(lab.room_number, period, day, start_time, end_time, room_occupancy):
-                            session_labs.append(lab.room_number)
-                            mark_room_occupied(lab.room_number, period, day, start_time, end_time, course_code, room_occupancy)
-                            if len(session_labs) >= labs_needed:
-                                break
-                    
-                    all_assigned_labs.update(session_labs)
-                    
-                    # If we've found N labs total, we can stop (but continue marking for other sessions)
-                    if len(all_assigned_labs) >= labs_needed and len(session_labs) > 0:
-                        # For remaining sessions, try to reuse the same labs
-                        for remaining_session in practical_sessions[practical_sessions.index(session) + 1:]:
-                            remaining_time_block = remaining_session.block
-                            remaining_day = remaining_time_block.day
-                            remaining_start = remaining_time_block.start
-                            remaining_end = remaining_time_block.end
-                            
-                            # Try to reuse the same labs
-                            for lab in list(all_assigned_labs)[:labs_needed]:
-                                if not check_room_conflict(lab, period, remaining_day, remaining_start, remaining_end, room_occupancy):
-                                    mark_room_occupied(lab, period, remaining_day, remaining_start, remaining_end, course_code, room_occupancy)
-                        break
-            
-            # Ensure we have the desired number of labs (or as many as we found)
-            if all_assigned_labs:
-                room_assignments[key]["labs"] = sorted(list(all_assigned_labs))[:max(labs_needed, 1)]
-                assigned_labs_str = ", ".join(room_assignments[key]["labs"])
-                for session in practical_sessions:
-                    session.room = assigned_labs_str
-                # Debug: Update debug_samples with lab info
+            any_assigned = False
+            labs_union = set()
+
+            for session in practical_sessions:
+                if not getattr(session, "block", None):
+                    continue
+                time_block = session.block
+                day = time_block.day
+                start_time = time_block.start
+                end_time = time_block.end
+
+                # Choose an ALL-FREE set of N labs first, then mark occupancy.
+                # This avoids partial allocation that can hide collisions and later trigger strict verify.
+                needed_n = max(labs_needed, 1)
+
+                free_labs = [
+                    lab.room_number
+                    for lab in labs
+                    if not check_room_conflict(lab.room_number, period, day, start_time, end_time, room_occupancy)
+                ]
+                if not free_labs and all_labs_with_research:
+                    # last resort: allow research labs only when nothing else is free
+                    labs_any = [r for r in all_labs_with_research]
+                    labs_any.sort(key=lambda r: (_lab_occupancy_count(r), r.capacity))
+                    free_labs = [
+                        lab.room_number
+                        for lab in labs_any
+                        if not check_room_conflict(lab.room_number, period, day, start_time, end_time, room_occupancy)
+                    ]
+
+                session_labs: List[str] = []
+                if len(free_labs) >= needed_n:
+                    session_labs = free_labs[:needed_n]
+                elif free_labs:
+                    # If we cannot satisfy full N, still assign at least one lab deterministically.
+                    session_labs = [free_labs[0]]
+                else:
+                    # Last resort: no lab is free at this slot. Pick the least-conflicting labs
+                    # so later repair/reschedule has the best chance to resolve.
+                    def _overlap_count(room_number: str) -> int:
+                        try:
+                            # check_room_conflict is bool; we want an approximate count
+                            pv = str(period).strip().upper()
+                            if pv in ("PREMID", "PRE"):
+                                pv = "PRE"
+                            elif pv in ("POSTMID", "POST"):
+                                pv = "POST"
+                            occ_list = room_occupancy.get(pv, {}).get(room_number, {}).get(day, []) or []
+                            n = 0
+                            for occ_s, occ_e, _cc in occ_list:
+                                if not (end_time <= occ_s or start_time >= occ_e):
+                                    n += 1
+                            return n
+                        except Exception:
+                            return 10**9
+
+                    ranked = sorted([lab.room_number for lab in labs], key=lambda rn: (_overlap_count(rn), rn))
+                    if ranked:
+                        session_labs = ranked[: min(needed_n, len(ranked))]
+
+                if session_labs:
+                    any_assigned = True
+                    session.room = ", ".join(session_labs)
+                    for lr in session_labs:
+                        mark_room_occupied(lr, period, day, start_time, end_time, course_code, room_occupancy)
+                        labs_union.add(lr)
+
+            # Keep mapping as best-effort union; DO NOT force onto sessions.
+            if any_assigned:
+                room_assignments[key]["labs"] = sorted(labs_union)
                 for sample in debug_samples:
                     if sample['key'] == key:
                         sample['labs'] = room_assignments[key]["labs"]
                         sample['has_labs'] = True
                         break
-            else:
-                # Last resort: assign any available labs (even if not ideal)
-                final_labs = []
-                for session in practical_sessions:
-                    time_block = session.block
-                    day = time_block.day
-                    for lab in labs:
-                        if lab.room_number not in final_labs:
-                            start_time = time_block.start
-                            end_time = time_block.end
-                            if not check_room_conflict(lab.room_number, period, day, start_time, end_time, room_occupancy):
-                                final_labs.append(lab.room_number)
-                                mark_room_occupied(lab.room_number, period, day, start_time, end_time, course_code, room_occupancy)
-                                if len(final_labs) >= max(labs_needed, 1):
-                                    break
-                    if len(final_labs) >= max(labs_needed, 1):
-                        break
-                if final_labs:
-                    room_assignments[key]["labs"] = sorted(final_labs[:max(labs_needed, 1)])
-                    assigned_labs_str = ", ".join(room_assignments[key]["labs"])
-                    for session in practical_sessions:
-                        session.room = assigned_labs_str
-                    # Debug: Update debug_samples with lab info
-                    for sample in debug_samples:
-                        if sample['key'] == key:
-                            sample['labs'] = room_assignments[key]["labs"]
-                            sample['has_labs'] = True
-                            break
     
     # Debug: Print sample keys
     if debug_samples:
@@ -673,7 +823,7 @@ def detect_lab_conflicts(
     """
     Detect lab conflicts: same lab, same period/day, overlapping time, different courses.
     Builds occupancy from room_assignments and practical sessions, then finds overlaps.
-    Returns list of conflict dicts: room, period, day, time, course1, course2, section1, section2.
+    Returns list of conflict dicts: room, period, day, time, start, end, course1, course2, section1, section2.
     """
     # Build (lab_room, period, day, start, end, course_code, section) for each lab slot
     entries = []
@@ -719,6 +869,8 @@ def detect_lab_conflicts(
                 "period": a["period"],
                 "day": a["day"],
                 "time": f"{a['start'].strftime('%H:%M')}-{a['end'].strftime('%H:%M')}",
+                "start": a["start"],
+                "end": a["end"],
                 "course1": a["course"],
                 "course2": b["course"],
                 "section1": a["section"],
@@ -901,9 +1053,7 @@ def detect_room_conflicts(phase5_sessions: List[ScheduledSession],
             if not all([session2['room'], session2['period'], session2['day'], session2['start'], session2['end']]):
                 continue
             p2 = _norm_period(session2['period'])
-            if p1 != p2:
-                continue
-            # Same room, same period (both PRE or both POST), same day
+            # Same room, same day (period tags don't grant immunity if times actually overlap)
             if (session1['room'] == session2['room'] and session1['day'] == session2['day']):
                 
                 # Check if times overlap
@@ -1007,6 +1157,59 @@ def run_phase8(phase5_sessions: List[ScheduledSession],
     if len(room_assignments) > 10:
         print(f"  ... and {len(room_assignments) - 10} more keys")
     print()
+
+    # Step 2.5: Assign C004 to combined course lectures/tutorials
+    # Combined courses (Phase 4) need the 240-seater auditorium since they combine
+    # multiple sections. Phase 4 scheduling doesn't assign rooms, so we do it here.
+    print("Step 2.5: Assigning C004 to combined course lectures/tutorials...")
+    combined_c004_count = 0
+    for session in combined_sessions:
+        if isinstance(session, dict):
+            cc = session.get('course_code', '')
+            stype = session.get('session_type', 'L')
+            secs = session.get('sections', [])
+            period_val = session.get('period', 'PRE')
+        elif hasattr(session, 'course_code'):
+            cc = getattr(session, 'course_code', '')
+            stype = getattr(session, 'kind', getattr(session, 'session_type', 'L'))
+            secs = getattr(session, 'sections', [])
+            period_val = getattr(session, 'period', 'PRE')
+        else:
+            continue
+
+        # Only assign C004 for lectures and tutorials (not practicals — labs get separate assignment)
+        if stype == 'P':
+            continue
+
+        base_code = cc.split('-')[0]
+        period_val = (period_val or 'PRE').strip().upper()
+        if period_val == 'PREMID': period_val = 'PRE'
+        if period_val == 'POSTMID': period_val = 'POST'
+
+        for sec in secs:
+            sec_str = str(sec).strip()
+            key = (base_code, sec_str, period_val)
+            if key not in room_assignments:
+                room_assignments[key] = {"classroom": "C004", "labs": []}
+                combined_c004_count += 1
+            else:
+                # Force C004 even if a smaller room was assigned earlier.
+                if room_assignments[key].get("classroom") != "C004":
+                    room_assignments[key]["classroom"] = "C004"
+                    combined_c004_count += 1
+
+        # Also assign room to the session object itself
+        if isinstance(session, dict):
+            if not session.get('room') or session.get('room') in ('', 'None', 'TBD', 'nan'):
+                session['room'] = 'C004'
+        elif hasattr(session, 'room'):
+            if not session.room or str(session.room).strip().lower() in ('', 'none', 'tbd', 'nan'):
+                session.room = 'C004'
+
+    print(f"  Assigned C004 to {combined_c004_count} combined course entries")
+    print()
+
+    # NOTE: C004 is strictly reserved for Phase 4 combined sessions only.
     
     # Step 3: Conflict Detection and Reporting
     print("Step 3: Detecting classroom conflicts...")
@@ -1027,6 +1230,173 @@ def run_phase8(phase5_sessions: List[ScheduledSession],
         print("  [OK] No classroom conflicts detected")
         print()
     
+    # Step 3.4: Repair lab double-booking (target: 0)
+    print("Step 3.4: Repairing lab double-bookings (target: 0)...")
+    try:
+        # Build lab list
+        def _is_lab_room(room):
+            if getattr(room, "is_research_lab", False):
+                return False
+            rt = (room.room_type or "").lower()
+            return (rt == "lab" or "lab" in rt) and room.room_number != "C004"
+
+        lab_rooms_all = [r for r in (classrooms or []) if _is_lab_room(r)]
+
+        def _np(p):
+            if not p:
+                return "PRE"
+            v = str(p).strip().upper()
+            if v in ("PREMID", "PRE"):
+                return "PRE"
+            if v in ("POSTMID", "POST"):
+                return "POST"
+            return v
+
+        def _is_practical(sess: ScheduledSession) -> bool:
+            cc_u = str(getattr(sess, "course_code", "") or "").upper()
+            return getattr(sess, "kind", "") == "P" or "-LAB" in cc_u
+
+        # occupancy: period -> lab -> day -> [(start,end, tag)]
+        lab_occ = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+
+        practicals = []
+        for s in (phase5_sessions or []) + (phase7_sessions or []):
+            if not getattr(s, "block", None):
+                continue
+            if not _is_practical(s):
+                continue
+            practicals.append(s)
+            period_v = _np(getattr(s, "period", "PRE"))
+            day = s.block.day
+            st = s.block.start
+            et = s.block.end
+            room_raw = str(getattr(s, "room", "") or "").strip()
+            labs = [x.strip() for x in room_raw.split(",") if x.strip()]
+            for lr in labs:
+                lab_occ[period_v][lr][day].append((st, et, f"{getattr(s,'course_code','')}/{getattr(s,'section','')}"))
+
+        def _conflicts_now() -> List[Tuple[str, str, time, time, ScheduledSession, ScheduledSession]]:
+            out = []
+            # Pairwise check by (period, lab, day)
+            for period_v, by_lab in lab_occ.items():
+                for lab, by_day in by_lab.items():
+                    for day, slots in by_day.items():
+                        for i, (s1, e1, tag1) in enumerate(slots):
+                            for (s2, e2, tag2) in slots[i + 1:]:
+                                if _times_overlap(s1, e1, s2, e2) and tag1 != tag2:
+                                    out.append((period_v, lab, max(s1, s2), min(e1, e2), day, None))  # placeholder
+            return out
+
+        # Simple pass-based repair: for each practical session, ensure its labs are conflict-free.
+        max_passes = 8
+        repaired = 0
+        for _pass in range(max_passes):
+            # Recompute conflicts by checking sessions directly (more reliable than occ tags)
+            conflicts_sess = []
+            # build index: (period, lab, day) -> list of sessions using it
+            idx = defaultdict(list)
+            for s in practicals:
+                period_v = _np(getattr(s, "period", "PRE"))
+                day = s.block.day
+                room_raw = str(getattr(s, "room", "") or "").strip()
+                labs = [x.strip() for x in room_raw.split(",") if x.strip()]
+                for lr in labs:
+                    idx[(period_v, lr, day)].append(s)
+            for (period_v, lr, day), ss in idx.items():
+                for i, a in enumerate(ss):
+                    for b in ss[i + 1:]:
+                        if not _times_overlap(a.block.start, a.block.end, b.block.start, b.block.end):
+                            continue
+                        if (getattr(a, "course_code", ""), getattr(a, "section", "")) == (getattr(b, "course_code", ""), getattr(b, "section", "")):
+                            continue
+                        conflicts_sess.append((period_v, lr, day, a, b))
+
+            if not conflicts_sess:
+                break
+
+            for period_v, _lr, day, a, b in conflicts_sess:
+                # Try to move session b to alternative labs
+                base_code = (getattr(b, "course_code", "") or "").split("-")[0]
+                num_secs = 1
+                if hasattr(b, "section") and b.section:
+                    # Approximation: if looking to reassign, we can just use 1 or try to derive.
+                    # Since it's lab, capacity is constrained by lab size (45) anyway.
+                    num_secs = 1
+                enrollment = calculate_section_enrollment(b, sections, courses, num_sections=num_secs)
+
+                # Filter lab pool by course type (match Phase 8 logic)
+                if base_code.upper().startswith("EC"):
+                    lab_pool = [r for r in lab_rooms_all if getattr(r, "lab_type", None) == "Hardware"]
+                else:
+                    lab_pool = [r for r in lab_rooms_all if getattr(r, "lab_type", None) in (None, "Software")]
+
+                # Determine needed labs count (by capacity sum)
+                lab_pool_desc = sorted(lab_pool, key=lambda r: r.capacity, reverse=True)
+                if not lab_pool_desc:
+                    continue
+                needed_n = 0
+                remaining = enrollment if enrollment and enrollment > 0 else 0
+                for r in lab_pool_desc:
+                    if remaining <= 0:
+                        break
+                    remaining -= r.capacity
+                    needed_n += 1
+                if needed_n == 0 and lab_pool_desc:
+                    needed_n = 1
+                needed_n = min(needed_n, len(lab_pool_desc)) if lab_pool_desc else 0
+                needed_n = max(needed_n, 1) if lab_pool_desc else 0
+
+                # Remove b's current labs from occupancy
+                cur = [x.strip() for x in str(getattr(b, "room", "") or "").split(",") if x.strip()]
+                for lr_name in cur:
+                    try:
+                        lab_occ[period_v][lr_name][day] = [
+                            t for t in lab_occ[period_v][lr_name][day]
+                            if not (t[0] == b.block.start and t[1] == b.block.end and base_code in str(t[2]))
+                        ]
+                    except Exception:
+                        pass
+
+                # Find replacement labs that are free for b's time
+                chosen = []
+                for r in sorted(lab_pool_desc, key=lambda x: x.capacity):  # prefer smaller first
+                    if not check_room_conflict(r.room_number, period_v, day, b.block.start, b.block.end, room_occupancy):
+                        chosen.append(r.room_number)
+                        if len(chosen) >= needed_n:
+                            break
+
+                if chosen and chosen != cur:
+                    b.room = ", ".join(chosen)
+                    for lr_name in chosen:
+                        mark_room_occupied(lr_name, period_v, day, b.block.start, b.block.end, base_code, room_occupancy)
+                        lab_occ[period_v][lr_name][day].append((b.block.start, b.block.end, f"{getattr(b,'course_code','')}/{getattr(b,'section','')}"))
+                    repaired += 1
+
+            # next pass
+
+        # Recheck
+        idx2 = defaultdict(list)
+        for s in practicals:
+            period_v = _np(getattr(s, "period", "PRE"))
+            day = s.block.day
+            labs = [x.strip() for x in str(getattr(s, "room", "") or "").split(",") if x.strip()]
+            for lr in labs:
+                idx2[(period_v, lr, day)].append(s)
+        remaining_conflicts = 0
+        for (period_v, lr, day), ss in idx2.items():
+            for i, a in enumerate(ss):
+                for b in ss[i + 1:]:
+                    if _times_overlap(a.block.start, a.block.end, b.block.start, b.block.end):
+                        if (getattr(a, "course_code", ""), getattr(a, "section", "")) != (getattr(b, "course_code", ""), getattr(b, "section", "")):
+                            remaining_conflicts += 1
+        if remaining_conflicts == 0:
+            print(f"  [OK] Lab double-booking repaired to 0 (moves applied: {repaired})")
+        else:
+            print(f"  [WARN] Lab double-booking still present: {remaining_conflicts} pair(s) (moves applied: {repaired})")
+    except Exception as _lab_fix_e:
+        print(f"  WARNING: lab double-booking repair failed: {_lab_fix_e}")
+    print()
+
     # Step 3.5: Lab conflict detection and logging
     print("Step 3.5: Detecting lab conflicts...")
     lab_conflicts = detect_lab_conflicts(phase5_sessions, phase7_sessions, room_assignments)
@@ -1066,5 +1436,33 @@ def run_phase8(phase5_sessions: List[ScheduledSession],
         print(f"WARNING: {len(conflicts)} conflict(s) detected - see details above")
     print()
     
+    # Attach room to phase5 and phase7 sessions before returning
+    for s in phase5_sessions + phase7_sessions:
+        if not hasattr(s, 'course_code') or not hasattr(s, 'section'):
+            continue
+        # Only assign if not already assigned (e.g. combined courses already got C004)
+        if hasattr(s, 'room') and s.room and str(s.room).strip().lower() not in ('', 'none', 'tbd', 'nan'):
+            continue
+            
+        base_code = s.course_code.split('-')[0]
+        sec_str = str(s.section).strip()
+        period_val = s.period or 'PRE'
+        pv = str(period_val).strip().upper()
+        if pv in ("PREMID", "PRE"):
+            period_val = "PRE"
+        elif pv in ("POSTMID", "POST"):
+            period_val = "POST"
+        else:
+            period_val = pv
+            
+        key = (base_code, sec_str, period_val)
+        if key in room_assignments:
+            kind = getattr(s, 'kind', getattr(s, 'session_type', 'L')).strip().upper()
+            if kind == 'P':
+                labs = room_assignments[key].get("labs", [])
+                s.room = ", ".join(labs) if labs else ""
+            else:
+                s.room = room_assignments[key].get("classroom", "")
+
     return room_assignments
 

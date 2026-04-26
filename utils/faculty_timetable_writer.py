@@ -130,12 +130,17 @@ def _collect_faculty_sessions(
             period_raw = session.get("period", "PRE")
             course_code = session.get("course_code", "UNKNOWN")
             sections = session.get("sections") or []
+            single_section = session.get("section")
             room = session.get("room")
 
             if sections and isinstance(sections, (list, tuple)):
                 section_str = ",".join(str(s) for s in sections)
+            elif sections:
+                 section_str = str(sections)
+            elif single_section:
+                 section_str = str(single_section)
             else:
-                section_str = str(sections) if sections else ""
+                 section_str = ""
         else:
             faculty = getattr(session, "faculty", None)
             block = getattr(session, "block", None)
@@ -145,19 +150,30 @@ def _collect_faculty_sessions(
             room = getattr(session, "room", None)
             section_str = str(section)
 
-        if not faculty or faculty in ("TBD", "Various", "-"):
+        if not faculty or str(faculty).lower() == "nan" or str(faculty) in ("TBD", "Various", "-"):
             continue
         if not block or not getattr(block, "start", None) or not getattr(block, "end", None):
             continue
 
         period = _normalize_period(period_raw)
 
+        start_time = block.start
+        end_time = block.end
+        for t_var in [start_time, end_time]:
+            if isinstance(t_var, str):
+                try:
+                    fmt = "%H:%M:%S" if len(t_var.split(":")) == 3 else "%H:%M"
+                    if t_var == start_time: start_time = datetime.strptime(t_var, fmt).time()
+                    else: end_time = datetime.strptime(t_var, fmt).time()
+                except Exception:
+                    pass
+
         faculty_sessions[faculty].append(
             {
                 "day": block.day,
                 "period": period,
-                "start": block.start,
-                "end": block.end,
+                "start": start_time,
+                "end": end_time,
                 "course_code": course_code,
                 "section": section_str,
                 "room": room,

@@ -13,7 +13,7 @@ from typing import List, Dict, Tuple
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from utils.data_models import TimeSlot, TimeBlock, DayScheduleGrid
-from config.schedule_config import WORKING_DAYS
+from config.schedule_config import WORKING_DAYS, LUNCH_WINDOWS
 
 def generate_base_time_slots() -> List[TimeSlot]:
     """Generate 15-minute base slots from 9:00 AM to 6:00 PM for all days"""
@@ -44,11 +44,10 @@ def generate_base_time_slots() -> List[TimeSlot]:
     return all_slots
 
 def get_lunch_blocks() -> Dict[int, TimeBlock]:
-    """Return lunch blocks for each semester"""
+    """Return lunch blocks for each semester (times from LUNCH_WINDOWS; Monday as anchor day)."""
     return {
-        1: TimeBlock("Monday", time(12, 30), time(13, 30)),  # Sem 1: 12:30-13:30
-        3: TimeBlock("Monday", time(12, 45), time(13, 45)),  # Sem 3: 12:45-13:45
-        5: TimeBlock("Monday", time(13, 0), time(14, 0)),    # Sem 5: 13:00-14:00
+        sem: TimeBlock("Monday", start_t, end_t)
+        for sem, (start_t, end_t) in LUNCH_WINDOWS.items()
     }
 
 def check_lunch_conflict(session_time: TimeBlock, semester: int) -> bool:

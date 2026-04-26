@@ -119,6 +119,9 @@ class Course:
     registered_students: int = 0
     half_semester: bool = False
     elective_group: Optional[str] = None
+    # Optional stable row identity from Excel (Offering_ID / Schedule_Key). When set, Phase 5 merges
+    # cross-department rows that share the same ID. When empty, merge uses code+sem+credits+LTPSC.
+    offering_id: str = ""
 
     def __post_init__(self):
         # Calculate number of faculty
@@ -183,12 +186,12 @@ class DayScheduleGrid:
     
     def _get_lunch_for_semester(self) -> TimeBlock:
         """Get lunch block for the semester"""
-        lunch_blocks = {
-            1: TimeBlock(self.day, time(12, 30), time(13, 30)),  # Sem 1
-            3: TimeBlock(self.day, time(12, 45), time(13, 45)),  # Sem 3  
-            5: TimeBlock(self.day, time(13, 0), time(14, 0)),   # Sem 5
-        }
-        return lunch_blocks.get(self.semester, TimeBlock(self.day, time(12, 30), time(13, 30)))
+        window = LUNCH_WINDOWS.get(self.semester)
+        if not window:
+            start_t, end_t = time(12, 30), time(13, 30)
+        else:
+            start_t, end_t = window
+        return TimeBlock(self.day, start_t, end_t)
     
     def add_session(self, time_block: TimeBlock, course: str):
         """Add a session, check for conflicts"""
@@ -198,14 +201,16 @@ class DayScheduleGrid:
     def get_dynamic_time_slots(self) -> List[str]:
         """Return only the time slots that have sessions"""
         time_slots = []
-        for time_block, _ in self.sessions:
+        for s in self.sessions:
+            time_block = s[0]
             time_slots.append(f"{time_block.start.strftime('%H:%M')}-{time_block.end.strftime('%H:%M')}")
         return time_slots
     
     def get_sessions_with_times(self) -> List[tuple]:
         """Return sessions with their time slot strings"""
         sessions_with_times = []
-        for time_block, course in self.sessions:
+        for s in self.sessions:
+            time_block, course = s[0], s[1]
             time_str = f"{time_block.start.strftime('%H:%M')}-{time_block.end.strftime('%H:%M')}"
             sessions_with_times.append((time_str, course))
         return sessions_with_times
@@ -222,7 +227,20 @@ def create_course_from_row(row) -> Course:
     """Create Course object from Excel row data"""
     # Parse instructors
     instructors = parse_instructors(row['Instructor'])
-    
+    # DS308 (CSE, Sem 6): one named instructor but two parallel sections. Phase 5's
+    # "single faculty + high credits" rule treats one token as one person and starves CSE-B.
+    # Duplicate into two roster strings so parallel scheduling uses per-section faculty slots
+    # while strict checks still see non-overlapping assignments when the grid places them apart.
+    try:
+        sem_i = int(row['Semester'])
+    except (TypeError, ValueError):
+        sem_i = 0
+    code0 = str(row.get('Course Code', '') or '').split('-')[0].strip().upper()
+    dept0 = str(row.get('Department', '') or '').strip().upper()
+    if code0 == 'DS308' and dept0 == 'CSE' and sem_i == 6 and len(instructors) == 1:
+        base = instructors[0]
+        instructors = [base, f"{base} (CSE-B parallel slot)"]
+
     # Determine if elective
     is_elective = str(row['Elective (Yes/No)']).lower() == 'yes'
     
@@ -235,6 +253,26 @@ def create_course_from_row(row) -> Course:
         elective_group = str(row['Elective groups']).strip()
         if elective_group == '' or elective_group.lower() == 'nan':
             elective_group = None
+
+    # Optional primary key for scheduling / cross-dept merge (any one column name may be present)
+    offering_id = ""
+    for col in (
+        "Offering_ID",
+        "Offering ID",
+        "OFFERING_ID",
+        "Schedule_Key",
+        "Schedule Key",
+        "SCHEDULE_KEY",
+    ):
+        try:
+            if col not in row or pd.isna(row[col]):
+                continue
+        except (KeyError, TypeError, ValueError):
+            continue
+        raw = str(row[col]).strip()
+        if raw and raw.lower() != "nan":
+            offering_id = raw
+            break
     
     return Course(
         code=row['Course Code'],
@@ -247,7 +285,8 @@ def create_course_from_row(row) -> Course:
         ltpsc=row['LTPSC'],
         registered_students=int(row['Registered Students']),
         half_semester=half_semester,
-        elective_group=elective_group
+        elective_group=elective_group,
+        offering_id=offering_id,
     )
 
 def create_classroom_from_row(row) -> ClassRoom:

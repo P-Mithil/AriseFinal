@@ -1,21 +1,118 @@
 import pandas as pd
 import os
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 from collections import defaultdict
 
 from utils.data_models import Course, ClassRoom, Section, create_course_from_row, create_classroom_from_row
 from config.structure_config import DEPARTMENTS
+from config.schedule_config import LUNCH_WINDOWS
+from utils.interactive_prompts import skip_interactive_prompts
+
+
+_COURSE_DATA_SELECTION_CACHE: Optional[str] = None
+
+
+def _normalize_variant(raw: str) -> Optional[str]:
+    v = str(raw or "").strip().lower()
+    if v in ("odd", "1", "course_data1", "course_data1.xlsx", "coursedata1"):
+        return "odd"
+    if v in ("even", "2", "course_data2", "course_data2.xlsx", "coursedata2"):
+        return "even"
+    return None
+
+
+def _select_course_data_path(base_dir: str) -> str:
+    """
+    Resolve the course input file for odd/even offerings.
+
+    Priority:
+      1) ARISE_COURSE_DATA_FILE (absolute path or file under DATA/INPUT)
+      2) ARISE_COURSE_DATA_VARIANT / ARISE_OFFERING (odd/even)
+      3) Interactive prompt (TTY only) when both course_data1/2 are present
+      4) Safe fallback to available file (or raise clear FileNotFoundError)
+    """
+    global _COURSE_DATA_SELECTION_CACHE
+    if _COURSE_DATA_SELECTION_CACHE and os.path.exists(_COURSE_DATA_SELECTION_CACHE):
+        return _COURSE_DATA_SELECTION_CACHE
+
+    input_dir = os.path.join(base_dir, "DATA", "INPUT")
+    legacy_path = os.path.join(input_dir, "course_data.xlsx")
+    odd_path = os.path.join(input_dir, "course_data1.xlsx")
+    even_path = os.path.join(input_dir, "course_data2.xlsx")
+
+    env_file = os.environ.get("ARISE_COURSE_DATA_FILE", "").strip()
+    if env_file:
+        cand = env_file if os.path.isabs(env_file) else os.path.join(input_dir, env_file)
+        if os.path.exists(cand):
+            _COURSE_DATA_SELECTION_CACHE = cand
+            return cand
+        raise FileNotFoundError(
+            f"ARISE_COURSE_DATA_FILE points to missing file: {cand}"
+        )
+
+    env_variant = (
+        os.environ.get("ARISE_COURSE_DATA_VARIANT", "").strip()
+        or os.environ.get("ARISE_OFFERING", "").strip()
+    )
+    norm_variant = _normalize_variant(env_variant)
+    if norm_variant == "odd":
+        if os.path.exists(odd_path):
+            _COURSE_DATA_SELECTION_CACHE = odd_path
+            return odd_path
+        raise FileNotFoundError(f"Requested odd offering, but file missing: {odd_path}")
+    if norm_variant == "even":
+        if os.path.exists(even_path):
+            _COURSE_DATA_SELECTION_CACHE = even_path
+            return even_path
+        raise FileNotFoundError(f"Requested even offering, but file missing: {even_path}")
+
+    if os.path.exists(odd_path) and os.path.exists(even_path):
+        if skip_interactive_prompts():
+            # Non-interactive environments must not block on input().
+            # Default to odd unless explicitly set via env vars above.
+            _COURSE_DATA_SELECTION_CACHE = odd_path
+            print(
+                "[INFO] Auto-selected odd offering (course_data1.xlsx). "
+                "Set ARISE_COURSE_DATA_VARIANT=even to use course_data2.xlsx."
+            )
+            return odd_path
+        while True:
+            print("\nSelect course data offering:")
+            print("  1) Odd  -> course_data1.xlsx")
+            print("  2) Even -> course_data2.xlsx")
+            choice = input("Enter choice [1/2 or odd/even]: ").strip()
+            picked = _normalize_variant(choice)
+            if picked == "odd":
+                _COURSE_DATA_SELECTION_CACHE = odd_path
+                return odd_path
+            if picked == "even":
+                _COURSE_DATA_SELECTION_CACHE = even_path
+                return even_path
+            print("Invalid choice. Please enter 1/2 or odd/even.")
+
+    if os.path.exists(odd_path):
+        _COURSE_DATA_SELECTION_CACHE = odd_path
+        return odd_path
+    if os.path.exists(even_path):
+        _COURSE_DATA_SELECTION_CACHE = even_path
+        return even_path
+    if os.path.exists(legacy_path):
+        _COURSE_DATA_SELECTION_CACHE = legacy_path
+        return legacy_path
+
+    raise FileNotFoundError(
+        "No course data file found. Expected one of: "
+        f"{odd_path}, {even_path}, or {legacy_path}"
+    )
 
 def read_course_data() -> List[Course]:
     """Read and parse course data from Excel file"""
     # Get the base directory (iiitdwd_timetable_v2)
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    input_path = os.path.join(base_dir, "DATA", "INPUT", "course_data.xlsx")
-    
-    if not os.path.exists(input_path):
-        raise FileNotFoundError(f"Course data file not found: {input_path}")
+    input_path = _select_course_data_path(base_dir)
     
     df = pd.read_excel(input_path)
+    print(f"Using course data file: {os.path.basename(input_path)}")
     print(f"Loaded {len(df)} courses from Excel file")
     
     courses = []
@@ -117,7 +214,7 @@ def generate_statistics(courses: List[Course], classrooms: List[ClassRoom]) -> s
     report.append("=== PHASE 1: DATA VALIDATION & STATISTICS ===\n")
     
     report.append(f"Total Courses Loaded: {len(courses)}")
-    report.append(f"Filtered Courses (Odd Semesters, CSE/DSAI/ECE): {len(filtered_courses)}\n")
+    report.append(f"Filtered Courses (CSE/DSAI/ECE, all semesters in data): {len(filtered_courses)}\n")
     
     # Extract unique semesters from filtered courses
     unique_semesters = sorted(set(c.semester for c in filtered_courses))
@@ -204,6 +301,19 @@ def generate_statistics(courses: List[Course], classrooms: List[ClassRoom]) -> s
     unique_semesters = sorted(set(c.semester for c in filtered_courses))
     valid_semesters = len(unique_semesters) > 0
     report.append(f"[OK] All courses have valid semester ({unique_semesters}): {'PASS' if valid_semesters else 'FAIL'}")
+
+    missing_lunch = [s for s in unique_semesters if s not in LUNCH_WINDOWS]
+    lunch_ok = not missing_lunch
+    if lunch_ok:
+        report.append(
+            "[OK] Every semester in course_data has a lunch window in config.schedule_config.LUNCH_WINDOWS: PASS"
+        )
+    else:
+        report.append(
+            "[FAIL] Semester(s) in course_data missing from LUNCH_WINDOWS — "
+            f"add entries in schedule_config.py for: {missing_lunch}. "
+            "Odd/even switches fail verification or slot checks without this."
+        )
     
     # Check credits
     valid_credits = all(c.credits > 0 for c in filtered_courses)

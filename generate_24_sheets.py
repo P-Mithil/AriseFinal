@@ -8,14 +8,22 @@ import re
 import sys
 import logging
 from datetime import time, datetime, timedelta
-from typing import List, Dict
+from typing import List, Dict, Tuple, Optional
 
 # Add the current directory to Python path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from utils.data_models import DayScheduleGrid, TimeBlock, Section
 from utils.timetable_writer_v2 import TimetableWriterV2
-from config.schedule_config import WORKING_DAYS, DAY_START_TIME, DAY_END_TIME
+from config.schedule_config import (
+    WORKING_DAYS,
+    DAY_START_TIME,
+    DAY_END_TIME,
+    LUNCH_WINDOWS,
+    GENERATION_RUNTIME_MODE,
+    GENERATION_RUNTIME_SCALE,
+)
+from utils.time_validator import validate_time_range
 from config.structure_config import DEPARTMENTS, SECTIONS_BY_DEPT, STUDENTS_PER_SECTION, get_group_for_section
 from utils.faculty_timetable_writer import write_faculty_timetables
 from utils.classroom_timetable_writer import write_classroom_timetables
@@ -30,6 +38,15 @@ from utils.data_models import Course
 # Trace config for unsatisfied debugging: list of (section_name, semester, period, course_code).
 # Set by trace_unsatisfied.py before running generate_24_sheets.
 TRACE_CONFIG: List[tuple] = []
+
+
+def _scaled_budget(base_value: int, minimum: int = 1) -> int:
+    """Apply runtime scale to a data-driven budget."""
+    try:
+        scaled = int(round(float(base_value) * float(GENERATION_RUNTIME_SCALE)))
+    except Exception:
+        scaled = int(base_value)
+    return max(int(minimum), scaled)
 
 
 def _trace_enabled(section_name: str, semester: int, period: str) -> List[str]:
@@ -774,10 +791,9 @@ def get_available_slots_for_rescheduling(day: str, semester: int, existing_sessi
     """
     available_slots = []
     
-    # Generate time slots for the day (9:00-18:00, 15-minute intervals)
-    start_hour, end_hour = 9, 18
-    current_time = time(start_hour, 0)
-    end_time = time(end_hour, 0)
+    # Generate time slots for the day (config-driven window, 15-minute intervals; honor minutes)
+    current_dt = datetime.combine(datetime.min, DAY_START_TIME)
+    end_dt = datetime.combine(datetime.min, DAY_END_TIME)
     
     # Get lunch block for this semester
     lunch_blocks = {
@@ -814,10 +830,7 @@ def get_available_slots_for_rescheduling(day: str, semester: int, existing_sessi
     except:
         elective_slots = []
     
-    # Generate candidate slots
-    current_dt = datetime.combine(datetime.min, current_time)
-    end_dt = datetime.combine(datetime.min, end_time)
-    
+    # Generate candidate slots (current_dt / end_dt set above from DAY_START_TIME / DAY_END_TIME)
     while current_dt < end_dt:
         # Calculate end time for this slot
         slot_end_dt = current_dt + timedelta(minutes=session_duration_minutes)
@@ -827,7 +840,11 @@ def get_available_slots_for_rescheduling(day: str, semester: int, existing_sessi
         slot_start = current_dt.time()
         slot_end = slot_end_dt.time()
         candidate_block = TimeBlock(day, slot_start, slot_end)
-        
+
+        if not validate_time_range(slot_start, slot_end):
+            current_dt += timedelta(minutes=15)
+            continue
+
         # Check lunch conflict
         if candidate_block.overlaps(lunch_block):
             current_dt += timedelta(minutes=15)
@@ -1013,6 +1030,197 @@ def get_course_requirements(courses: List[Course], semester: int, section_name: 
     return requirements
 
 
+def rebalance_lt_mix_for_section_courses(sessions: List, courses: List[Course]) -> int:
+    """
+    Rebalance L/T labels when a section-course has lecture deficit but tutorial surplus.
+
+    This keeps weekly contact count unchanged while matching LTPSC expectations more robustly
+    across stochastic runs (e.g., one lecture dropped and one extra tutorial added).
+
+    Rebalancing is done per (section, code, period) to avoid cross-period L/T swaps that
+    would leave one period under-scheduled while the other looks correct in aggregate.
+    """
+    from modules_v2.phase5_core_courses import calculate_slots_needed
+
+    def _base_code(code: str) -> str:
+        return (code or "").replace("-TUT", "").replace("-LAB", "").strip()
+
+    def _semester_from_section(section: str) -> int:
+        m = re.search(r"Sem(\d+)", section or "")
+        return int(m.group(1)) if m else -1
+
+    def _period_bin(sess) -> str:
+        p = str(getattr(sess, "period", "") or "").strip().upper()
+        if p in ("PRE", "PREMID", "PRE-MID", "PRE MID", "PRE_MID"):
+            return "PRE"
+        if p in ("POST", "POSTMID", "POST-MID", "POST MID", "POST_MID"):
+            return "POST"
+        return "PRE"  # default
+
+    # Build fast lookup: (code, semester, dept) -> required counts
+    req_lookup: Dict[Tuple[str, int, str], Dict[str, int]] = {}
+    for c in courses or []:
+        if getattr(c, "is_elective", False):
+            continue
+        code = getattr(c, "code", None)
+        sem = getattr(c, "semester", None)
+        dept = getattr(c, "department", None)
+        ltpsc = getattr(c, "ltpsc", None)
+        if not code or sem is None or not dept or not ltpsc:
+            continue
+        slots = calculate_slots_needed(ltpsc)
+        req_lookup[(code, sem, dept)] = {
+            "lectures": slots.get("lectures", 0),
+            "tutorials": slots.get("tutorials", 0),
+        }
+
+    # Key is (section, code, period) — rebalance independently per period
+    buckets: Dict[Tuple[str, str, str], Dict[str, List]] = {}
+    for s in sessions or []:
+        section = getattr(s, "section", "") or ""
+        sem = _semester_from_section(section)
+        dept = section.split("-")[0] if "-" in section else ""
+        code_raw = getattr(s, "course_code", "") or ""
+        code = _base_code(code_raw)
+        if not section or not code or sem <= 0 or not dept:
+            continue
+
+        req = req_lookup.get((code, sem, dept))
+        if not req:
+            continue
+
+        kind = (getattr(s, "kind", None) or getattr(s, "session_type", None) or "L").upper()
+        if kind not in ("L", "T"):
+            continue
+
+        pbin = _period_bin(s)
+        key = (section, code, pbin)
+        if key not in buckets:
+            buckets[key] = {"L": [], "T": [], "req": req}
+        buckets[key][kind].append(s)
+
+    changed = 0
+    for (_section, _code, _pbin), bucket in buckets.items():
+        req_lectures = bucket["req"]["lectures"]
+        req_tutorials = bucket["req"]["tutorials"]
+        lectures = bucket["L"]
+        tutorials = bucket["T"]
+
+        lecture_deficit = max(0, req_lectures - len(lectures))
+        tutorial_surplus = max(0, len(tutorials) - req_tutorials)
+        to_convert = min(lecture_deficit, tutorial_surplus)
+        if to_convert <= 0:
+            continue
+
+        # Convert surplus tutorials into lectures to satisfy LT mix.
+        for sess in tutorials[:to_convert]:
+            ccode = getattr(sess, "course_code", "") or ""
+            if ccode.endswith("-TUT"):
+                setattr(sess, "course_code", ccode[:-4])
+            if hasattr(sess, "kind"):
+                setattr(sess, "kind", "L")
+            if hasattr(sess, "session_type"):
+                setattr(sess, "session_type", "L")
+            changed += 1
+
+    return changed
+
+
+def trim_core_sessions_to_exact_ltpsc(phase5_sessions: List, phase7_sessions: List, courses: List[Course]) -> int:
+    """
+    Trim extra non-elective sessions so each (section, course, period) matches LTPSC exactly.
+
+    Counts are enforced **per PreMid / PostMid period** (PRE vs POST), not merged across the
+    whole semester. Merging PRE+POST into one bucket and trimming to a single ``required``
+    count used to delete every POST session when Phase 5 scheduled full loads in both halves
+    (e.g. CS163), emptying PostMid grids while semester totals looked "correct".
+    """
+    from modules_v2.phase5_core_courses import calculate_slots_needed
+
+    def _base_code(code: str) -> str:
+        return (code or "").replace("-TUT", "").replace("-LAB", "").split("-")[0].strip()
+
+    def _section_sem_dept(section: str) -> Tuple[int, str]:
+        m = re.search(r"Sem(\d+)", section or "")
+        sem = int(m.group(1)) if m else -1
+        dept = section.split("-")[0].strip() if "-" in section else ""
+        return sem, dept
+
+    def _kind_of(sess) -> str:
+        return (getattr(sess, "kind", None) or getattr(sess, "session_type", None) or "L").upper()
+
+    def _period_bin(sess) -> Optional[str]:
+        p = str(getattr(sess, "period", "") or "").strip().upper()
+        if p in ("PRE", "PREMID", "PRE-MID", "PRE MID", "PRE_MID"):
+            return "PRE"
+        if p in ("POST", "POSTMID", "POST-MID", "POST MID", "POST_MID"):
+            return "POST"
+        return None
+
+    def _sort_key_within_period(sess):
+        block = getattr(sess, "block", None)
+        day = getattr(block, "day", "") if block else ""
+        start = getattr(block, "start", None)
+        start_s = start.strftime("%H:%M") if start else "99:99"
+        return (day, start_s)
+
+    req_lookup: Dict[Tuple[str, int, str], Dict[str, int]] = {}
+    for c in courses or []:
+        if getattr(c, "is_elective", False):
+            continue
+        code = getattr(c, "code", None)
+        sem = getattr(c, "semester", None)
+        dept = getattr(c, "department", None)
+        ltpsc = getattr(c, "ltpsc", "")
+        if not code or sem is None or not dept or not ltpsc:
+            continue
+        slots = calculate_slots_needed(ltpsc)
+        req_lookup[(code, int(sem), dept)] = {
+            "L": int(slots.get("lectures", 0)),
+            "T": int(slots.get("tutorials", 0)),
+            "P": int(slots.get("practicals", 0)),
+        }
+
+    buckets: Dict[Tuple[str, str, str], Dict[str, List]] = {}
+    for sess in (phase5_sessions or []) + (phase7_sessions or []):
+        section = getattr(sess, "section", "") or ""
+        if not section:
+            continue
+        sem, dept = _section_sem_dept(section)
+        code = _base_code(getattr(sess, "course_code", "") or "")
+        if not code or sem <= 0 or not dept:
+            continue
+        req = req_lookup.get((code, sem, dept))
+        if not req:
+            continue
+        pbin = _period_bin(sess)
+        if pbin is None:
+            continue
+        kind = _kind_of(sess)
+        if kind not in ("L", "T", "P"):
+            kind = "L"
+        key = (section, code, pbin)
+        if key not in buckets:
+            buckets[key] = {"req": req, "L": [], "T": [], "P": []}
+        buckets[key][kind].append(sess)
+
+    to_remove_ids = set()
+    for _key, b in buckets.items():
+        for kind in ("L", "T", "P"):
+            sessions_of_kind = sorted(b[kind], key=_sort_key_within_period)
+            required = b["req"][kind]
+            if len(sessions_of_kind) > required:
+                for s in sessions_of_kind[required:]:
+                    to_remove_ids.add(id(s))
+
+    before = len(phase5_sessions or []) + len(phase7_sessions or [])
+    if to_remove_ids:
+        phase5_sessions[:] = [s for s in (phase5_sessions or []) if id(s) not in to_remove_ids]
+        phase7_sessions[:] = [s for s in (phase7_sessions or []) if id(s) not in to_remove_ids]
+    after = len(phase5_sessions or []) + len(phase7_sessions or [])
+    return max(0, before - after)
+
+
 def get_course_requirements_for_sheet(
     courses: List[Course],
     semester: int,
@@ -1187,19 +1395,23 @@ def match_section(expected_section: str, session_sections) -> bool:
     expected_normalized = normalize_section_string(expected_section)
     
     if isinstance(session_sections, list):
-        # Check if expected_section is in the list
         for sec in session_sections:
-            sec_normalized = normalize_section_string(sec)
-            if expected_normalized == sec_normalized:
+            if expected_normalized == normalize_section_string(sec):
                 return True
         return False
     elif isinstance(session_sections, str):
-        session_normalized = normalize_section_string(session_sections)
-        return expected_normalized == session_normalized
+        # The logged string could be "CSE-A-Sem1, CSE-B-Sem1" or "['CSE-A-Sem1', 'CSE-B-Sem1']"
+        # We check if the expected_normalized section appears as a distinct word in the string
+        session_str = session_sections.upper()
+        # Remove brackets and quotes if it's a string representation of a list
+        session_str = session_str.replace('[', '').replace(']', '').replace("'", "").replace('"', '')
+        parts = [normalize_section_string(p.strip()) for p in session_str.split(',')]
+        return expected_normalized in parts
     else:
         # Try to convert to string and match
-        session_str = normalize_section_string(str(session_sections))
-        return expected_normalized == session_str
+        session_str = str(session_sections).upper().replace('[', '').replace(']', '').replace("'", "").replace('"', '')
+        parts = [normalize_section_string(p.strip()) for p in session_str.split(',')]
+        return expected_normalized in parts
 
 def normalize_period(period: str) -> str:
     """
@@ -1257,18 +1469,33 @@ def create_integrated_schedule(
             try:
                 start_str = s.get("Start Time", "00:00")
                 end_str = s.get("End Time", "00:00")
-                sh, sm = map(int, start_str.split(':'))
-                eh, em = map(int, end_str.split(':'))
+                sh, sm = map(int, start_str.split(':')[:2])
+                eh, em = map(int, end_str.split(':')[:2])
                 block = TimeBlock(day, time(sh, sm), time(eh, em))
                 # Skip if already in final_sessions (some logs might have redundancy if not cleaned)
-                if any(b.start == block.start and b.end == block.end for b, c, p, bse in final_sessions):
+                if any(b.start == block.start and b.end == block.end for b, c, p, bse, *rest in final_sessions):
                     continue
-                final_sessions.append((block, s.get("Course Code", ""), 0, ""))
-            except Exception:
+                
+                # Support both API-style (course_code, faculty, room) and Log-style (Course Code, Faculty, Room)
+                c_code = s.get("course_code") or s.get("Course Code", "")
+                fac = s.get("faculty") or s.get("Faculty", "")
+                rm = s.get("room") or s.get("Room", "")
+                
+                # Extract base_course for verification (satisfaction check)
+                if c_code.startswith('ELECTIVE_BASKET_'):
+                    base = c_code.replace('-LAB', '').replace('-TUT', '')
+                else:
+                    base = c_code.replace("-TUT", "").replace("-LAB", "").split("-")[0]
+                
+                # Include metadata for Faculty and Room
+                meta = {"faculty": fac, "room": rm}
+                final_sessions.append((block, c_code, 0, base, meta))
+            except Exception as e:
+                print(f"Error processing session from log: {e}")
                 continue
         
-        # Add lunch block
-        final_sessions.append((grid.lunch_block, "LUNCH", -1, "LUNCH"))
+        # Add lunch block with empty metadata to prevent unpack errors downstream
+        final_sessions.append((grid.lunch_block, "LUNCH", -1, "LUNCH", {"faculty": "", "room": ""}))
         final_sessions.sort(key=lambda x: x[0].start)
         
         return _add_breaks_to_grid(grid, final_sessions, day), []
@@ -1459,9 +1686,12 @@ def create_integrated_schedule(
                     trace_log(f"COLLECT phase5 [{day}]: SKIP {course_display} section={section_match} period={period_match} "
                               f"day={day_match} (session_sec={session_section!r} period={session_period!r} day={session_day!r})")
                 elif is_cs307:
+                    # Keep this at debug level; warning-level spam here significantly slows runs.
                     import logging
-                    logging.warning(f"CS307 NOT added: section_match={section_match}, period_match={period_match}, "
-                              f"day_match={day_match}, has_block={session_block is not None}")
+                    logging.debug(
+                        "CS307 NOT added: section_match=%s, period_match=%s, day_match=%s, has_block=%s",
+                        section_match, period_match, day_match, (session_block is not None)
+                    )
     
     # Add Phase 7 remaining <=2 credit course sessions for this section/semester/period
     if phase7_sessions:
@@ -2578,7 +2808,7 @@ def _add_breaks_to_grid(grid: DayScheduleGrid, final_sessions: List[tuple], day:
     sessions_with_breaks: List[tuple] = []
     for idx, item in enumerate(final_sessions):
         block, course = item[0], item[1]
-        sessions_with_breaks.append((block, course))
+        sessions_with_breaks.append(item)  # Preserve the full 5-tuple
         
         if isinstance(course, str) and course not in ["LUNCH", "ELECTIVE"] and "Break" not in course:
             next_item = final_sessions[idx + 1] if idx + 1 < len(final_sessions) else None
@@ -2586,20 +2816,161 @@ def _add_breaks_to_grid(grid: DayScheduleGrid, final_sessions: List[tuple], day:
                 break_start = block.end
                 break_end = (datetime.combine(datetime.min, break_start) + timedelta(minutes=15)).time()
                 break_block = TimeBlock(day, break_start, break_end)
+                
+                # Create a uniform 5-tuple for the break slot
+                break_tuple = (break_block, "Break(15min)", -1, "Break", {"faculty": "", "room": ""})
+                
                 if next_item:
                     next_block = next_item[0]
                     if not break_block.overlaps(next_block) or break_end == next_block.start:
-                        sessions_with_breaks.append((break_block, "Break(15min)"))
+                        sessions_with_breaks.append(break_tuple)
                 else:
-                    sessions_with_breaks.append((break_block, "Break(15min)"))
+                    sessions_with_breaks.append(break_tuple)
     
     grid.sessions = sessions_with_breaks
     return grid
+
+
+def _build_faculty_room_lookup_from_pipeline_sessions(all_sessions) -> dict:
+    """
+    Map (section, course_code, day, start, end, period, session_type) -> (faculty, room)
+    from post–Phase-6 pipeline sessions so Excel/CSV use the same instructor as the resolver.
+    """
+    lookup = {}
+
+    def _store(sec: str, cc: str, day: str, t0: str, t1: str, per: str, stype_k: str, fac: str, room: str):
+        if not sec or not day:
+            return
+        key = (sec, cc, day, t0, t1, per, stype_k)
+        if key not in lookup and (fac or room):
+            lookup[key] = (fac or "", room or "")
+
+    for s in all_sessions or []:
+        if isinstance(s, dict):
+            block = s.get("time_block") or s.get("block")
+            if not block:
+                continue
+            fac = str(s.get("instructor") or s.get("faculty") or "").strip()
+            room = str(s.get("room") or "").strip()
+            cc = str(s.get("course_code") or "").strip()
+            per = normalize_period(str(s.get("period") or "PRE"))
+            st_raw = str(s.get("session_type") or s.get("kind") or "L").strip().upper()
+            if st_raw in ("L", "T", "P"):
+                st_map = st_raw
+            elif st_raw == "ELECTIVE" or "ELECTIVE_BASKET" in cc.upper():
+                st_map = "ELECTIVE"
+            else:
+                st_map = "L"
+            day = str(block.day).strip()
+            t0 = block.start.strftime("%H:%M")
+            t1 = block.end.strftime("%H:%M")
+            secs = s.get("sections") or []
+            if not secs:
+                continue
+            stypes = {st_map}
+            if st_map == "L" and "ELECTIVE_BASKET" in cc.upper():
+                stypes.add("ELECTIVE")
+            for sec in secs:
+                sec = str(sec).strip()
+                for st_k in stypes:
+                    _store(sec, cc, day, t0, t1, per, st_k, fac, room)
+                base = cc.replace("-TUT", "").replace("-LAB", "").split("-")[0]
+                if base and base != cc:
+                    for st_k in stypes:
+                        _store(sec, base, day, t0, t1, per, st_k, fac, room)
+        else:
+            block = getattr(s, "block", None)
+            if not block:
+                continue
+            fac = str(getattr(s, "faculty", None) or "").strip()
+            room = str(getattr(s, "room", None) or "").strip()
+            cc = str(getattr(s, "course_code", "") or "").strip()
+            per = normalize_period(str(getattr(s, "period", None) or "PRE"))
+            kind = str(getattr(s, "kind", "L") or "L").strip().upper()
+            if kind in ("L", "T", "P"):
+                st_map = kind
+            elif kind == "ELECTIVE" or "ELECTIVE_BASKET" in cc.upper():
+                st_map = "ELECTIVE"
+            else:
+                st_map = "L"
+            day = str(block.day).strip()
+            t0 = block.start.strftime("%H:%M")
+            t1 = block.end.strftime("%H:%M")
+            sec = str(getattr(s, "section", "") or "").strip()
+            if not sec:
+                continue
+            stypes = {st_map}
+            if st_map == "L" and "ELECTIVE_BASKET" in cc.upper():
+                stypes.add("ELECTIVE")
+            for st_k in stypes:
+                _store(sec, cc, day, t0, t1, per, st_k, fac, room)
+            base = cc.split("-")[0] if cc else ""
+            if kind == "T" and base:
+                cc_tut = f"{base}-TUT" if "-TUT" not in cc.upper() else cc
+                for st_k in ("T", "L"):
+                    _store(sec, cc_tut, day, t0, t1, per, st_k, fac, room)
+            if kind == "P" and base:
+                cc_lab = f"{base}-LAB" if "-LAB" not in cc.upper() else cc
+                for st_k in ("P", "L"):
+                    _store(sec, cc_lab, day, t0, t1, per, st_k, fac, room)
+            if base and base != cc:
+                for st_k in stypes:
+                    _store(sec, base, day, t0, t1, per, st_k, fac, room)
+    return lookup
+
+
+def _lookup_faculty_room_from_pipeline_map(
+    faculty_room_lookup: dict,
+    section_key: str,
+    course_display: str,
+    day: str,
+    block,
+    period: str,
+    stype: str,
+) -> tuple:
+    """Return (faculty, room) from lookup or ("", "") if missing."""
+    if not faculty_room_lookup or not block:
+        return "", ""
+    lk_period = normalize_period(period)
+    day_s = str(day).strip()
+    t0 = block.start.strftime("%H:%M")
+    t1 = block.end.strftime("%H:%M")
+    for st_try in (stype, "L", "T", "P", "ELECTIVE"):
+        k = (section_key, course_display, day_s, t0, t1, lk_period, st_try)
+        if k in faculty_room_lookup:
+            return faculty_room_lookup[k]
+    base = course_display.replace("-TUT", "").replace("-LAB", "").split("-")[0]
+    if base and base != course_display:
+        for st_try in (stype, "L", "T", "P", "ELECTIVE"):
+            k = (section_key, base, day_s, t0, t1, lk_period, st_try)
+            if k in faculty_room_lookup:
+                return faculty_room_lookup[k]
+    return "", ""
+
 
 def generate_24_sheets(sessions_from_log: List[Dict] = None):
     """Generate all 24 sheets for the timetable.
     If sessions_from_log is provided, it use those sessions directly and skips the scheduling phases.
     """
+    import random
+
+    _run_started_at = datetime.now()
+
+    # Reproducible scheduling:
+    # - If ARISE_GENERATION_SEED is set, honor it.
+    # - Otherwise use a stable per-dataset default to avoid run-to-run drift.
+    _seed_raw = str(os.environ.get("ARISE_GENERATION_SEED", "") or "").strip()
+    if _seed_raw.isdigit():
+        random.seed(int(_seed_raw))
+    else:
+        _variant = (
+            str(os.environ.get("ARISE_COURSE_DATA_VARIANT", "") or "").strip().lower()
+            or str(os.environ.get("ARISE_OFFERING", "") or "").strip().lower()
+        )
+        _default_seed = 1829 if _variant in ("odd", "1", "course_data1", "course_data1.xlsx") else 1830
+        random.seed(_default_seed)
+        _seed_raw = str(_default_seed)
+
     from utils.time_slot_logger import reset_logger
     if sessions_from_log is None:
         reset_logger()
@@ -2642,9 +3013,61 @@ def generate_24_sheets(sessions_from_log: List[Dict] = None):
     if sessions_from_log is not None:
         print("Bypassing Phase 2-6 scheduling as sessions were provided from log.")
         all_sessions = sessions_from_log
+
+        # Build room_assignments from the log so verification table has correct rooms
+        # Also detect combined courses (same course+day+time in multiple sections)
+        # and ensure they get C004 if no room was already assigned.
+        from collections import defaultdict as _defaultdict
+        _combined_course_codes: set = set()
+        _slot_sections = _defaultdict(set)  # (course_code_base, day, start) -> set(sections)
+        for s in sessions_from_log:
+            cc = str(s.get('Course Code', s.get('course_code', ''))).split('-')[0].strip()
+            sec = str(s.get('Section', s.get('section', ''))).strip()
+            day = str(s.get('Day', s.get('day', ''))).strip()
+            start = str(s.get('Start Time', s.get('start_time', ''))).strip()
+            _slot_sections[(cc, day, start)].add(sec)
+        course_map_all = {getattr(c, 'code', ''): c for c in courses}
+        for key, secs in _slot_sections.items():
+            if len(secs) > 1:
+                cc_obj = course_map_all.get(key[0])
+                if cc_obj and getattr(cc_obj, 'is_combined', False):
+                    _combined_course_codes.add(key[0])
+
+        for s in sessions_from_log:
+            cc = str(s.get('Course Code', s.get('course_code', ''))).strip()
+            sec = str(s.get('Section', s.get('section', ''))).strip()
+            period = str(s.get('Period', s.get('period', 'PRE'))).strip().upper()
+            if period in ('PREMID',): period = 'PRE'
+            if period in ('POSTMID',): period = 'POST'
+            room = str(s.get('Room', s.get('room', ''))).strip()
+            stype = str(s.get('Session Type', s.get('session_type', 'L'))).strip().upper()
+
+            base_code = cc.replace('-TUT', '').replace('-LAB', '').split('-')[0]
+            room_key = (base_code, sec, period)
+
+            if room_key not in room_assignments:
+                room_assignments[room_key] = {'classroom': '', 'labs': []}
+
+            if room and room.lower() not in ('nan', 'none', 'tbd', ''):
+                # Classify as lab or classroom using room_type from classrooms list
+                is_lab = any(
+                    hasattr(cr, 'room_number') and str(cr.room_number).strip() == room
+                    and hasattr(cr, 'room_type') and 'lab' in str(cr.room_type).lower()
+                    for cr in classrooms
+                )
+                if is_lab:
+                    if room not in room_assignments[room_key]['labs']:
+                        room_assignments[room_key]['labs'].append(room)
+                elif not room_assignments[room_key]['classroom']:
+                    room_assignments[room_key]['classroom'] = room
+
+            # Phase 4 combined courses: default to C004 if no classroom found
+            if not room_assignments[room_key]['classroom'] and base_code in _combined_course_codes:
+                room_assignments[room_key]['classroom'] = 'C004'
+
         
         # Load cached elective assignments to prevent "TBD" in the Excel tables
-        import json, os
+        import json
         cache_file = "DATA/OUTPUT/elective_assignments_cache.json"
         if os.path.exists(cache_file):
             try:
@@ -2701,10 +3124,29 @@ def generate_24_sheets(sessions_from_log: List[Dict] = None):
             for session in combined_sessions:
                 add_session_to_occupied_slots(session, occupied_slots)
             # Run Phase 7
-            phase7_sessions = run_phase7(courses, sections, classrooms, occupied_slots, {}, combined_sessions, timeout_seconds=60)
+            phase7_sessions = run_phase7(
+                courses,
+                sections,
+                classrooms,
+                occupied_slots,
+                {},
+                combined_sessions,
+                context_sessions=(elective_sessions + combined_sessions + phase5_sessions),
+                timeout_seconds=60,
+            )
         except Exception as e:
             print(f"ERROR in Phase 7: {e}")
             phase7_sessions = []
+
+        # Stabilize LT mix for non-elective section courses across stochastic runs.
+        lt_relabels = rebalance_lt_mix_for_section_courses((phase5_sessions or []) + (phase7_sessions or []), courses)
+        if lt_relabels:
+            print(f"Adjusted {lt_relabels} session(s) from T to L to satisfy LTPSC lecture/tutorial mix.")
+
+        # Enforce exact LTPSC counts for non-elective core sessions by trimming surplus.
+        trimmed_exact = trim_core_sessions_to_exact_ltpsc(phase5_sessions, phase7_sessions, courses)
+        if trimmed_exact:
+            print(f"Trimmed {trimmed_exact} surplus core session(s) to enforce exact LTPSC counts.")
 
 
     
@@ -2736,7 +3178,7 @@ def generate_24_sheets(sessions_from_log: List[Dict] = None):
                 all_courses=courses
             )
             # Cache elective assignments for fast-path regeneration
-            import json, os
+            import json
             os.makedirs("DATA/OUTPUT", exist_ok=True)
             cache_data = {}
             for sem, assignments in elective_assignments.items():
@@ -2783,6 +3225,7 @@ def generate_24_sheets(sessions_from_log: List[Dict] = None):
                             'period': period_val,
                             'time_block': tb,
                             'course_code': f"{course_code}-Elective",
+                            'section': 'Elective',
                             'course_obj': course,
                             'session_type': 'L' if 'lecture' in slot_name else 'T'
                         })
@@ -2792,14 +3235,60 @@ def generate_24_sheets(sessions_from_log: List[Dict] = None):
             traceback.print_exc()
         try:
             from utils.room_conflict_resolver import resolve_room_conflicts
+            from utils.room_conflict_resolver import resolve_unassigned_core_classrooms
             from modules_v2.phase8_classroom_assignment import detect_room_conflicts
+            room_slot_attempt_budget = max(
+                len(classrooms or []),
+                (len(sections or []) + len(courses or [])) // 3
+            )
+            room_slot_attempt_budget = _scaled_budget(max(18, room_slot_attempt_budget), minimum=12)
+            room_pass_budget = _scaled_budget(
+                max(3, (len(classrooms or []) + len(sections or [])) // 4),
+                minimum=2,
+            )
+            recovered_unassigned = resolve_unassigned_core_classrooms(
+                phase5_sessions,
+                phase7_sessions,
+                combined_sessions,
+                elective_sessions_with_rooms,
+                classrooms,
+                courses=courses,
+                sections=sections,
+                max_slot_attempts=room_slot_attempt_budget,
+            )
+            if recovered_unassigned:
+                print(f"  [OK] Recovered unassigned core classrooms: {recovered_unassigned}")
             resolved, remaining = resolve_room_conflicts(
                 phase5_sessions, phase7_sessions, combined_sessions,
-                elective_sessions_with_rooms, classrooms, max_passes=15
+                elective_sessions_with_rooms, classrooms, courses=courses, sections=sections, max_passes=room_pass_budget
             )
             for s in elective_sessions_with_rooms:
                 if isinstance(s, dict) and '_assignment' in s and 'room' in s:
                     s['_assignment']['room'] = s['room']
+
+            # CRITICAL FIX: resolve_room_conflicts mutates session.room in-place but does NOT
+            # update room_assignments.  Sync them now so final_ui_sessions gets correct rooms.
+            if room_assignments:
+                for sess in list(phase5_sessions) + list(phase7_sessions):
+                    r = getattr(sess, 'room', None)
+                    if not r:
+                        continue
+                    cc = str(getattr(sess, 'course_code', '') or '').split('-')[0]
+                    sec = getattr(sess, 'section', '')
+                    per = str(getattr(sess, 'period', 'PRE') or 'PRE').strip().upper()
+                    per = 'PRE' if per in ('PRE', 'PREMID') else ('POST' if per in ('POST', 'POSTMID') else per)
+                    key = (cc, sec, per)
+                    kind = getattr(sess, 'kind', 'L') or 'L'
+                    if key in room_assignments:
+                        if kind == 'P':
+                            # For practicals update the per-session room on the object only
+                            pass
+                        else:
+                            room_assignments[key]['classroom'] = r
+                    else:
+                        room_assignments[key] = {'classroom': r if kind != 'P' else '', 'labs': [r] if kind == 'P' else []}
+                print(f"  [OK] room_assignments refreshed from {len(phase5_sessions)+len(phase7_sessions)} post-resolution sessions")
+
             room_conflicts_after = detect_room_conflicts(
                 phase5_sessions, phase7_sessions, combined_sessions,
                 elective_sessions_with_rooms, classrooms
@@ -2814,6 +3303,29 @@ def generate_24_sheets(sessions_from_log: List[Dict] = None):
         # Step 6: Run Phase 6 - Faculty conflict detection and resolution
         print("\nStep 6: Running Phase 6 - Faculty conflict detection and resolution...")
         all_sessions = elective_sessions + combined_sessions + phase5_sessions + phase7_sessions
+
+        def _print_faculty_conflict_diagnostics(fc_list, stage: str, top_faculties: int = 6, sample_size: int = 8):
+            fc_list = fc_list or []
+            if not fc_list:
+                print(f"  [Diag] {stage}: 0 faculty conflicts")
+                return
+
+            from collections import Counter
+            faculty_counts = Counter(
+                (getattr(fc, "faculty_name", "") or "").strip().lower() for fc in fc_list
+            )
+            top = faculty_counts.most_common(top_faculties)
+            top_str = ", ".join([f"{fac or 'unknown'}({c})" for fac, c in top])
+            print(f"  [Diag] {stage}: {len(fc_list)} faculty conflicts. Top faculties: {top_str}")
+
+            for fc in fc_list[:sample_size]:
+                fname = getattr(fc, "faculty_name", "UNKNOWN")
+                tslot = getattr(fc, "time_slot", "")
+                cs = getattr(fc, "conflicting_sessions", [])
+                cs_str = ""
+                if isinstance(cs, (list, tuple)):
+                    cs_str = " & ".join([str(x) for x in cs if x is not None])
+                print(f"    - {fname}: {cs_str} at {tslot}")
     
         # First detect conflicts
         faculty_conflicts, conflict_report = run_phase6_faculty_conflicts(all_sessions)
@@ -2830,7 +3342,7 @@ def generate_24_sheets(sessions_from_log: List[Dict] = None):
         for session_val in all_sessions:
             if isinstance(session_val, dict):
                 sections_val = session_val.get('sections', [])
-                period_val = session_val.get('period', 'PRE')
+                period_val = normalize_period(session_val.get('period', 'PRE') or 'PRE')
                 block_val = session_val.get('time_block')
                 course_code_val = session_val.get('course_code', '')
                 if block_val and sections_val:
@@ -2838,12 +3350,13 @@ def generate_24_sheets(sessions_from_log: List[Dict] = None):
                         section_key_val = f"{section_val_inner}_{period_val}"
                         occupied_slots[section_key_val].append((block_val, course_code_val))
             elif hasattr(session_val, 'section') and hasattr(session_val, 'block'):
-                section_key_val = f"{session_val.section}_{getattr(session_val, 'period', 'PRE')}"
+                p_obj = normalize_period(getattr(session_val, 'period', 'PRE') or 'PRE')
+                section_key_val = f"{session_val.section}_{p_obj}"
                 occupied_slots[section_key_val].append((session_val.block, session_val.course_code))
 
         # Use central resolver (handles all session types, respects move priorities)
         all_sessions, remaining_conflicts = resolve_all_faculty_conflicts(
-            all_sessions, classrooms, occupied_slots, max_passes=3
+            all_sessions, classrooms, occupied_slots, max_passes=24
         )
 
         # Update faculty_conflicts with remaining conflicts
@@ -2853,13 +3366,14 @@ def generate_24_sheets(sessions_from_log: List[Dict] = None):
             print("  These may require manual review or indicate scheduling constraints")
         else:
             print("[OK] All faculty conflicts resolved successfully")
+        _print_faculty_conflict_diagnostics(faculty_conflicts, "After Step 6")
 
         # Always resolve overlaps within the same section+period
         occupied_slots_overlap = defaultdict(list)
         for session_overlap in all_sessions:
             if isinstance(session_overlap, dict):
                 sections_overlap = session_overlap.get('sections', [])
-                period_overlap = session_overlap.get('period', 'PRE')
+                period_overlap = normalize_period(session_overlap.get('period', 'PRE') or 'PRE')
                 block_overlap = session_overlap.get('time_block')
                 course_code_overlap = session_overlap.get('course_code', '')
                 if block_overlap and sections_overlap:
@@ -2867,7 +3381,8 @@ def generate_24_sheets(sessions_from_log: List[Dict] = None):
                         section_key_overlap = f"{section_overlap_inner}_{period_overlap}"
                         occupied_slots_overlap[section_key_overlap].append((block_overlap, course_code_overlap))
             elif hasattr(session_overlap, 'section') and hasattr(session_overlap, 'block'):
-                section_key_overlap = f"{session_overlap.section}_{getattr(session_overlap, 'period', 'PRE')}"
+                p_ov = normalize_period(getattr(session_overlap, 'period', 'PRE') or 'PRE')
+                section_key_overlap = f"{session_overlap.section}_{p_ov}"
                 occupied_slots_overlap[section_key_overlap].append((session_overlap.block, session_overlap.course_code))
         all_sessions = detect_and_resolve_section_overlaps(all_sessions, occupied_slots_overlap, classrooms)
     
@@ -2887,7 +3402,7 @@ def generate_24_sheets(sessions_from_log: List[Dict] = None):
                     kind=session_val_check.get('session_type', 'L'),
                     block=session_val_check.get('time_block'),
                     room=session_val_check.get('room'),
-                    period=session_val_check.get('period', 'PRE'),
+                    period=normalize_period(session_val_check.get('period', 'PRE') or 'PRE'),
                     faculty=session_val_check.get('instructor', 'TBD')
                 )
                 validation_sessions.append(session_obj_check)
@@ -3004,12 +3519,14 @@ def generate_24_sheets(sessions_from_log: List[Dict] = None):
         # The new time slot allocation should prevent conflicts:
         # - Semester 1 combined courses: Tuesday/Thursday 14:00-16:45 (afternoon)
         # - Semester 3 combined courses: Monday/Wednesday/Friday mornings (09:00-10:30)
-        # - Electives: Sem1 (Mon/Wed/Fri 09:00), Sem3 (Mon/Wed/Fri 11:00), Sem5 (Mon/Wed/Fri 14:00)
+        # - Electives: Phase 3 allocates from elective groups in course data (any semester)
     
         # Step 6.75: Final classroom conflict check
         print("\nStep 6.75: Final classroom conflict check after all rescheduling...")
         try:
-            from modules_v2.phase8_classroom_assignment import detect_room_conflicts, resolve_room_conflicts
+            from modules_v2.phase8_classroom_assignment import detect_room_conflicts
+            from utils.room_conflict_resolver import resolve_room_conflicts
+            
             r_conflicts_final = detect_room_conflicts(
                 phase5_sessions, phase7_sessions, combined_sessions,
                 locals().get("elective_sessions_with_rooms", None), classrooms
@@ -3018,7 +3535,8 @@ def generate_24_sheets(sessions_from_log: List[Dict] = None):
                 print(f"  Found {len(r_conflicts_final)} room conflict(s); resolving...")
                 _, r_conflicts_final = resolve_room_conflicts(
                     phase5_sessions, phase7_sessions, combined_sessions,
-                    locals().get("elective_sessions_with_rooms", None), classrooms
+                    locals().get("elective_sessions_with_rooms", None), classrooms, courses=courses, sections=sections,
+                    max_passes=1
                 )
             if r_conflicts_final:
                 print(f"  WARNING: {len(r_conflicts_final)} room conflicts remain.")
@@ -3028,7 +3546,160 @@ def generate_24_sheets(sessions_from_log: List[Dict] = None):
             print(f"WARNING: Final classroom conflict check failed: {e_room_final}")
             import traceback
             traceback.print_exc()
-    
+
+        # Step 6.8: Faculty repair after section overlap / room moves (they can recreate double-booking)
+        import random
+        from config.schedule_config import (
+            GENERATION_FACULTY_REPAIR_MAX_OUTER_PASSES,
+            GENERATION_REPAIR_SHUFFLE_SEED,
+        )
+        from utils.generation_verify_bridge import rebuild_occupied_slots_from_all_sessions
+        from modules_v2.phase6_faculty_conflicts import detect_faculty_conflicts
+
+        print("\nStep 6.8: Post-mover faculty repair (shuffled conflict order)...")
+        all_sessions = elective_sessions + combined_sessions + phase5_sessions + phase7_sessions
+        for outer in range(GENERATION_FACULTY_REPAIR_MAX_OUTER_PASSES):
+            fc_now = len(detect_faculty_conflicts(all_sessions))
+            if fc_now == 0:
+                print(f"  [OK] No faculty conflicts after outer repair pass {outer}.")
+                break
+            seed = GENERATION_REPAIR_SHUFFLE_SEED + outer * 10007
+            random.seed(seed)
+            rng = random.Random(seed)
+            rng.shuffle(all_sessions)
+            occupied_repair = rebuild_occupied_slots_from_all_sessions(all_sessions)
+            all_sessions, rem_fc = resolve_all_faculty_conflicts(
+                all_sessions,
+                classrooms,
+                occupied_repair,
+                max_passes=12 + outer * 2,
+                rng=rng,
+            )
+            print(
+                f"  Outer {outer + 1}/{GENERATION_FACULTY_REPAIR_MAX_OUTER_PASSES}: "
+                f"resolver left {len(rem_fc)} faculty conflict(s); re-running section-overlap pass."
+            )
+            occupied_ov = rebuild_occupied_slots_from_all_sessions(all_sessions)
+            all_sessions = detect_and_resolve_section_overlaps(
+                all_sessions, occupied_ov, classrooms
+            )
+
+        fc_final = detect_faculty_conflicts(all_sessions)
+        if fc_final:
+            print(
+                f"  WARNING: {len(fc_final)} faculty conflict(s) remain after Step 6.8 "
+                f"(strict verify may fail)."
+            )
+        _print_faculty_conflict_diagnostics(fc_final, "After Step 6.8")
+
+    # Canonical faculty/room from pipeline (Phase 6) for CSV/UI verify alignment
+    faculty_room_lookup = {}
+    if sessions_from_log is None:
+        try:
+            faculty_room_lookup = _build_faculty_room_lookup_from_pipeline_sessions(all_sessions)
+        except Exception as ex_lk:
+            print(f"WARNING: _build_faculty_room_lookup_from_pipeline_sessions failed: {ex_lk}")
+
+        # Step 6.9: One more resolver pass before Excel (writer + strict verify see this state)
+        import random
+        from utils.generation_verify_bridge import rebuild_occupied_slots_from_all_sessions
+
+        print("\nStep 6.9: Pre-export faculty resolution (two long passes, no list shuffle)...")
+        rem_69 = []
+        faculty_pass_budget_69 = _scaled_budget(
+            max(
+                8,
+                (len(all_sessions or []) // 20) + (len(sections or []) // 2)
+            ),
+            minimum=6,
+        )
+        for round69 in range(2):
+            occ_69 = rebuild_occupied_slots_from_all_sessions(all_sessions)
+            rng_69 = random.Random(91011 + round69 * 7919)
+            all_sessions, rem_69 = resolve_all_faculty_conflicts(
+                all_sessions, classrooms, occ_69, max_passes=faculty_pass_budget_69, rng=rng_69
+            )
+            print(f"  round {round69 + 1}: {len(rem_69)} faculty conflict(s)")
+            if not rem_69:
+                print("  [OK] No faculty conflicts before Step 7.")
+                break
+        if rem_69:
+            print(f"  WARNING: {len(rem_69)} faculty conflict(s) remain after Step 6.9")
+        _print_faculty_conflict_diagnostics(rem_69, "After Step 6.9")
+        try:
+            faculty_room_lookup = _build_faculty_room_lookup_from_pipeline_sessions(all_sessions)
+        except Exception as ex_lk2:
+            print(f"WARNING: faculty_room_lookup rebuild after Step 6.9 failed: {ex_lk2}")
+
+        # Step 6.95: Terminal micro-pass to sync room/section/faculty state before UI row build.
+        # This keeps writer output aligned with strict-verify expectations.
+        try:
+            from modules_v2.phase5_core_courses import detect_and_resolve_section_overlaps
+            from utils.room_conflict_resolver import resolve_room_conflicts
+
+            print("\nStep 6.95: Terminal micro-pass (room + section + faculty sync)...")
+            course_credit_map = {}
+            for c in courses or []:
+                cc = str(getattr(c, "code", "") or "").strip().upper()
+                if not cc:
+                    continue
+                try:
+                    course_credit_map[cc] = int(getattr(c, "credits", 0) or 0)
+                except Exception:
+                    course_credit_map[cc] = 0
+
+            phase5_sessions_micro = []
+            phase7_sessions_micro = []
+            combined_sessions_micro = []
+            elective_sessions_micro = []
+            for s in all_sessions or []:
+                if isinstance(s, dict):
+                    cc = str(s.get("course_code", "") or "")
+                    base = cc.split("-")[0].strip().upper()
+                    if base.startswith("ELECTIVE_BASKET_"):
+                        elective_sessions_micro.append(s)
+                    else:
+                        combined_sessions_micro.append(s)
+                    continue
+
+                cc = str(getattr(s, "course_code", "") or "")
+                base = cc.split("-")[0].strip().upper()
+                if base.startswith("ELECTIVE_BASKET_"):
+                    elective_sessions_micro.append(s)
+                    continue
+                cr = int(course_credit_map.get(base, 0) or 0)
+                if cr <= 2:
+                    phase7_sessions_micro.append(s)
+                else:
+                    phase5_sessions_micro.append(s)
+
+            _, rem_room_micro = resolve_room_conflicts(
+                phase5_sessions_micro,
+                phase7_sessions_micro,
+                combined_sessions_micro,
+                elective_sessions_micro,
+                classrooms,
+                courses=courses,
+                sections=sections,
+                max_passes=_scaled_budget(max(1, len(classrooms or []) // 12), minimum=1),
+            )
+            occ_micro = rebuild_occupied_slots_from_all_sessions(all_sessions)
+            all_sessions = detect_and_resolve_section_overlaps(all_sessions, occ_micro, classrooms, max_passes=2)
+            occ_micro = rebuild_occupied_slots_from_all_sessions(all_sessions)
+            all_sessions, rem_fac_micro = resolve_all_faculty_conflicts(
+                all_sessions,
+                classrooms,
+                occ_micro,
+                max_passes=_scaled_budget(max(6, len(all_sessions or []) // 30), minimum=4),
+                rng=random.Random(44051),
+            )
+            print(
+                f"  Micro-pass residuals -> room: {len(rem_room_micro)}, faculty: {len(rem_fac_micro)}"
+            )
+            faculty_room_lookup = _build_faculty_room_lookup_from_pipeline_sessions(all_sessions)
+        except Exception as ex_micro:
+            print(f"WARNING: Step 6.95 micro-pass failed: {ex_micro}")
+
     # Ensure all_sessions is populated if we didn't go through the else block above
     if sessions_from_log is not None:
         all_sessions = sessions_from_log
@@ -3053,105 +3724,2053 @@ def generate_24_sheets(sessions_from_log: List[Dict] = None):
             section_names.append(f"{dept}-{sec_label}")
     semesters = unique_semesters  # Use dynamically extracted semesters
     periods = ["PreMid", "PostMid"]
-    
-    # Create writer
-    writer = TimetableWriterV2(course_colors=course_colors)
-    
-    final_ui_sessions = []
-    
-    # Generate sheets for each combination
-    sheet_count = 0
-    for section_name in section_names:
-        for semester in semesters:
-            for period in periods:
-                sheet_count += 1
-                sheet_name = f"{section_name} Sem{semester} {period}"
-                print(f"Creating sheet {sheet_count}/24: {sheet_name}")
-                
-                # Create sheet
-                sheet = writer.workbook.create_sheet(title=sheet_name)
-                
-                # Set column widths
-                sheet.column_dimensions['A'].width = 15
-                for col in range(2, 20):
-                    sheet.column_dimensions[writer.workbook.worksheets[0].cell(row=1, column=col).column_letter].width = 12
-                
-                # Add title
-                title_cell = sheet['A1']
-                title_cell.value = f"Timetable - {section_name} Semester {semester} {period}"
-                title_cell.font = writer.header_font
-                title_cell.fill = writer.colors['header']
-                
-                # Add days with integrated schedules
-                days = list(WORKING_DAYS)
-                current_row = 3
-                accumulated_final_sessions = []  # Cross-day finalized sessions for rescheduling
-                grid_sessions_dict = {}  # {day: [(TimeBlock, course_display), ...]}
-                deferred_by_day = {}  # day -> [(block, course, prio, base), ...] from dedup reschedule
 
-                for day in days:
-                    extra = deferred_by_day.get(day, [])
-                    schedule_grid, deferred = create_integrated_schedule(
-                        day, semester, section_name, period,
-                        elective_sessions, combined_sessions, phase5_sessions, phase7_sessions,
-                        courses=courses,
-                        final_sessions_all_days=accumulated_final_sessions,
-                        extra_candidates=extra,
-                        sessions_from_log=sessions_from_log
-                    )
-                    for t in deferred:
-                        target_day = t[0].day
-                        if target_day not in deferred_by_day:
-                            deferred_by_day[target_day] = []
-                        deferred_by_day[target_day].append(t)
-                    grid_sessions_dict[day] = schedule_grid.sessions
-                    for s in schedule_grid.sessions:
-                        accumulated_final_sessions.append(s)  # (block, course) each
-                        
-                        # Add to our final_ui_sessions list for re-logging
-                        block, course_display = s
-                        if course_display != "LUNCH" and course_display != "Break(15min)":
-                            section_key = f"{section_name}-Sem{semester}"
-                            stype = 'L'
-                            if '-TUT' in course_display: stype = 'T'
-                            elif '-LAB' in course_display: stype = 'P'
-                            if course_display.startswith("ELECTIVE_BASKET_"): stype = 'ELECTIVE'
+    from config.schedule_config import (
+        GENERATION_STRICT_MACRO_MAX_ATTEMPTS,
+        GENERATION_MAX_RUNTIME_SECONDS,
+    )
+    from utils.generation_verify_bridge import (
+        GenerationViolationError,
+        final_ui_rows_to_verify_sessions,
+        macro_repair_pipeline_sessions,
+        run_strict_verification_on_final_ui,
+    )
+
+    def _guard_runtime_or_raise(stage_label: str) -> None:
+        elapsed_s = (datetime.now() - _run_started_at).total_seconds()
+        if elapsed_s <= float(GENERATION_MAX_RUNTIME_SECONDS):
+            return
+        raise GenerationViolationError(
+            f"Generation exceeded runtime budget ({int(elapsed_s)}s > {GENERATION_MAX_RUNTIME_SECONDS}s) at {stage_label}",
+            [
+                {
+                    "rule": "RUNTIME_TIMEOUT",
+                    "message": (
+                        f"Generation exceeded runtime budget ({int(elapsed_s)}s > "
+                        f"{GENERATION_MAX_RUNTIME_SECONDS}s) at {stage_label}"
+                    ),
+                }
+            ],
+            debug_faculty_path=None,
+        )
+
+    if sessions_from_log is None:
+        _macro_max = _scaled_budget(
+            GENERATION_STRICT_MACRO_MAX_ATTEMPTS,
+            minimum=2 if GENERATION_RUNTIME_MODE == "fast" else 3,
+        )
+    else:
+        _macro_max = 1
+
+    for _macro_i in range(_macro_max):
+        _guard_runtime_or_raise(f"macro_iteration_{_macro_i + 1}")
+        if _macro_i > 0:
+            if not _seed_raw:
+                # Seed sweep across macro retries: deterministic per retry, without requiring a fixed env seed.
+                _retry_seed = 1729 + (_macro_i * 9973)
+                random.seed(_retry_seed)
+                print(f"  [macro-seed] retry {_macro_i + 1}: random.seed({_retry_seed})")
+            print(
+                f"\nStep 7 — macro retry {_macro_i + 1}/{_macro_max}: "
+                "reshuffling pipeline sessions, then rebuilding 24 sheets..."
+            )
+            macro_repair_pipeline_sessions(all_sessions, classrooms, _macro_i)
+            faculty_room_lookup = {}
+            if sessions_from_log is None:
+                try:
+                    faculty_room_lookup = _build_faculty_room_lookup_from_pipeline_sessions(all_sessions)
+                except Exception as ex_lk:
+                    print(f"WARNING: _build_faculty_room_lookup_from_pipeline_sessions failed: {ex_lk}")
+        elif sessions_from_log is None:
+            print(
+                f"  [runtime-mode] mode={GENERATION_RUNTIME_MODE} "
+                f"scale={GENERATION_RUNTIME_SCALE:.2f} macro_budget={_macro_max}"
+            )
+
+        # Create writer
+        writer = TimetableWriterV2(course_colors=course_colors)
+
+        final_ui_sessions = []
+
+        # Generate sheets for each combination
+        sheet_count = 0
+        for section_name in section_names:
+            for semester in semesters:
+                for period in periods:
+                    sheet_count += 1
+                    sheet_name = f"{section_name} Sem{semester} {period}"
+                    print(f"Creating sheet {sheet_count}/24: {sheet_name}")
+                    
+                    # Create sheet
+                    sheet = writer.workbook.create_sheet(title=sheet_name)
+                    
+                    # Set column widths
+                    sheet.column_dimensions['A'].width = 15
+                    for col in range(2, 20):
+                        sheet.column_dimensions[writer.workbook.worksheets[0].cell(row=1, column=col).column_letter].width = 12
+                    
+                    # Add title
+                    title_cell = sheet['A1']
+                    title_cell.value = f"Timetable - {section_name} Semester {semester} {period}"
+                    title_cell.font = writer.header_font
+                    title_cell.fill = writer.colors['header']
+                    
+                    # Add days with integrated schedules
+                    days = list(WORKING_DAYS)
+                    current_row = 3
+                    accumulated_final_sessions = []  # Cross-day finalized sessions for rescheduling
+                    grid_sessions_dict = {}  # {day: [(TimeBlock, course_display), ...]}
+                    deferred_by_day = {}  # day -> [(block, course, prio, base), ...] from dedup reschedule
+    
+                    for day in days:
+                        extra = deferred_by_day.get(day, [])
+                        schedule_grid, deferred = create_integrated_schedule(
+                            day, semester, section_name, period,
+                            elective_sessions, combined_sessions, phase5_sessions, phase7_sessions,
+                            courses=courses,
+                            final_sessions_all_days=accumulated_final_sessions,
+                            extra_candidates=extra,
+                            sessions_from_log=sessions_from_log
+                        )
+                        for t in deferred:
+                            target_day = t[0].day
+                            if target_day not in deferred_by_day:
+                                deferred_by_day[target_day] = []
+                            deferred_by_day[target_day].append(t)
+                        grid_sessions_dict[day] = schedule_grid.sessions
+                        for s in schedule_grid.sessions:
+                            accumulated_final_sessions.append(s)  # (block, course) each
                             
-                            final_ui_sessions.append({
-                                'course_code': course_display,
-                                'section': section_key,
-                                'day': day,
-                                'start_time': block.start,
-                                'end_time': block.end,
-                                'period': normalize_period(period),
-                                'session_type': stype
-                            })
-
-                    current_row = writer.write_day_schedule(sheet, day, schedule_grid, current_row)
-                    current_row += 1
-                print("[OK] Done")
-                
-                # Add verification table after all days - pass grid_sessions to count only displayed sessions
-                print(f"    Adding verification table...", end=" ", flush=True)
-                current_row += 2  # Add spacing
-                current_row = writer.write_verification_table(
-                    sheet, current_row, courses, 
-                    combined_sessions + elective_sessions,  # Still pass for reference, but grid_sessions takes precedence
-                    semester, section_name, period, phase5_sessions,
-                    phase7_sessions, combined_sessions, faculty_conflicts,
-                    room_assignments,  # Pass room assignments from Phase 8
-                    grid_sessions=grid_sessions_dict  # Pass actual displayed sessions from grid
-                )
-                print("[OK] Done")
-                
-                # Add elective assignment table below verification table
-                print(f"    Adding elective assignment table...", end=" ", flush=True)
-                current_row += 2  # Add spacing
-                current_row = writer.write_elective_assignment_table(
-                    sheet, current_row, semester, courses, elective_assignments.get(semester, [])
-                )
-                print("[OK] Done")
+                            # Add to our final_ui_sessions list for re-logging
+                            block = s[0]
+                            course_display = s[1]
+                            
+                            meta_fac = ""
+                            meta_rm = ""
+                            if len(s) > 4 and isinstance(s[4], dict):
+                                meta_fac = s[4].get('faculty', '')
+                                meta_rm = s[4].get('room', '')
+                                
+                            if course_display != "LUNCH" and course_display != "Break(15min)":
+                                section_key = f"{section_name}-Sem{semester}"
+                                stype = 'L'
+                                if '-TUT' in course_display: stype = 'T'
+                                elif '-LAB' in course_display: stype = 'P'
+                                if course_display.startswith("ELECTIVE_BASKET_"): stype = 'ELECTIVE'
+                                
+                                base_code = course_display.replace('-TUT', '').replace('-LAB', '').split('-')[0]
     
+                                # Prefer Phase-6-resolved faculty/room so CSV matches deep_verification
+                                if sessions_from_log is None and faculty_room_lookup:
+                                    lf, lr = _lookup_faculty_room_from_pipeline_map(
+                                        faculty_room_lookup, section_key, course_display, day, block, period, stype
+                                    )
+                                    # Always prefer latest Phase-6-resolved values when present.
+                                    if lf:
+                                        meta_fac = lf
+                                    if lr:
+                                        meta_rm = lr
+                                
+                                comb_sess = None
+                                # Determine room
+                                comb_sess = None
+                                # Combined (Phase 4) rooms are authoritative; keep C004 strictly for Phase 4.
+                                # Match by base course code + session type (L/T/P) since combined dicts may store
+                                # course_code without -TUT/-LAB suffix.
+                                comb_sess = next(
+                                    (
+                                        cs
+                                        for cs in combined_sessions
+                                        if isinstance(cs, dict)
+                                        and str(cs.get("course_code", "") or "").split("-")[0].strip() == base_code
+                                        and normalize_period(cs.get("period")) == normalize_period(period)
+                                        and str(cs.get("session_type", cs.get("kind", "L")) or "L").strip().upper() == stype
+                                        and any(str(sec).startswith(section_key) for sec in cs.get("sections", []))
+                                    ),
+                                    None,
+                                )
+                                if comb_sess and comb_sess.get("room"):
+                                    meta_rm = comb_sess["room"]
+
+                                # For practicals, prefer the session's own room (Phase 8 may assign per-session labs).
+                                if sessions_from_log is None and stype == "P" and getattr(block, "start", None) is not None:
+                                    try:
+                                        _pkey = normalize_period(period)
+                                        _match = next(
+                                            (
+                                                ss for ss in (phase5_sessions + phase7_sessions)
+                                                if getattr(ss, "section", "") == section_key
+                                                and (getattr(ss, "course_code", "").split("-")[0] == base_code)
+                                                and normalize_period(getattr(ss, "period", "PRE")) == _pkey
+                                                and getattr(getattr(ss, "block", None), "day", None) == day
+                                                and getattr(getattr(ss, "block", None), "start", None) == block.start
+                                                and getattr(getattr(ss, "block", None), "end", None) == block.end
+                                            ),
+                                            None,
+                                        )
+                                        if _match and getattr(_match, "room", None):
+                                            meta_rm = str(_match.room).strip()
+                                    except Exception:
+                                        pass
+
+                                # For lectures/tutorials, prefer the actual session object's room
+                                # (which was updated by resolve_room_conflicts) then fall back to room_assignments.
+                                if sessions_from_log is None and stype != "P" and not comb_sess:
+                                    pkey = normalize_period(period)
+                                    # First: look for a matching ScheduledSession with an up-to-date .room
+                                    _direct_match = next(
+                                        (
+                                            ss for ss in (phase5_sessions + phase7_sessions)
+                                            if getattr(ss, 'section', '') == section_key
+                                            and str(getattr(ss, 'course_code', '') or '').split('-')[0] == base_code
+                                            and normalize_period(getattr(ss, 'period', 'PRE')) == pkey
+                                            and getattr(getattr(ss, 'block', None), 'day', None) == day
+                                            and getattr(ss, 'kind', 'L') != 'P'
+                                        ),
+                                        None,
+                                    )
+                                    if _direct_match and getattr(_direct_match, 'room', None):
+                                        meta_rm = _direct_match.room
+                                    elif room_assignments:
+                                        a = room_assignments.get((base_code, section_key, pkey))
+                                        if isinstance(a, dict) and a.get("classroom"):
+                                            meta_rm = a.get("classroom")
+
+                                if not meta_rm:
+                                    if comb_sess and comb_sess.get("room"):
+                                        meta_rm = comb_sess["room"]
+                                    elif room_assignments:
+                                        # Secondary attempt (should be rare if Phase 8 ran)
+                                        pkey = normalize_period(period)
+                                        a = room_assignments.get((base_code, section_key, pkey))
+                                        if isinstance(a, dict):
+                                            if stype == "P":
+                                                labs = a.get("labs") or []
+                                                labs = [str(x).strip() for x in labs if str(x).strip()]
+                                                if labs:
+                                                    meta_rm = ", ".join(labs)
+                                            else:
+                                                meta_rm = a.get("classroom") or ""
+                                    
+                                # Determine faculty.
+                                # Prefer the exact course row for this section's program + semester
+                                # (same code can exist across departments with different instructors).
+                                sec_prog = ""
+                                try:
+                                    sec_prog = str(section_key).split("-")[0].strip()
+                                except Exception:
+                                    sec_prog = ""
+                                course_obj = next((
+                                    c for c in courses
+                                    if getattr(c, 'code', '') == base_code
+                                    and getattr(c, 'semester', None) == semester
+                                    and (not sec_prog or getattr(c, 'department', '') == sec_prog)
+                                ), None)
+                                if course_obj is None:
+                                    course_obj = next((
+                                        c for c in courses
+                                        if getattr(c, 'code', '') == base_code
+                                        and getattr(c, 'semester', None) == semester
+                                    ), None)
+                                if course_obj is None:
+                                    course_obj = next((c for c in courses if getattr(c, 'code', '') == base_code), None)
+                                
+                                sec_idx = 0
+                                try:
+                                    sec_idx = next((i for i, s in enumerate(sections) if s.label == section_key), 0)
+                                except:
+                                    pass
+                                    
+                                if not meta_fac:
+                                    if comb_sess and comb_sess.get('instructor'):
+                                        meta_fac = comb_sess['instructor']
+                                    elif sessions_from_log is None:
+                                        # Only use sec_idx-based fallback when NOT in log-replay mode
+                                        if course_obj and hasattr(course_obj, 'instructors') and course_obj.instructors:
+                                            if sec_idx < len(course_obj.instructors):
+                                                meta_fac = course_obj.instructors[sec_idx]
+                                            else:
+                                                meta_fac = course_obj.instructors[0]
+                                                
+                                # If generating from log (UI edits), preserve original Room and Faculty.
+                                # The create_integrated_schedule fast path already set meta_fac/meta_rm from
+                                # the original CSV row for this section.  Only do a secondary lookup if the
+                                # meta dict didn't carry a value (very rare edge-case).
+                                if sessions_from_log is not None and (not meta_fac or not meta_rm):
+                                    orig_s = next((os_item for os_item in sessions_from_log if 
+                                        match_section(section_key, os_item.get('Section') or os_item.get('section')) and 
+                                        (os_item.get('Course Code') == course_display or os_item.get('course_code') == course_display) and 
+                                        str(os_item.get('Day') or os_item.get('day')).strip().upper() == str(day).strip().upper() and 
+                                        str(os_item.get('Start Time') or os_item.get('start_time')).replace(':', '') == block.start.strftime("%H%M")
+                                    ), None)
+                                    if orig_s:
+                                        if not meta_rm:
+                                            meta_rm = orig_s.get('Room') or orig_s.get('room') or meta_rm
+                                        if not meta_fac:
+                                            # Use faculty value directly — no comma-splitting needed since
+                                            # the log stores one faculty per section row.
+                                            meta_fac = orig_s.get('Faculty') or orig_s.get('faculty') or meta_fac
+
+                                # Policy: practical sessions do not participate in faculty conflicts.
+                                # Keep faculty blank for P rows to align strict verification semantics.
+                                if stype == "P":
+                                    meta_fac = ""
+    
+    
+                                final_ui_sessions.append({
+                                    # Phase tagging is required so strict verification only merges sections
+                                    # for Phase 4 combined classes (C004). Phase 5/7 sessions remain per-section.
+                                    'phase': (
+                                        "Phase 3" if course_display.startswith("ELECTIVE_BASKET_") else
+                                        ("Phase 4" if comb_sess else
+                                         ("Phase 7" if any(
+                                             getattr(ss, "section", "") == section_key
+                                             and (getattr(ss, "course_code", "").split("-")[0] == base_code)
+                                             and normalize_period(getattr(ss, "period", "PRE")) == normalize_period(period)
+                                             and getattr(getattr(ss, "block", None), "day", None) == day
+                                             and getattr(getattr(ss, "block", None), "start", None) == block.start
+                                             and getattr(getattr(ss, "block", None), "end", None) == block.end
+                                             for ss in (phase7_sessions or [])
+                                         ) else "Phase 5"))
+                                    ),
+                                    'course_code': course_display,
+                                    'section': section_key,
+                                    'day': day,
+                                    'start_time': block.start,
+                                    'end_time': block.end,
+                                    'time_block': block,  # Required by faculty/classroom writers
+                                    'period': normalize_period(period),
+                                    'session_type': stype,
+                                    'faculty': meta_fac,
+                                    'room': meta_rm
+                                })
+    
+                        current_row = writer.write_day_schedule(sheet, day, schedule_grid, current_row)
+                        current_row += 1
+                    print("[OK] Done")
+                    
+                    # Add verification table after all days - pass grid_sessions to count only displayed sessions
+                    print(f"    Adding verification table...", end=" ", flush=True)
+                    current_row += 2  # Add spacing
+                    
+                    # If generated from log, extract ALL sessions (both PreMid/PostMid) 
+                    # so full-semester requirements are verified correctly
+                    all_section_log_sessions = None
+                    if sessions_from_log is not None:
+                        expected_sec = f"{section_name}-Sem{semester}"
+                        all_section_log_sessions = [
+                            s for s in sessions_from_log 
+                            if match_section(expected_sec, s.get('Section') or s.get('section', ''))
+                        ]
+    
+                    current_row = writer.write_verification_table(
+                        sheet, current_row, courses, 
+                        combined_sessions + elective_sessions,  # Still pass for reference, but grid_sessions takes precedence
+                        semester, section_name, period, phase5_sessions,
+                        phase7_sessions, combined_sessions, faculty_conflicts,
+                        room_assignments,  # Pass room assignments from Phase 8
+                        grid_sessions=grid_sessions_dict,  # Pass actual displayed sessions from grid
+                        all_section_sessions=all_section_log_sessions,
+                        classrooms=classrooms
+                    )
+                    print("[OK] Done")
+                    
+                    # Add elective assignment table below verification table
+                    print(f"    Adding elective assignment table...", end=" ", flush=True)
+                    current_row += 2  # Add spacing
+                    current_row = writer.write_elective_assignment_table(
+                        sheet, current_row, semester, courses, 
+                        elective_assignments.get(semester, []),
+                        all_section_sessions=all_section_log_sessions
+                    )
+                    print("[OK] Done")
+    
+        # Strict gate: zero-tolerance verification before writing workbook/CSV.
+        if final_ui_sessions:
+            # Repair pass: eliminate room double-bookings + under-capacity rooms
+            # (C004 reserved for Phase 4 only)
+            try:
+                def _t_overlap(a_s, a_e, b_s, b_e):
+                    return not (a_e <= b_s or b_e <= a_s)
+
+                def _np(p):
+                    return normalize_period(p)
+
+                section_students = {getattr(sec, "label", ""): int(getattr(sec, "students", 0) or 0) for sec in (sections or [])}
+                room_caps = {getattr(r, "room_number", ""): int(getattr(r, "capacity", 0) or 0) for r in (classrooms or [])}
+                lab_rooms = [
+                    r
+                    for r in (classrooms or [])
+                    if "lab" in str(getattr(r, "room_type", "")).lower()
+                    and getattr(r, "room_number", "") != "C004"
+                    and not getattr(r, "is_research_lab", False)
+                ]
+                # Last-resort fallback (only if needed): include research labs so strict verify can reach 0.
+                lab_rooms_fallback = [
+                    r
+                    for r in (classrooms or [])
+                    if "lab" in str(getattr(r, "room_type", "")).lower()
+                    and getattr(r, "room_number", "") != "C004"
+                ]
+                class_rooms = [r for r in (classrooms or []) if "lab" not in str(getattr(r, "room_type", "")).lower() and getattr(r, "room_number", "") != "C004"]
+
+                # Prefer smaller rooms first
+                lab_rooms.sort(key=lambda r: int(getattr(r, "capacity", 0) or 0))
+                lab_rooms_fallback.sort(key=lambda r: int(getattr(r, "capacity", 0) or 0))
+                class_rooms.sort(key=lambda r: int(getattr(r, "capacity", 0) or 0))
+
+                _day_order = {d: i for i, d in enumerate(["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"])}
+
+                def _dur_minutes(st_, et_):
+                    try:
+                        return int((et_.hour * 60 + et_.minute) - (st_.hour * 60 + st_.minute))
+                    except Exception:
+                        try:
+                            ss = str(st_)[:5]
+                            ee = str(et_)[:5]
+                            sm = int(ss.split(":")[0]) * 60 + int(ss.split(":")[1])
+                            em = int(ee.split(":")[0]) * 60 + int(ee.split(":")[1])
+                            return em - sm
+                        except Exception:
+                            return 0
+
+                def _base_code_of(display_code: str) -> str:
+                    return str(display_code or "").replace("-TUT", "").replace("-LAB", "").split("-")[0].strip().upper()
+
+                def _is_unassigned_room_value(rv: object) -> bool:
+                    s = str(rv or "").strip().lower()
+                    return s in ("", "na", "none", "nan", "tbd")
+
+                def _parse_strict_tasks(errors: List[Dict]) -> Dict[str, List[Dict]]:
+                    tasks = {
+                        "room_conflicts": [],
+                        "ltpsc": [],
+                        "time_constraints": [],
+                        "faculty_conflicts": [],
+                        "section_overlaps": [],
+                    }
+                    for e in errors or []:
+                        rule = str(e.get("rule", "") or "").strip().lower()
+                        msg = str(e.get("message", "") or "")
+                        if "room" in rule and "double-booked" in msg:
+                            m = re.search(r"Room\s+(\S+)\s+is double-booked in\s+(\w+):\s+(.+)\s+and\s+(.+)", msg)
+                            if m:
+                                tasks["room_conflicts"].append({
+                                    "room": m.group(1).strip(),
+                                    "period": normalize_period(m.group(2).strip()),
+                                    "course_a": _base_code_of(m.group(3)),
+                                    "course_b": _base_code_of(m.group(4)),
+                                })
+                        if "ltpsc" in rule and "mismatch" in msg:
+                            m = re.search(
+                                r"LTPSC mismatch for\s+([A-Z0-9/]+)\s+in\s+([A-Za-z0-9\-]+):\s+expected L/T/P=(\d+)/(\d+)/(\d+),\s+scheduled\s+(\d+)/(\d+)/(\d+)",
+                                msg,
+                            )
+                            if m:
+                                tasks["ltpsc"].append({
+                                    "course_code": _base_code_of(m.group(1)),
+                                    "section": m.group(2).strip(),
+                                    "expected": {"L": int(m.group(3)), "T": int(m.group(4)), "P": int(m.group(5))},
+                                    "scheduled": {"L": int(m.group(6)), "T": int(m.group(7)), "P": int(m.group(8))},
+                                })
+                        if "time constraints" in rule and "overlaps lunch break" in msg:
+                            m_tc = re.search(
+                                r"Session overlaps lunch break:\s+(\w+)\s+([0-9:]+)-([0-9:]+)",
+                                msg,
+                            )
+                            if m_tc:
+                                tasks["time_constraints"].append({
+                                    "message": msg,
+                                    "day": str(m_tc.group(1)).strip(),
+                                    "start": str(m_tc.group(2)).strip(),
+                                    "end": str(m_tc.group(3)).strip(),
+                                })
+                            else:
+                                tasks["time_constraints"].append({"message": msg})
+                        if "section overlap" in rule and "same section has two sessions at same time" in msg:
+                            m = re.search(
+                                r"Same section has two sessions at same time:\s+([A-Z0-9/\\-]+)\s+and\s+([A-Z0-9/\\-]+)",
+                                msg,
+                            )
+                            if m:
+                                tasks["section_overlaps"].append({
+                                    "course_a": _base_code_of(m.group(1)),
+                                    "course_b": _base_code_of(m.group(2)),
+                                })
+                        if "faculty" in rule and ("overlap" in msg or "overlapping sessions" in msg):
+                            m1 = re.search(
+                                r"Faculty\s+(.+?)\s+has overlapping sessions:\s+([A-Z0-9/]+)\s+and\s+([A-Z0-9/]+)\s+on\s+(\w+)\s+([0-9:]+)-([0-9:]+)",
+                                msg,
+                            )
+                            m2 = re.search(
+                                r"Faculty\s+(.+?)\s+overlap:\s+([A-Z0-9/]+)\s+\((\w+)\)\s+vs\s+([A-Z0-9/]+)\s+\((\w+)\)\s+on\s+(\w+)\s+([0-9:]+)-([0-9:]+)",
+                                msg,
+                            )
+                            if m1:
+                                tasks["faculty_conflicts"].append({
+                                    "faculty": str(m1.group(1)).strip(),
+                                    "course_a": _base_code_of(m1.group(2)),
+                                    "course_b": _base_code_of(m1.group(3)),
+                                    "section_a": "",
+                                    "section_b": "",
+                                    "day": str(m1.group(4)).strip(),
+                                    "start": str(m1.group(5)).strip(),
+                                    "end": str(m1.group(6)).strip(),
+                                    "period": "",
+                                })
+                            elif m2:
+                                tasks["faculty_conflicts"].append({
+                                    "faculty": str(m2.group(1)).strip(),
+                                    "course_a": _base_code_of(m2.group(2)),
+                                    "course_b": _base_code_of(m2.group(4)),
+                                    "section_a": "",
+                                    "section_b": "",
+                                    "day": str(m2.group(6)).strip(),
+                                    "start": str(m2.group(7)).strip(),
+                                    "end": str(m2.group(8)).strip(),
+                                    "period": normalize_period(m2.group(3).strip()),
+                                })
+                            else:
+                                m3 = re.search(
+                                    r"Faculty\s+(.+?)\s+cannot teach\s+([A-Z0-9/]+).*parallel sections\s+([A-Za-z0-9\-]+)\s+and\s+([A-Za-z0-9\-]+)\s+at overlapping times on\s+(\w+)\s+([0-9:]+)-([0-9:]+)",
+                                    msg,
+                                )
+                                if m3:
+                                    tasks["faculty_conflicts"].append({
+                                        "faculty": str(m3.group(1)).strip(),
+                                        "course_a": _base_code_of(m3.group(2)),
+                                        "course_b": _base_code_of(m3.group(2)),
+                                        "section_a": str(m3.group(3)).strip(),
+                                        "section_b": str(m3.group(4)).strip(),
+                                        "day": str(m3.group(5)).strip(),
+                                        "start": str(m3.group(6)).strip(),
+                                        "end": str(m3.group(7)).strip(),
+                                        "period": "",
+                                    })
+                    return tasks
+
+                def _parse_clock(v: str):
+                    try:
+                        bits = [int(x) for x in str(v or "").strip().split(":")]
+                        if len(bits) >= 2:
+                            return time(bits[0], bits[1])
+                    except Exception:
+                        return None
+                    return None
+
+                def _slot_conflicts_for_section(sec: str, period: str, day: str, st, et) -> bool:
+                    for row in final_ui_sessions:
+                        if str(row.get("section", "") or "").strip() != sec:
+                            continue
+                        if normalize_period(row.get("period")) != normalize_period(period):
+                            continue
+                        if str(row.get("day", "") or "").strip() != day:
+                            continue
+                        rs, re_ = row.get("start_time"), row.get("end_time")
+                        if rs and re_ and _t_overlap(st, et, rs, re_):
+                            return True
+                    return False
+
+                def _faculty_tokens(nm: str):
+                    from utils.faculty_conflict_utils import faculty_name_tokens
+
+                    return set(faculty_name_tokens(str(nm or "").strip()))
+
+                def _faculty_slot_busy(
+                    faculty_raw: str, period: str, day: str, st, et, exclude_idx: Optional[int]
+                ) -> bool:
+                    """True if another non-P row (final UI) uses an overlapping token for this instructor."""
+                    toks = _faculty_tokens(faculty_raw)
+                    if not toks:
+                        return False
+                    per = normalize_period(period)
+                    dday = str(day or "").strip()
+                    for idx, row in enumerate(final_ui_sessions):
+                        if exclude_idx is not None and idx == exclude_idx:
+                            continue
+                        if str(row.get("session_type", "L") or "L").strip().upper() == "P":
+                            continue
+                        oth = str(row.get("faculty", "") or "").strip()
+                        if not oth:
+                            continue
+                        if not (_faculty_tokens(oth) & toks):
+                            continue
+                        if normalize_period(row.get("period")) != per:
+                            continue
+                        if str(row.get("day", "") or "").strip() != dday:
+                            continue
+                        rs, re_ = row.get("start_time"), row.get("end_time")
+                        if rs and re_ and _t_overlap(st, et, rs, re_):
+                            return True
+                    return False
+
+                def _room_conflicts(room: str, period: str, day: str, st, et, exclude_idx: Optional[int] = None) -> bool:
+                    room_tokens = {x.strip() for x in str(room or "").split(",") if x.strip()}
+                    for idx, row in enumerate(final_ui_sessions):
+                        if exclude_idx is not None and idx == exclude_idx:
+                            continue
+                        if normalize_period(row.get("period")) != normalize_period(period):
+                            continue
+                        if str(row.get("day", "") or "").strip() != day:
+                            continue
+                        rs, re_ = row.get("start_time"), row.get("end_time")
+                        if not (rs and re_ and _t_overlap(st, et, rs, re_)):
+                            continue
+                        other_tokens = {x.strip() for x in str(row.get("room", "") or "").split(",") if x.strip()}
+                        if room_tokens & other_tokens:
+                            return True
+                    return False
+
+                def _room_candidates_for_kind(kind: str):
+                    return lab_rooms_fallback if kind == "P" else class_rooms
+
+                def _needed_capacity_for_section(sec: str) -> int:
+                    base_sec = str(sec).split("-Sem")[0].strip()
+                    return int(section_students.get(base_sec, 0) or section_students.get(sec, 0) or 85)
+
+                def _pick_room_for_slot(
+                    kind: str,
+                    sec: str,
+                    period: str,
+                    day: str,
+                    st,
+                    et,
+                    exclude_idx: Optional[int] = None,
+                    faculty_raw: Optional[str] = None,
+                    allow_faculty_fallback: bool = True,
+                    forbidden_rooms: Optional[set] = None,
+                ) -> str:
+                    need = _needed_capacity_for_section(sec)
+                    fac_chk = (
+                        str(faculty_raw or "").strip()
+                        if str(kind or "L").strip().upper() not in ("P",)
+                        else ""
+                    )
+                    blocked_rooms = {str(x).strip() for x in (forbidden_rooms or set()) if str(x).strip()}
+
+                    def _scan(require_faculty: bool) -> str:
+                        for r in _room_candidates_for_kind(kind):
+                            rn = getattr(r, "room_number", "")
+                            if rn in blocked_rooms:
+                                continue
+                            cap = room_caps.get(rn, 0)
+                            if kind in ("L", "T") and need and cap < need:
+                                continue
+                            if _room_conflicts(rn, period, day, st, et, exclude_idx=exclude_idx):
+                                continue
+                            if require_faculty and fac_chk and _faculty_slot_busy(
+                                fac_chk, period, day, st, et, exclude_idx
+                            ):
+                                continue
+                            return rn
+                        for r in _room_candidates_for_kind(kind):
+                            rn = getattr(r, "room_number", "")
+                            if rn in blocked_rooms:
+                                continue
+                            if _room_conflicts(rn, period, day, st, et, exclude_idx=exclude_idx):
+                                continue
+                            if require_faculty and fac_chk and _faculty_slot_busy(
+                                fac_chk, period, day, st, et, exclude_idx
+                            ):
+                                continue
+                            return rn
+                        return ""
+
+                    picked = _scan(True)
+                    if picked:
+                        return picked
+                    if fac_chk and allow_faculty_fallback:
+                        return _scan(False)
+                    return ""
+
+                def _atomic_fill_blank_room(_tasks: Dict[str, List[Dict]]) -> int:
+                    for idx, row in enumerate(final_ui_sessions):
+                        if not _is_unassigned_room_value(row.get("room", "")):
+                            continue
+                        kind = str(row.get("session_type", "L") or "L").strip().upper()
+                        sec = str(row.get("section", "") or "").strip()
+                        per = normalize_period(row.get("period"))
+                        day = str(row.get("day", "") or "").strip()
+                        st, et = row.get("start_time"), row.get("end_time")
+                        if not (sec and day and st and et):
+                            continue
+                        rn = _pick_room_for_slot(
+                            kind,
+                            sec,
+                            per,
+                            day,
+                            st,
+                            et,
+                            exclude_idx=idx,
+                            faculty_raw=str(row.get("faculty") or ""),
+                        )
+                        if rn:
+                            row["room"] = rn
+                            return 1
+                    return 0
+
+                def _atomic_fix_parsed_room_conflict(_tasks: Dict[str, List[Dict]]) -> int:
+                    for t in _tasks.get("room_conflicts", []):
+                        room = t["room"]
+                        per = normalize_period(t["period"])
+                        course_a = t["course_a"]
+                        course_b = t["course_b"]
+                        colliding = []
+                        for idx, row in enumerate(final_ui_sessions):
+                            if normalize_period(row.get("period")) != per:
+                                continue
+                            tokens = {x.strip() for x in str(row.get("room", "") or "").split(",") if x.strip()}
+                            if room not in tokens:
+                                continue
+                            base = _base_code_of(row.get("course_code"))
+                            if base not in (course_a, course_b):
+                                continue
+                            colliding.append((idx, row))
+                        if len(colliding) < 2:
+                            continue
+                        idx_move, row_move = sorted(
+                            colliding,
+                            key=lambda p: (
+                                _day_order.get(str(p[1].get("day", "") or ""), 99),
+                                str(p[1].get("start_time") or ""),
+                                str(p[1].get("course_code") or ""),
+                                p[0],
+                            ),
+                        )[-1]
+                        kind = str(row_move.get("session_type", "L") or "L").strip().upper()
+                        sec = str(row_move.get("section", "") or "").strip()
+                        day = str(row_move.get("day", "") or "").strip()
+                        st, et = row_move.get("start_time"), row_move.get("end_time")
+                        rn = _pick_room_for_slot(
+                            kind,
+                            sec,
+                            per,
+                            day,
+                            st,
+                            et,
+                            exclude_idx=idx_move,
+                            faculty_raw=str(row_move.get("faculty") or ""),
+                        )
+                        if rn and str(row_move.get("room", "") or "").strip() != rn:
+                            row_move["room"] = rn
+                            return 1
+                        if kind == "P":
+                            dur = _dur_minutes(st, et)
+                            sem = 0
+                            for sec_obj in sections or []:
+                                if str(getattr(sec_obj, "label", "") or "") == sec:
+                                    sem = int(getattr(sec_obj, "semester", 0) or 0)
+                                    break
+                            lw = LUNCH_WINDOWS.get(sem)
+                            for hh in range(9, 18):
+                                for mm in (0, 15, 30, 45):
+                                    ns = time(hh, mm)
+                                    end_m = hh * 60 + mm + dur
+                                    eh, em = divmod(end_m, 60)
+                                    if eh > 18 or (eh == 18 and em > 0):
+                                        continue
+                                    ne = time(eh, em)
+                                    if lw and _t_overlap(ns, ne, lw[0], lw[1]):
+                                        continue
+                                    if _slot_conflicts_for_section(sec, per, day, ns, ne):
+                                        continue
+                                    rn2 = _pick_room_for_slot(
+                                        kind,
+                                        sec,
+                                        per,
+                                        day,
+                                        ns,
+                                        ne,
+                                        exclude_idx=idx_move,
+                                        faculty_raw=str(row_move.get("faculty") or ""),
+                                    )
+                                    if not rn2:
+                                        continue
+                                    row_move["start_time"] = ns
+                                    row_move["end_time"] = ne
+                                    row_move["time_block"] = TimeBlock(day, ns, ne)
+                                    row_move["room"] = rn2
+                                    return 1
+                    return 0
+
+                def _display_code_for_kind(base: str, kind: str) -> str:
+                    if kind == "T":
+                        return f"{base}-TUT"
+                    if kind == "P":
+                        return f"{base}-LAB"
+                    return base
+
+                def _atomic_ltpsc_trim_one(tasks: Dict[str, List[Dict]]) -> int:
+                    """
+                    Remove exactly one overscheduled LTPSC row when strict verify reports
+                    scheduled > expected for a concrete course+section+kind.
+                    """
+                    kind_by_suffix = {"-TUT": "T", "-LAB": "P"}
+                    for task in tasks.get("ltpsc", []):
+                        base = task["course_code"]
+                        sec = task["section"]
+                        extra = {
+                            k: max(0, int(task["scheduled"][k]) - int(task["expected"][k]))
+                            for k in ("L", "T", "P")
+                        }
+                        if sum(extra.values()) <= 0:
+                            continue
+
+                        for kind in ("L", "T", "P"):
+                            if extra[kind] <= 0:
+                                continue
+                            candidates = []
+                            for idx, row in enumerate(final_ui_sessions):
+                                if str(row.get("section", "") or "").strip() != sec:
+                                    continue
+                                if _base_code_of(row.get("course_code")) != base:
+                                    continue
+                                row_kind = str(row.get("session_type", "L") or "L").strip().upper()
+                                if row_kind not in ("L", "T", "P"):
+                                    cc = str(row.get("course_code", "") or "").strip().upper()
+                                    row_kind = "L"
+                                    for suf, k2 in kind_by_suffix.items():
+                                        if cc.endswith(suf):
+                                            row_kind = k2
+                                            break
+                                if row_kind != kind:
+                                    continue
+                                candidates.append((idx, row))
+
+                            if not candidates:
+                                continue
+
+                            # Deterministic trim: remove latest day/time row first.
+                            idx_drop, _ = sorted(
+                                candidates,
+                                key=lambda p: (
+                                    _day_order.get(str(p[1].get("day", "") or ""), 99),
+                                    str(p[1].get("start_time") or ""),
+                                    normalize_period(p[1].get("period")),
+                                    p[0],
+                                ),
+                            )[-1]
+                            final_ui_sessions.pop(idx_drop)
+                            return 1
+                    return 0
+
+                def _atomic_ltpsc_one(tasks: Dict[str, List[Dict]]) -> int:
+                    sec_sem = {}
+                    for s0 in sections or []:
+                        sec_sem[str(getattr(s0, "label", "") or "")] = int(getattr(s0, "semester", 0) or 0)
+                    for task in tasks.get("ltpsc", []):
+                        base = task["course_code"]
+                        sec = task["section"]
+                        miss = {
+                            k: max(0, int(task["expected"][k]) - int(task["scheduled"][k]))
+                            for k in ("L", "T", "P")
+                        }
+                        if sum(miss.values()) <= 0:
+                            continue
+
+                        rows = [
+                            r for r in final_ui_sessions
+                            if str(r.get("section", "") or "") == sec
+                            and _base_code_of(r.get("course_code")) == base
+                        ]
+                        per_counts = {"PRE": 0, "POST": 0}
+                        for r in rows:
+                            per_counts[normalize_period(r.get("period"))] += 1
+                        target_period = "PRE" if per_counts["PRE"] <= per_counts["POST"] else "POST"
+                        period_order = [target_period, "POST" if target_period == "PRE" else "PRE"]
+
+                        faculty_default = ""
+                        for r in rows:
+                            f = str(r.get("faculty", "") or "").strip()
+                            if f:
+                                faculty_default = f
+                                break
+
+                        for kind in ("L", "T", "P"):
+                            dur = 90 if kind == "L" else (60 if kind == "T" else 120)
+                            if miss[kind] <= 0:
+                                continue
+                            for per0 in period_order:
+                                for day in WORKING_DAYS:
+                                    for hh in range(9, 18):
+                                        for mm in (0, 15, 30, 45):
+                                            st = time(hh, mm)
+                                            end_m = hh * 60 + mm + dur
+                                            eh, em = divmod(end_m, 60)
+                                            if eh > 18 or (eh == 18 and em > 0):
+                                                continue
+                                            et = time(eh, em)
+                                            sem = sec_sem.get(sec, 0)
+                                            lw = LUNCH_WINDOWS.get(sem)
+                                            if lw:
+                                                l0, l1 = lw
+                                                if _t_overlap(st, et, l0, l1):
+                                                    continue
+                                            if _slot_conflicts_for_section(sec, per0, day, st, et):
+                                                continue
+                                            rn = _pick_room_for_slot(
+                                                kind,
+                                                sec,
+                                                per0,
+                                                day,
+                                                st,
+                                                et,
+                                                faculty_raw=faculty_default,
+                                                allow_faculty_fallback=False,
+                                            )
+                                            if not rn:
+                                                continue
+                                            final_ui_sessions.append({
+                                                "phase": "Phase 5",
+                                                "course_code": _display_code_for_kind(base, kind),
+                                                "section": sec,
+                                                "day": day,
+                                                "start_time": st,
+                                                "end_time": et,
+                                                "time_block": TimeBlock(day, st, et),
+                                                "period": per0,
+                                                "session_type": kind,
+                                                "faculty": "" if kind == "P" else faculty_default,
+                                                "room": rn,
+                                            })
+                                            return 1
+                    return 0
+
+                def _atomic_fix_one_lunch(_tasks: Dict[str, List[Dict]]) -> int:
+                    sec_sem = {}
+                    for s0 in sections or []:
+                        sec_sem[str(getattr(s0, "label", "") or "")] = int(getattr(s0, "semester", 0) or 0)
+
+                    for idx, row in enumerate(final_ui_sessions):
+                        sec = str(row.get("section", "") or "")
+                        sem = sec_sem.get(sec, 0)
+                        lw = LUNCH_WINDOWS.get(sem)
+                        if not lw:
+                            continue
+                        st, et = row.get("start_time"), row.get("end_time")
+                        day = str(row.get("day", "") or "")
+                        if not (st and et and day):
+                            continue
+                        l0, l1 = lw
+                        if not _t_overlap(st, et, l0, l1):
+                            continue
+                        kind = str(row.get("session_type", "L") or "L").strip().upper()
+                        per = normalize_period(row.get("period"))
+                        dur = _dur_minutes(st, et)
+                        for hh in range(9, 18):
+                            for mm in (0, 15, 30, 45):
+                                ns = time(hh, mm)
+                                end_m = hh * 60 + mm + dur
+                                eh, em = divmod(end_m, 60)
+                                if eh > 18 or (eh == 18 and em > 0):
+                                    continue
+                                ne = time(eh, em)
+                                if _t_overlap(ns, ne, l0, l1):
+                                    continue
+                                if _slot_conflicts_for_section(sec, per, day, ns, ne):
+                                    continue
+                                rn = _pick_room_for_slot(
+                                    kind,
+                                    sec,
+                                    per,
+                                    day,
+                                    ns,
+                                    ne,
+                                    exclude_idx=idx,
+                                    faculty_raw=str(row.get("faculty") or ""),
+                                    allow_faculty_fallback=True,
+                                )
+                                if not rn:
+                                    continue
+                                row["start_time"] = ns
+                                row["end_time"] = ne
+                                row["time_block"] = TimeBlock(day, ns, ne)
+                                row["room"] = rn
+                                return 1
+                    return 0
+
+                def _atomic_fix_parsed_lunch_conflict(tasks: Dict[str, List[Dict]]) -> int:
+                    for t in tasks.get("time_constraints", []):
+                        day = str(t.get("day", "") or "").strip()
+                        st = _parse_clock(t.get("start"))
+                        et = _parse_clock(t.get("end"))
+                        if not (day and st and et):
+                            continue
+                        for idx, row in enumerate(final_ui_sessions):
+                            rday = str(row.get("day", "") or "").strip()
+                            rst, ret = row.get("start_time"), row.get("end_time")
+                            if not (rday and rst and ret):
+                                continue
+                            if rday != day or not _t_overlap(rst, ret, st, et):
+                                continue
+                            sec = str(row.get("section", "") or "")
+                            kind = str(row.get("session_type", "L") or "L").strip().upper()
+                            per = normalize_period(row.get("period"))
+                            dur = _dur_minutes(rst, ret)
+                            sem = 0
+                            for s0 in sections or []:
+                                if str(getattr(s0, "label", "") or "") == sec:
+                                    sem = int(getattr(s0, "semester", 0) or 0)
+                                    break
+                            lw = LUNCH_WINDOWS.get(sem)
+                            if not lw:
+                                continue
+                            for hh in range(9, 18):
+                                for mm in (0, 15, 30, 45):
+                                    ns = time(hh, mm)
+                                    end_m = hh * 60 + mm + dur
+                                    eh, em = divmod(end_m, 60)
+                                    if eh > 18 or (eh == 18 and em > 0):
+                                        continue
+                                    ne = time(eh, em)
+                                    if _t_overlap(ns, ne, lw[0], lw[1]):
+                                        continue
+                                    if _slot_conflicts_for_section(sec, per, day, ns, ne):
+                                        continue
+                                    rn = _pick_room_for_slot(
+                                        kind,
+                                        sec,
+                                        per,
+                                        day,
+                                        ns,
+                                        ne,
+                                        exclude_idx=idx,
+                                        faculty_raw=str(row.get("faculty") or ""),
+                                        allow_faculty_fallback=True,
+                                    )
+                                    if not rn:
+                                        continue
+                                    row["start_time"] = ns
+                                    row["end_time"] = ne
+                                    row["time_block"] = TimeBlock(day, ns, ne)
+                                    row["room"] = rn
+                                    return 1
+                    return 0
+
+                def _force_resolve_one_room_conflict() -> int:
+                    entries = []
+                    for idx, row in enumerate(final_ui_sessions):
+                        per = normalize_period(row.get("period"))
+                        day = str(row.get("day", "") or "")
+                        st, et = row.get("start_time"), row.get("end_time")
+                        if not (day and st and et):
+                            continue
+                        kind = str(row.get("session_type", "L") or "L").strip().upper()
+                        sec = str(row.get("section", "") or "").strip()
+                        rooms = [x.strip() for x in str(row.get("room", "") or "").split(",") if x.strip()]
+                        for rn in rooms:
+                            entries.append((idx, per, day, st, et, kind, sec, rn))
+
+                    conflicts = []
+                    for i in range(len(entries)):
+                        ai, ap, ad, as_, ae, ak, asec, ar = entries[i]
+                        for j in range(i + 1, len(entries)):
+                            bi, bp, bd, bs, be, bk, bsec, br = entries[j]
+                            if ar != br or ap != bp or ad != bd:
+                                continue
+                            if not _t_overlap(as_, ae, bs, be):
+                                continue
+                            if ai == bi:
+                                continue
+                            conflicts.append((ar, ap, ad, min(ai, bi), max(ai, bi)))
+
+                    if not conflicts:
+                        return 0
+
+                    conflicts.sort()
+                    for _room, per, day, _lo, hi in conflicts:
+                        row = final_ui_sessions[hi]
+                        st, et = row.get("start_time"), row.get("end_time")
+                        key = (_room, per, day, hi, str(st), str(et))
+                        if key in _attempted_room_conflict_keys:
+                            continue
+                        _attempted_room_conflict_keys.add(key)
+                        idx_move = hi
+                        kind = str(row.get("session_type", "L") or "L").strip().upper()
+                        sec = str(row.get("section", "") or "").strip()
+                        if not (st and et and sec):
+                            continue
+                        dur = _dur_minutes(st, et)
+                        _sem = 0
+                        for s0 in sections or []:
+                            if str(getattr(s0, "label", "") or "") == sec:
+                                _sem = int(getattr(s0, "semester", 0) or 0)
+                                break
+                        lw = LUNCH_WINDOWS.get(_sem)
+
+                        day_order = [day] + [d for d in WORKING_DAYS if d != day]
+                        for d0 in day_order:
+                            for hh in range(9, 18):
+                                for mm in (0, 15, 30, 45):
+                                    ns = time(hh, mm)
+                                    end_m = hh * 60 + mm + dur
+                                    eh, em = divmod(end_m, 60)
+                                    if eh > 18 or (eh == 18 and em > 0):
+                                        continue
+                                    ne = time(eh, em)
+                                    if lw and _t_overlap(ns, ne, lw[0], lw[1]):
+                                        continue
+                                    if _slot_conflicts_for_section(sec, per, d0, ns, ne):
+                                        continue
+                                    rn = _pick_room_for_slot(
+                                        kind,
+                                        sec,
+                                        per,
+                                        d0,
+                                        ns,
+                                        ne,
+                                        exclude_idx=idx_move,
+                                        faculty_raw=str(row.get("faculty") or ""),
+                                        allow_faculty_fallback=False,
+                                    forbidden_rooms={_room},
+                                    )
+                                    if not rn:
+                                        continue
+                                    row["day"] = d0
+                                    row["start_time"] = ns
+                                    row["end_time"] = ne
+                                    row["time_block"] = TimeBlock(d0, ns, ne)
+                                    row["room"] = rn
+                                    return 1
+                    return 0
+
+                def _faculty_overlap_move_idx() -> Optional[int]:
+                    """First overlapping L/T pair (same period+day); move the higher-index row."""
+                    n = len(final_ui_sessions)
+                    for i in range(n):
+                        ri = final_ui_sessions[i]
+                        if str(ri.get("session_type", "L") or "L").strip().upper() == "P":
+                            continue
+                        fi = str(ri.get("faculty", "") or "").strip()
+                        toki = _faculty_tokens(fi)
+                        if not toki:
+                            continue
+                        for j in range(i + 1, n):
+                            rj = final_ui_sessions[j]
+                            if str(rj.get("session_type", "L") or "L").strip().upper() == "P":
+                                continue
+                            fj = str(rj.get("faculty", "") or "").strip()
+                            if not (_faculty_tokens(fj) & toki):
+                                continue
+                            if normalize_period(ri.get("period")) != normalize_period(rj.get("period")):
+                                continue
+                            if str(ri.get("day", "") or "").strip() != str(rj.get("day", "") or "").strip():
+                                continue
+                            st_i, et_i = ri.get("start_time"), ri.get("end_time")
+                            st_j, et_j = rj.get("start_time"), rj.get("end_time")
+                            if not (st_i and et_i and st_j and et_j):
+                                continue
+                            if not _t_overlap(st_i, et_i, st_j, et_j):
+                                continue
+                            return max(i, j)
+                    return None
+
+                def _try_relocate_row_faculty(idx_move: int) -> int:
+                    """Move one L/T row to a slot free for its section and instructor (cross-section safe)."""
+                    row = final_ui_sessions[idx_move]
+                    kind = str(row.get("session_type", "L") or "L").strip().upper()
+                    if kind == "P":
+                        return 0
+                    sec = str(row.get("section", "") or "").strip()
+                    fac = str(row.get("faculty", "") or "").strip()
+                    per = normalize_period(row.get("period"))
+                    day = str(row.get("day", "") or "").strip()
+                    st, et = row.get("start_time"), row.get("end_time")
+                    if not (sec and day and st and et):
+                        return 0
+                    dur = _dur_minutes(st, et)
+                    _sem = 0
+                    for s0 in sections or []:
+                        if str(getattr(s0, "label", "") or "") == sec:
+                            _sem = int(getattr(s0, "semester", 0) or 0)
+                            break
+                    lw = LUNCH_WINDOWS.get(_sem)
+                    day_order = [day] + [d for d in WORKING_DAYS if d != day]
+                    for d0 in day_order:
+                        for hh in range(9, 18):
+                            for mm in (0, 15, 30, 45):
+                                ns = time(hh, mm)
+                                end_m = hh * 60 + mm + dur
+                                eh, em = divmod(end_m, 60)
+                                if eh > 18 or (eh == 18 and em > 0):
+                                    continue
+                                ne = time(eh, em)
+                                if lw and _t_overlap(ns, ne, lw[0], lw[1]):
+                                    continue
+                                if _slot_conflicts_for_section(sec, per, d0, ns, ne):
+                                    continue
+                                if fac and _faculty_slot_busy(fac, per, d0, ns, ne, idx_move):
+                                    continue
+                                rn = _pick_room_for_slot(
+                                    kind,
+                                    sec,
+                                    per,
+                                    d0,
+                                    ns,
+                                    ne,
+                                    exclude_idx=idx_move,
+                                    faculty_raw=fac,
+                                    allow_faculty_fallback=False,
+                                )
+                                if not rn:
+                                    continue
+                                row["day"] = d0
+                                row["start_time"] = ns
+                                row["end_time"] = ne
+                                row["time_block"] = TimeBlock(d0, ns, ne)
+                                row["room"] = rn
+                                return 1
+                    return 0
+
+                def _atomic_fix_parsed_faculty_conflict(tasks: Dict[str, List[Dict]]) -> int:
+                    for t in tasks.get("faculty_conflicts", []):
+                        fac = str(t.get("faculty", "") or "").strip()
+                        if not fac:
+                            continue
+                        course_a = str(t.get("course_a", "") or "").strip().upper()
+                        course_b = str(t.get("course_b", "") or "").strip().upper()
+                        section_a = str(t.get("section_a", "") or "").strip()
+                        section_b = str(t.get("section_b", "") or "").strip()
+                        day = str(t.get("day", "") or "").strip()
+                        per = normalize_period(t.get("period"))
+                        st = _parse_clock(t.get("start"))
+                        et = _parse_clock(t.get("end"))
+                        ftoks = _faculty_tokens(fac)
+                        colliding = []
+                        for idx, row in enumerate(final_ui_sessions):
+                            kind = str(row.get("session_type", "L") or "L").strip().upper()
+                            if kind == "P":
+                                continue
+                            if day and str(row.get("day", "") or "").strip() != day:
+                                continue
+                            if per and normalize_period(row.get("period")) != per:
+                                continue
+                            base = _base_code_of(row.get("course_code"))
+                            if course_a and course_b and base not in (course_a, course_b):
+                                continue
+                            if section_a and section_b:
+                                sec_now = str(row.get("section", "") or "").strip()
+                                if sec_now not in (section_a, section_b):
+                                    continue
+                            rf = str(row.get("faculty", "") or "").strip()
+                            if not rf or not (_faculty_tokens(rf) & ftoks):
+                                continue
+                            rs, re_ = row.get("start_time"), row.get("end_time")
+                            if st and et and rs and re_ and (not _t_overlap(rs, re_, st, et)):
+                                continue
+                            colliding.append(idx)
+                        if len(colliding) < 2:
+                            continue
+                        for idx_move in sorted(colliding, reverse=True):
+                            if _try_relocate_row_faculty(idx_move):
+                                return 1
+                    return 0
+
+                def _atomic_fix_any_faculty_overlap() -> int:
+                    """Fallback: move one row from the first detected faculty overlap pair."""
+                    n = len(final_ui_sessions)
+                    for i in range(n):
+                        ri = final_ui_sessions[i]
+                        if str(ri.get("session_type", "L") or "L").strip().upper() == "P":
+                            continue
+                        fi = str(ri.get("faculty", "") or "").strip()
+                        toki = _faculty_tokens(fi)
+                        if not toki:
+                            continue
+                        for j in range(i + 1, n):
+                            rj = final_ui_sessions[j]
+                            if str(rj.get("session_type", "L") or "L").strip().upper() == "P":
+                                continue
+                            fj = str(rj.get("faculty", "") or "").strip()
+                            if not (_faculty_tokens(fj) & toki):
+                                continue
+                            if normalize_period(ri.get("period")) != normalize_period(rj.get("period")):
+                                continue
+                            if str(ri.get("day", "") or "").strip() != str(rj.get("day", "") or "").strip():
+                                continue
+                            st_i, et_i = ri.get("start_time"), ri.get("end_time")
+                            st_j, et_j = rj.get("start_time"), rj.get("end_time")
+                            if not (st_i and et_i and st_j and et_j and _t_overlap(st_i, et_i, st_j, et_j)):
+                                continue
+                            for idx_move in (max(i, j), min(i, j)):
+                                if _try_relocate_row_faculty(idx_move):
+                                    return 1
+                            return 0
+                    return 0
+
+                def _count_errors_with(rule_fragment: str, errs: List[Dict]) -> int:
+                    key = str(rule_fragment or "").strip().lower()
+                    return sum(1 for e in (errs or []) if key in str(e.get("rule", "") or "").strip().lower())
+
+                def _atomic_fix_one_section_overlap(tasks: Dict[str, List[Dict]]) -> int:
+                    targets = {(t.get("course_a"), t.get("course_b")) for t in tasks.get("section_overlaps", [])}
+                    candidates = []
+                    n = len(final_ui_sessions)
+                    for i in range(n):
+                        a = final_ui_sessions[i]
+                        asec = str(a.get("section", "") or "").strip()
+                        aday = str(a.get("day", "") or "").strip()
+                        aper = normalize_period(a.get("period"))
+                        ast, aet = a.get("start_time"), a.get("end_time")
+                        if not (asec and aday and ast and aet):
+                            continue
+                        abase = _base_code_of(a.get("course_code"))
+                        for j in range(i + 1, n):
+                            b = final_ui_sessions[j]
+                            if str(b.get("section", "") or "").strip() != asec:
+                                continue
+                            if str(b.get("day", "") or "").strip() != aday:
+                                continue
+                            if normalize_period(b.get("period")) != aper:
+                                continue
+                            bst, bet = b.get("start_time"), b.get("end_time")
+                            if not (bst and bet and _t_overlap(ast, aet, bst, bet)):
+                                continue
+                            bbase = _base_code_of(b.get("course_code"))
+                            pair = (abase, bbase)
+                            pair_rev = (bbase, abase)
+                            if targets and pair not in targets and pair_rev not in targets:
+                                continue
+                            candidates.append((i, j))
+                    if not candidates:
+                        return 0
+
+                    for i, j in sorted(candidates, key=lambda p: p[1], reverse=True):
+                        for idx_move in (j, i):
+                            row = final_ui_sessions[idx_move]
+                            kind = str(row.get("session_type", "L") or "L").strip().upper()
+                            sec = str(row.get("section", "") or "").strip()
+                            fac = str(row.get("faculty", "") or "").strip()
+                            per = normalize_period(row.get("period"))
+                            day = str(row.get("day", "") or "").strip()
+                            st, et = row.get("start_time"), row.get("end_time")
+                            if not (sec and day and st and et):
+                                continue
+                            dur = _dur_minutes(st, et)
+                            _sem = 0
+                            for s0 in sections or []:
+                                if str(getattr(s0, "label", "") or "") == sec:
+                                    _sem = int(getattr(s0, "semester", 0) or 0)
+                                    break
+                            lw = LUNCH_WINDOWS.get(_sem)
+                            day_order = [day] + [d for d in WORKING_DAYS if d != day]
+                            for d0 in day_order:
+                                for hh in range(9, 18):
+                                    for mm in (0, 15, 30, 45):
+                                        ns = time(hh, mm)
+                                        end_m = hh * 60 + mm + dur
+                                        eh, em = divmod(end_m, 60)
+                                        if eh > 18 or (eh == 18 and em > 0):
+                                            continue
+                                        ne = time(eh, em)
+                                        if lw and _t_overlap(ns, ne, lw[0], lw[1]):
+                                            continue
+                                        if _slot_conflicts_for_section(sec, per, d0, ns, ne):
+                                            continue
+                                        # For combined courses, also verify the new slot is free for all sibling sections
+                                        orig_code_chk = str(row.get("course_code", "") or "").strip()
+                                        orig_day_chk = str(row.get("day", "") or "").strip()
+                                        orig_st_chk = row.get("start_time")
+                                        sibling_free = True
+                                        for sib in final_ui_sessions:
+                                            if sib is row:
+                                                continue
+                                            if str(sib.get("course_code", "") or "").strip() != orig_code_chk:
+                                                continue
+                                            if normalize_period(sib.get("period")) != per:
+                                                continue
+                                            if str(sib.get("day", "") or "").strip() != orig_day_chk:
+                                                continue
+                                            if sib.get("start_time") != orig_st_chk:
+                                                continue
+                                            sib_sec = str(sib.get("section", "") or "").strip()
+                                            if _slot_conflicts_for_section(sib_sec, per, d0, ns, ne):
+                                                sibling_free = False
+                                                break
+                                        if not sibling_free:
+                                            continue
+                                        if kind != "P" and fac and _faculty_slot_busy(fac, per, d0, ns, ne, idx_move):
+                                            continue
+                                        rn = _pick_room_for_slot(
+                                            kind,
+                                            sec,
+                                            per,
+                                            d0,
+                                            ns,
+                                            ne,
+                                            exclude_idx=idx_move,
+                                            faculty_raw=fac,
+                                            allow_faculty_fallback=False,
+                                        )
+                                        if not rn:
+                                            continue
+                                        # Move the conflicting row
+                                        orig_day = row["day"]
+                                        orig_st = row["start_time"]
+                                        orig_code = str(row.get("course_code", "") or "").strip()
+                                        orig_per = normalize_period(row.get("period"))
+                                        row["day"] = d0
+                                        row["start_time"] = ns
+                                        row["end_time"] = ne
+                                        row["time_block"] = TimeBlock(d0, ns, ne)
+                                        row["room"] = rn
+                                        # Also move sibling rows (combined-class: same code+period+day+start across sections)
+                                        for sibling in final_ui_sessions:
+                                            if sibling is row:
+                                                continue
+                                            if str(sibling.get("course_code", "") or "").strip() != orig_code:
+                                                continue
+                                            if normalize_period(sibling.get("period")) != orig_per:
+                                                continue
+                                            if str(sibling.get("day", "") or "").strip() != orig_day:
+                                                continue
+                                            if sibling.get("start_time") != orig_st:
+                                                continue
+                                            sibling["day"] = d0
+                                            sibling["start_time"] = ns
+                                            sibling["end_time"] = ne
+                                            sibling["time_block"] = TimeBlock(d0, ns, ne)
+                                            # Assign room for sibling's section
+                                            sib_sec = str(sibling.get("section", "") or "").strip()
+                                            sib_room = _pick_room_for_slot(
+                                                kind, sib_sec, orig_per, d0, ns, ne,
+                                                exclude_idx=None,
+                                                faculty_raw=fac,
+                                                allow_faculty_fallback=False,
+                                            )
+                                            sibling["room"] = sib_room or rn
+                                        return 1
+                    return 0
+
+                def _atomic_fix_one_practical_lab_doublebook(_tasks: Dict[str, List[Dict]]) -> int:
+                    entries = []
+                    for idx, row in enumerate(final_ui_sessions):
+                        if str(row.get("session_type", "L") or "L").strip().upper() != "P":
+                            continue
+                        per = normalize_period(row.get("period"))
+                        day = str(row.get("day", "") or "").strip()
+                        st, et = row.get("start_time"), row.get("end_time")
+                        sec = str(row.get("section", "") or "").strip()
+                        if not (day and st and et and sec):
+                            continue
+                        for rn in [x.strip() for x in str(row.get("room", "") or "").split(",") if x.strip()]:
+                            entries.append((idx, rn, per, day, st, et, sec))
+                    conflicts = []
+                    for i in range(len(entries)):
+                        ai, ar, ap, ad, ast, aet, asec = entries[i]
+                        for j in range(i + 1, len(entries)):
+                            bi, br, bp, bd, bst, bet, bsec = entries[j]
+                            if ar != br or ap != bp or ad != bd:
+                                continue
+                            if not _t_overlap(ast, aet, bst, bet):
+                                continue
+                            if ai == bi:
+                                continue
+                            conflicts.append((ar, ap, ad, min(ai, bi), max(ai, bi)))
+                    if not conflicts:
+                        return 0
+                    conflicts.sort()
+                    _room, per, day, _lo, idx_move = conflicts[0]
+                    row = final_ui_sessions[idx_move]
+                    kind = "P"
+                    sec = str(row.get("section", "") or "").strip()
+                    st, et = row.get("start_time"), row.get("end_time")
+                    if not (sec and st and et):
+                        return 0
+                    dur = _dur_minutes(st, et)
+                    _sem = 0
+                    for s0 in sections or []:
+                        if str(getattr(s0, "label", "") or "") == sec:
+                            _sem = int(getattr(s0, "semester", 0) or 0)
+                            break
+                    lw = LUNCH_WINDOWS.get(_sem)
+                    day_order = [day] + [d for d in WORKING_DAYS if d != day]
+                    for d0 in day_order:
+                        for hh in range(9, 18):
+                            for mm in (0, 15, 30, 45):
+                                ns = time(hh, mm)
+                                end_m = hh * 60 + mm + dur
+                                eh, em = divmod(end_m, 60)
+                                if eh > 18 or (eh == 18 and em > 0):
+                                    continue
+                                ne = time(eh, em)
+                                if lw and _t_overlap(ns, ne, lw[0], lw[1]):
+                                    continue
+                                if _slot_conflicts_for_section(sec, per, d0, ns, ne):
+                                    continue
+                                rn = _pick_room_for_slot(
+                                    kind,
+                                    sec,
+                                    per,
+                                    d0,
+                                    ns,
+                                    ne,
+                                    exclude_idx=idx_move,
+                                    faculty_raw="",
+                                    allow_faculty_fallback=False,
+                                )
+                                if not rn:
+                                    continue
+                                row["day"] = d0
+                                row["start_time"] = ns
+                                row["end_time"] = ne
+                                row["time_block"] = TimeBlock(d0, ns, ne)
+                                row["room"] = rn
+                                return 1
+                    return 0
+
+                for _pass in range(10):
+                    occ = {}  # (period, room, day) -> [(start,end)]
+                    moved = 0
+
+                    # Deterministic ordering helps convergence:
+                    # schedule longer practicals first so they "claim" lab sets early.
+                    iter_sessions = sorted(
+                        list(final_ui_sessions),
+                        key=lambda s: (
+                            _np(s.get("period")),
+                            _day_order.get(str(s.get("day") or ""), 99),
+                            str(s.get("start_time") or ""),
+                            0 if str(s.get("session_type") or "L").strip().upper() == "P" else 1,
+                            -_dur_minutes(s.get("start_time"), s.get("end_time")),
+                            str(s.get("course_code") or ""),
+                            str(s.get("section") or ""),
+                        ),
+                    )
+
+                    for s in iter_sessions:
+                        room = str(s.get("room") or "").strip()
+                        period = _np(s.get("period"))
+                        day = str(s.get("day") or "")
+                        st = s.get("start_time")
+                        et = s.get("end_time")
+                        if not (day and st and et):
+                            continue
+                        stype = str(s.get("session_type") or "L").strip().upper()
+                        sec = str(s.get("section") or "").strip()
+                        needed = section_students.get(sec, 0)
+                        if not room:
+                            # Fill blank rooms before strict verification.
+                            candidates = lab_rooms if stype == "P" else class_rooms
+                            for r in candidates:
+                                rn = getattr(r, "room_number", "")
+                                if stype in ("L", "T") and needed and room_caps.get(rn, 0) < needed:
+                                    continue
+                                ok = True
+                                for (occ_start, occ_end) in occ.get((period, rn, day), []):
+                                    if _t_overlap(st, et, occ_start, occ_end):
+                                        ok = False
+                                        break
+                                if ok:
+                                    s["room"] = rn
+                                    room = rn
+                                    moved += 1
+                                    break
+                            if not room and candidates:
+                                # Final fallback: keep any non-conflicting room even if under-capacity.
+                                for r in candidates:
+                                    rn = getattr(r, "room_number", "")
+                                    ok = True
+                                    for (occ_start, occ_end) in occ.get((period, rn, day), []):
+                                        if _t_overlap(st, et, occ_start, occ_end):
+                                            ok = False
+                                            break
+                                    if ok:
+                                        s["room"] = rn
+                                        room = rn
+                                        moved += 1
+                                        break
+                            if not room:
+                                continue
+
+                        rooms = [x.strip() for x in room.split(",") if x.strip()]
+                        if not rooms:
+                            rooms = [room]
+                        # Preserve canonical Phase 4 combined C004 sessions; all other C004 uses
+                        # are eligible for reassignment if they create strict conflicts.
+                        is_phase4_combined = str(s.get("phase") or "").strip().lower() == "phase 4"
+                        if room == "C004" and is_phase4_combined and stype in ("L", "T"):
+                            for rname in rooms:
+                                occ.setdefault((period, rname, day), []).append((st, et))
+                            continue
+
+                        # Capacity check: if L/T room is under-capacity, treat as needing reassignment.
+                        under_capacity = False
+                        if stype in ("L", "T") and needed:
+                            # pick max cap for comma-separated room list (defensive)
+                            cap_now = max(room_caps.get(rn, 0) for rn in rooms) if rooms else 0
+                            if cap_now and cap_now < needed:
+                                under_capacity = True
+
+                        # If any listed room conflicts, reassign whole session room
+                        conflict = False
+                        for rname in rooms:
+                            for (occ_start, occ_end) in occ.get((period, rname, day), []):
+                                if _t_overlap(st, et, occ_start, occ_end):
+                                    conflict = True
+                                    break
+                            if conflict:
+                                break
+
+                        if not conflict and not under_capacity:
+                            for rname in rooms:
+                                occ.setdefault((period, rname, day), []).append((st, et))
+                            continue
+                        candidates = lab_rooms if stype == "P" else class_rooms
+                        assigned = False
+
+                        # For practicals, prioritize eliminating conflicts even if it means
+                        # reducing a multi-lab assignment to a single lab (strict verify cares
+                        # about double-booking, not lab-count).
+                        if stype == "P":
+                            # Try single-lab first
+                            new_room = ""
+                            for r in candidates:
+                                rn = getattr(r, "room_number", "")
+                                ok = True
+                                for (occ_start, occ_end) in occ.get((period, rn, day), []):
+                                    if _t_overlap(st, et, occ_start, occ_end):
+                                        ok = False
+                                        break
+                                if ok:
+                                    new_room = rn
+                                    break
+                            if new_room:
+                                s["room"] = new_room
+                                occ.setdefault((period, new_room, day), []).append((st, et))
+                                moved += 1
+                                assigned = True
+                            # If no non-research lab is free, retry with fallback pool (may include research labs).
+                            if not assigned:
+                                new_room = ""
+                                for r in lab_rooms_fallback:
+                                    rn = getattr(r, "room_number", "")
+                                    ok = True
+                                    for (occ_start, occ_end) in occ.get((period, rn, day), []):
+                                        if _t_overlap(st, et, occ_start, occ_end):
+                                            ok = False
+                                            break
+                                    if ok:
+                                        new_room = rn
+                                        break
+                                if new_room:
+                                    s["room"] = new_room
+                                    occ.setdefault((period, new_room, day), []).append((st, et))
+                                    moved += 1
+                                    assigned = True
+                            # If still not assigned and original had multiple labs, try to find an N-lab set all free.
+                            if (not assigned) and len(rooms) >= 2:
+                                needed_n = len(rooms)
+                                chosen = []
+                                for r in candidates:
+                                    rn = getattr(r, "room_number", "")
+                                    ok = True
+                                    for (occ_start, occ_end) in occ.get((period, rn, day), []):
+                                        if _t_overlap(st, et, occ_start, occ_end):
+                                            ok = False
+                                            break
+                                    if not ok:
+                                        continue
+                                    chosen.append(rn)
+                                    if len(chosen) >= needed_n:
+                                        break
+                                if len(chosen) >= needed_n:
+                                    new_room = ", ".join(chosen[:needed_n])
+                                    s["room"] = new_room
+                                    for rn in chosen[:needed_n]:
+                                        occ.setdefault((period, rn, day), []).append((st, et))
+                                    moved += 1
+                                    assigned = True
+
+                        # Otherwise (or fallback), try to move to a single free candidate room
+                        if not assigned:
+                            new_room = ""
+                            for r in candidates:
+                                rn = getattr(r, "room_number", "")
+                                cap = room_caps.get(rn, 0)
+                                if stype in ("L", "T") and needed and cap < needed:
+                                    continue
+                                ok = True
+                                for (occ_start, occ_end) in occ.get((period, rn, day), []):
+                                    if _t_overlap(st, et, occ_start, occ_end):
+                                        ok = False
+                                        break
+                                if ok:
+                                    new_room = rn
+                                    break
+                            if new_room:
+                                s["room"] = new_room
+                                occ.setdefault((period, new_room, day), []).append((st, et))
+                                moved += 1
+                                assigned = True
+
+                        if not assigned:
+                            # Keep original; record occupancy to reduce cascading
+                            for rname in rooms:
+                                occ.setdefault((period, rname, day), []).append((st, et))
+
+                    if moved == 0:
+                        break
+
+                # Final targeted sweep: eliminate any remaining lab double-bookings
+                # (especially comma-separated lab lists) before strict verification.
+                def _normalize_room_list(v):
+                    return [x.strip() for x in str(v or "").split(",") if x and str(x).strip()]
+
+                for _pass2 in range(6):
+                    changed2 = 0
+                    occ2 = {}  # (period, room, day) -> list[(start,end,idx)]
+                    p_rows = []
+                    for idx, s in enumerate(final_ui_sessions):
+                        if str(s.get("session_type", "L") or "L").strip().upper() != "P":
+                            continue
+                        day = str(s.get("day") or "")
+                        st = s.get("start_time")
+                        et = s.get("end_time")
+                        if not (day and st and et):
+                            continue
+                        period = _np(s.get("period"))
+                        rooms = _normalize_room_list(s.get("room"))
+                        if not rooms:
+                            continue
+                        p_rows.append((idx, s, period, day, st, et, rooms))
+                        for rn in rooms:
+                            occ2.setdefault((period, rn, day), []).append((st, et, idx))
+
+                    conflict_idx = set()
+                    for (_k, rows2) in occ2.items():
+                        for i in range(len(rows2)):
+                            a_s, a_e, a_i = rows2[i]
+                            for j in range(i + 1, len(rows2)):
+                                b_s, b_e, b_i = rows2[j]
+                                if _t_overlap(a_s, a_e, b_s, b_e):
+                                    conflict_idx.add(max(a_i, b_i))  # move deterministic later row
+
+                    if not conflict_idx:
+                        break
+
+                    lab_pool = list(lab_rooms) + [r for r in lab_rooms_fallback if getattr(r, "room_number", "") not in {getattr(x, "room_number", "") for x in lab_rooms}]
+                    for idx, s, period, day, st, et, rooms in p_rows:
+                        if idx not in conflict_idx:
+                            continue
+                        new_room = ""
+                        for r in lab_pool:
+                            rn = getattr(r, "room_number", "")
+                            if not rn:
+                                continue
+                            blocked = False
+                            for (occ_s, occ_e, occ_i) in occ2.get((period, rn, day), []):
+                                if occ_i == idx:
+                                    continue
+                                if _t_overlap(st, et, occ_s, occ_e):
+                                    blocked = True
+                                    break
+                            if not blocked:
+                                new_room = rn
+                                break
+                        if new_room and str(s.get("room") or "").strip() != new_room:
+                            s["room"] = new_room
+                            changed2 += 1
+                    if changed2 == 0:
+                        break
+            except Exception as _room_fix_e:
+                print(f"WARNING: room double-booking repair pass failed: {_room_fix_e}")
+
+            print("\nStrict verification (zero violations required)...")
+            try:
+                # Sem2-focused audit lens requested by user (reporting only).
+                room_caps = {getattr(r, "room_number", ""): int(getattr(r, "capacity", 0) or 0) for r in (classrooms or [])}
+                sem2_rows = [
+                    s for s in final_ui_sessions
+                    if "Sem2" in str(s.get("section", "") or "")
+                    and str(s.get("session_type", "L") or "L").strip().upper() in ("L", "T")
+                ]
+                sem2_under = 0
+                for s in sem2_rows:
+                    sec = str(s.get("section", "") or "")
+                    needed = 0
+                    for _sec in (sections or []):
+                        if getattr(_sec, "label", "") == sec:
+                            needed = int(getattr(_sec, "students", 0) or 0)
+                            break
+                    rms = [x.strip() for x in str(s.get("room", "") or "").split(",") if x.strip()]
+                    cap = max([room_caps.get(rn, 0) for rn in rms], default=0)
+                    if needed and cap and cap < needed:
+                        sem2_under += 1
+                print(f"[Sem2 audit] LT rows={len(sem2_rows)}, under-capacity rows={sem2_under}")
+            except Exception as _sem2_audit_e:
+                print(f"WARNING: Sem2 audit skipped: {_sem2_audit_e}")
+            ok_verify, ver_errors = run_strict_verification_on_final_ui(
+                final_ui_sessions, courses, sections, classrooms
+            )
+            if not ok_verify:
+                # One deterministic repair per micro-iteration, then re-verify (reduces cascade).
+                _attempted_room_conflict_keys = set()
+                _initial_errs = len(ver_errors or [])
+                _micro_budget = _scaled_budget(
+                    max(
+                        18,
+                        (_initial_errs * 3) + (len(final_ui_sessions or []) // 25) + (len(classrooms or []) // 2)
+                    ),
+                    minimum=12,
+                )
+                for _micro in range(_micro_budget):
+                    _guard_runtime_or_raise(f"strict_fix_micro_{_micro + 1}")
+                    _tasks = _parse_strict_tasks(ver_errors)
+                    _has_room = bool(_tasks.get("room_conflicts"))
+                    _has_lunch = bool(_tasks.get("time_constraints"))
+                    _has_ltpsc = bool(_tasks.get("ltpsc"))
+                    _has_faculty = bool(_tasks.get("faculty_conflicts"))
+                    _has_section_overlap = bool(_tasks.get("section_overlaps")) or _count_errors_with("section overlap", ver_errors) > 0
+                    _has_lab_doublebook = _count_errors_with("classroom conflict", ver_errors) > 0
+                    _step = 0
+                    _step_tag = ""
+                    _before = None
+                    _pre_total = len(ver_errors)
+                    _pre_section = _count_errors_with("section overlap", ver_errors)
+                    _pre_room = _count_errors_with("classroom conflict", ver_errors)
+
+                    if _has_section_overlap or _has_lab_doublebook:
+                        from copy import deepcopy
+                        _before = deepcopy(final_ui_sessions)
+
+                    _step += _atomic_fill_blank_room(_tasks)
+                    if _step and not _step_tag:
+                        _step_tag = "fill"
+                    if (not _step) and _has_ltpsc:
+                        _step += _atomic_ltpsc_trim_one(_tasks)
+                        if _step:
+                            _step_tag = "ltpsc"
+                    if (not _step) and _has_ltpsc:
+                        _step += _atomic_ltpsc_one(_tasks)
+                        if _step:
+                            _step_tag = "ltpsc"
+                    if (not _step) and _has_faculty:
+                        _step += _atomic_fix_parsed_faculty_conflict(_tasks)
+                        if _step:
+                            _step_tag = "faculty"
+                    if (not _step) and _has_faculty:
+                        _step += _atomic_fix_any_faculty_overlap()
+                        if _step:
+                            _step_tag = "faculty_fallback"
+                    if (not _step) and _has_section_overlap:
+                        _step += _atomic_fix_one_section_overlap(_tasks)
+                        if _step:
+                            _step_tag = "section"
+                    if (not _step) and _has_lab_doublebook:
+                        _step += _atomic_fix_one_practical_lab_doublebook(_tasks)
+                        if _step:
+                            _step_tag = "lab"
+                    if (not _step) and _has_lunch:
+                        _step += _atomic_fix_parsed_lunch_conflict(_tasks)
+                        if _step:
+                            _step_tag = "lunch_parsed"
+                    if (not _step) and _has_lunch:
+                        _step += _atomic_fix_one_lunch(_tasks)
+                        if _step:
+                            _step_tag = "lunch"
+                    if (not _step) and _has_room:
+                        _step += _force_resolve_one_room_conflict()
+                        if _step:
+                            _step_tag = "room"
+                    if (not _step) and _has_lunch:
+                        _step += _atomic_fix_one_lunch(_tasks)
+                        if _step:
+                            _step_tag = "lunch"
+                    if (not _step) and _has_ltpsc:
+                        _step += _atomic_ltpsc_trim_one(_tasks)
+                        if _step:
+                            _step_tag = "ltpsc"
+                    if (not _step) and _has_ltpsc:
+                        _step += _atomic_ltpsc_one(_tasks)
+                        if _step:
+                            _step_tag = "ltpsc"
+                    if (not _step) and (not _has_lunch):
+                        # Last-resort deterministic nudge only when typed tasks cannot progress.
+                        _step += _force_resolve_one_room_conflict()
+                        if _step:
+                            _step_tag = "fallback_room"
+                    ok_verify, ver_errors = run_strict_verification_on_final_ui(
+                        final_ui_sessions, courses, sections, classrooms
+                    )
+
+                    # Transactional guard for high-oscillation repairs.
+                    if _step and _before is not None and _step_tag in ("section", "lab"):
+                        _post_section = _count_errors_with("section overlap", ver_errors)
+                        _post_room = _count_errors_with("classroom conflict", ver_errors)
+                        _improved = True
+                        # Section moves can trade overlap location before reducing total;
+                        # don't auto-revert them unless they increase total errors.
+                        if _step_tag == "section" and len(ver_errors) > _pre_total:
+                            _improved = False
+                        if _step_tag == "lab" and not (
+                            (_post_room < _pre_room) or
+                            (_post_room == _pre_room and len(ver_errors) < _pre_total)
+                        ):
+                            _improved = False
+                        if not _improved:
+                            final_ui_sessions[:] = _before
+                            ok_verify, ver_errors = run_strict_verification_on_final_ui(
+                                final_ui_sessions, courses, sections, classrooms
+                            )
+                            _step = 0
+                            _step_tag = f"{_step_tag}_reverted"
+
+                    _rule_counts = {}
+                    for _err in ver_errors or []:
+                        _r = str(_err.get("rule", "") or "")
+                        _rule_counts[_r] = _rule_counts.get(_r, 0) + 1
+                    print(
+                        f"  [strict-fix micro {_micro + 1}] step={_step} tag={_step_tag}, "
+                        f"remaining={len(ver_errors)} {_rule_counts}"
+                    )
+                    if ok_verify or _step == 0:
+                        break
+            # Strict moves run only on final_ui_sessions; Phase 6.8 repaired pipeline sessions earlier.
+            # Clear instructor double-bookings that appear as flat CSV rows (e.g. shared CS163 slots).
+            if ok_verify:
+                _faculty_post_budget = _scaled_budget(
+                    max(8, len(final_ui_sessions or []) // 30),
+                    minimum=5,
+                )
+                for _fpass in range(_faculty_post_budget):
+                    _fidx = _faculty_overlap_move_idx()
+                    if _fidx is None:
+                        break
+                    _row_ref = final_ui_sessions[_fidx]
+                    _old_day = _row_ref.get("day")
+                    _old_st = _row_ref.get("start_time")
+                    _old_et = _row_ref.get("end_time")
+                    _old_tb = _row_ref.get("time_block")
+                    _old_room = _row_ref.get("room")
+                    if not _try_relocate_row_faculty(_fidx):
+                        break
+                    ok_verify, ver_errors = run_strict_verification_on_final_ui(
+                        final_ui_sessions, courses, sections, classrooms
+                    )
+                    if not ok_verify:
+                        # Keep strict-safe state; do not retain a faculty relocation that
+                        # introduces section/room/LTPSC violations.
+                        _row_ref["day"] = _old_day
+                        _row_ref["start_time"] = _old_st
+                        _row_ref["end_time"] = _old_et
+                        _row_ref["time_block"] = _old_tb
+                        _row_ref["room"] = _old_room
+                        ok_verify, ver_errors = run_strict_verification_on_final_ui(
+                            final_ui_sessions, courses, sections, classrooms
+                        )
+                        break
+                    print(f"  [post-strict faculty] pass {_fpass + 1}: relocated row index {_fidx}")
+            if not ok_verify:
+                print(f"FAILED: {len(ver_errors)} verification violation(s). Output not saved.")
+                for err in ver_errors[:40]:
+                    print(f"  [{err.get('rule', '')}] {err.get('message', '')}")
+                if len(ver_errors) > 40:
+                    print(f"  ... and {len(ver_errors) - 40} more.")
+                # Always dump a reproducible debug artifact for strict-verify failures:
+                # - the exact final UI session rows used for verification
+                # - a CSV in time_slot_log format so CLI/tools can re-verify deterministically
+                try:
+                    import json
+                    import csv
+                    from datetime import datetime as _dt
+
+                    base_out_dir = "DATA/EDITED OUTPUT" if sessions_from_log is not None else "DATA/OUTPUT"
+                    debug_ts = _dt.now().strftime("%Y%m%d_%H%M%S")
+                    debug_dir = f"{base_out_dir}/strict_verify_DEBUG_{debug_ts}"
+                    os.makedirs(debug_dir, exist_ok=True)
+
+                    json_path = f"{debug_dir}/final_ui_sessions.json"
+                    with open(json_path, "w", encoding="utf-8") as f:
+                        json.dump(final_ui_sessions, f, indent=2, default=str)
+
+                    err_path = f"{debug_dir}/strict_verify_errors.json"
+                    with open(err_path, "w", encoding="utf-8") as f:
+                        json.dump(ver_errors, f, indent=2)
+
+                    csv_path = f"{debug_dir}/time_slot_log_{debug_ts}.csv"
+                    with open(csv_path, "w", encoding="utf-8", newline="") as f:
+                        w = csv.DictWriter(
+                            f,
+                            fieldnames=[
+                                "Phase",
+                                "Course Code",
+                                "Course Name",
+                                "Section",
+                                "Day",
+                                "Start Time",
+                                "End Time",
+                                "Room",
+                                "Faculty",
+                                "Session Type",
+                                "Period",
+                            ],
+                        )
+                        w.writeheader()
+                        for s in final_ui_sessions:
+                            tb = s.get("time_block")
+                            day = getattr(tb, "day", "") if tb else ""
+                            st = getattr(tb, "start", None)
+                            et = getattr(tb, "end", None)
+                            w.writerow(
+                                {
+                                    "Phase": s.get("phase", "") or "",
+                                    "Course Code": s.get("course_code", "") or "",
+                                    "Course Name": s.get("course_name", "") or "",
+                                    "Section": s.get("section", "") or "",
+                                    "Day": day or "",
+                                    "Start Time": st.strftime("%H:%M") if hasattr(st, "strftime") else "",
+                                    "End Time": et.strftime("%H:%M") if hasattr(et, "strftime") else "",
+                                    "Room": s.get("room", "") or "",
+                                    "Faculty": s.get("faculty", "") or "",
+                                    "Session Type": s.get("session_type", "") or "L",
+                                    "Period": s.get("period", "") or "",
+                                }
+                            )
+
+                    print(f"DEBUG strict-verify dump written: {debug_dir}")
+                except Exception as dump_ex:
+                    print(f"WARNING: Failed to write strict-verify debug dump: {dump_ex}")
+                if sessions_from_log is not None or _macro_i >= _macro_max - 1:
+                    debug_faculty_path = None
+                    try:
+                        from modules_v2.phase6_faculty_conflicts import detect_faculty_conflicts
+
+                        base_out_dir = "DATA/EDITED OUTPUT" if sessions_from_log is not None else "DATA/OUTPUT"
+                        debug_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        debug_faculty_path = f"{base_out_dir}/faculty_timetables_DEBUG_{debug_ts}.xlsx"
+                        os.makedirs(os.path.dirname(debug_faculty_path), exist_ok=True)
+
+                        internal_verify_sessions = final_ui_rows_to_verify_sessions(final_ui_sessions)
+                        debug_faculty_conflicts = detect_faculty_conflicts(internal_verify_sessions)
+                        debug_written = write_faculty_timetables(
+                            final_ui_sessions,
+                            debug_faculty_conflicts,
+                            debug_faculty_path,
+                        )
+                        if debug_written:
+                            debug_faculty_path = debug_written
+                            print(f"DEBUG faculty workbook written: {debug_faculty_path}")
+                        else:
+                            debug_faculty_path = None
+                            print("DEBUG faculty workbook skipped (no faculty sessions found).")
+                    except Exception as debug_ex:
+                        debug_faculty_path = None
+                        print(f"WARNING: Failed to write DEBUG faculty workbook: {debug_ex}")
+                    raise GenerationViolationError(
+                        f"{len(ver_errors)} verification violation(s)",
+                        ver_errors,
+                        debug_faculty_path=debug_faculty_path,
+                    )
+                print(
+                    "Retrying after macro repair (reshuffle + faculty/section overlap passes)..."
+                )
+                continue
+            print("[OK] Strict verification passed.")
+            break
+        else:
+            break
+
     # Create dedicated C004 (240-seater) timetable sheets for quick visual inspection
     print("Creating C004 room timetable sheets (PreMid/PostMid)...")
     for period_name, period_flag in [("PreMid", "PRE"), ("PostMid", "POST")]:
@@ -3230,35 +5849,100 @@ def generate_24_sheets(sessions_from_log: List[Dict] = None):
         base_code = course_display.replace('-TUT', '').replace('-LAB', '').split('-')[0]
         section_key = s['section']
         
+        comb_sess = None
+        # Always evaluate comb_sess to correctly tag Phase 4 sessions
+        stype = (s.get("session_type") or "L").strip().upper()
+        comb_sess = next(
+            (
+                cs
+                for cs in combined_sessions
+                if isinstance(cs, dict)
+                and str(cs.get("course_code", "") or "").split("-")[0].strip() == base_code
+                and normalize_period(cs.get("period")) == normalize_period(s.get("period", "PRE"))
+                and str(cs.get("session_type", cs.get("kind", "L")) or "L").strip().upper() == stype
+                and any(str(sec).startswith(section_key) for sec in cs.get("sections", []))
+            ),
+            None,
+        )
+
         # Determine room
-        room = ""
-        comb_sess = next((cs for cs in combined_sessions if isinstance(cs, dict) and cs.get('course_code') == course_display and any(str(sec).startswith(section_key) for sec in cs.get('sections', []))), None)
-        if comb_sess and comb_sess.get('room'):
-            room = comb_sess['room']
-        elif room_assignments and section_key in room_assignments and base_code in room_assignments[section_key]:
-            room = room_assignments[section_key][base_code]
+        room = s.get('room', "")
+        if not room:
+            if comb_sess and comb_sess.get("room"):
+                room = comb_sess["room"]
+
+
+            # For practicals, prefer the session's own room (Phase 8 may assign per-session labs).
+            if sessions_from_log is None and stype == "P" and not room:
+                try:
+                    _pkey = normalize_period(s.get("period", "PRE"))
+                    _st = s.get("start_time")
+                    _et = s.get("end_time")
+                    _day = s.get("day")
+                    _match = next(
+                        (
+                            ss for ss in (phase5_sessions + phase7_sessions)
+                            if getattr(ss, "section", "") == section_key
+                            and (getattr(ss, "course_code", "").split("-")[0] == base_code)
+                            and normalize_period(getattr(ss, "period", "PRE")) == _pkey
+                            and getattr(getattr(ss, "block", None), "day", None) == _day
+                            and getattr(getattr(ss, "block", None), "start", None) == _st
+                            and getattr(getattr(ss, "block", None), "end", None) == _et
+                        ),
+                        None,
+                    )
+                    if _match and getattr(_match, "room", None):
+                        room = str(_match.room).strip()
+                except Exception:
+                    pass
+
+            # For lectures/tutorials, Phase 8 room assignments are authoritative.
+            if sessions_from_log is None and (not room) and room_assignments and stype != "P":
+                pkey = normalize_period(s.get("period", "PRE"))
+                a = room_assignments.get((base_code, section_key, pkey))
+                if isinstance(a, dict) and a.get("classroom"):
+                    room = a.get("classroom") or room
+
+            # Combined sessions already handled above via authoritative comb_sess room.
+            if not room and room_assignments:
+                pkey = normalize_period(s.get("period", "PRE"))
+                a = room_assignments.get((base_code, section_key, pkey))
+                if isinstance(a, dict):
+                    stype = (s.get("session_type") or "L").strip().upper()
+                    if stype == "P":
+                        labs = a.get("labs") or []
+                        labs = [str(x).strip() for x in labs if str(x).strip()]
+                        if labs:
+                            room = ", ".join(labs)
+                    else:
+                        room = a.get("classroom") or ""
             
         # Determine faculty
-        faculty = ""
-        if comb_sess and comb_sess.get('instructor'):
-            faculty = comb_sess['instructor']
-        else:
-            course_obj = next((c for c in courses if getattr(c, 'code', '') == base_code), None)
-            if course_obj and hasattr(course_obj, 'instructor_name'):
-                faculty = course_obj.instructor_name
+        faculty = s.get('faculty', "")
+        if not faculty:
+            if comb_sess and comb_sess.get('instructor'):
+                faculty = comb_sess['instructor']
+            elif sessions_from_log is None:
+                # Only fall back to course object when NOT in log-replay mode
+                course_obj = next((c for c in courses if getattr(c, 'code', '') == base_code), None)
+                if course_obj and hasattr(course_obj, 'instructor_name'):
+                    faculty = course_obj.instructor_name
                 
-        # If generating from log (UI edits), preserve original Room and Faculty
-        if sessions_from_log is not None:
+        # If generating from log (UI edits), the session's faculty/room are already authoritative
+        # (set by create_integrated_schedule fast path).  Only do a secondary lookup if truly empty.
+        if sessions_from_log is not None and (not room or not faculty):
              orig_s = next((os_item for os_item in sessions_from_log if 
-                  os_item.get('Section') == section_key and 
-                  os_item.get('Course Code') == course_display and 
-                  str(os_item.get('Day')).strip().upper() == str(s['day']).strip().upper() and 
-                  str(os_item.get('Start Time')).replace(':', '') == s['start_time'].strftime("%H%M")
+                  (os_item.get('Section') == section_key or os_item.get('section') == section_key) and 
+                  (os_item.get('Course Code') == course_display or os_item.get('course_code') == course_display) and 
+                  str(os_item.get('Day') or os_item.get('day')).strip().upper() == str(s['day']).strip().upper() and 
+                  str(os_item.get('Start Time') or os_item.get('start_time')).replace(':', '') == s['start_time'].strftime("%H%M")
              ), None)
              if orig_s:
-                 room = orig_s.get('Room') or room
-                 faculty = orig_s.get('Faculty') or faculty
-
+                 if not room:
+                     room = orig_s.get('Room') or orig_s.get('room') or room
+                 if not faculty:
+                     faculty = orig_s.get('Faculty') or orig_s.get('faculty') or faculty
+                
                 
         # Determine Phase for UI syncing
         orig_phase = "Final"
@@ -3267,7 +5951,15 @@ def generate_24_sheets(sessions_from_log: List[Dict] = None):
         elif comb_sess:
             orig_phase = "Phase 4"
         elif "-TUT" in course_display or "-LAB" in course_display:
-            orig_phase = "Phase 5"
+            orig_phase = "Phase 5"  # Default to Phase 5; will be overridden below if session is from Phase 7
+            # Check if this course is actually a Phase 7 session (<=2 credits, not in combined)
+            if phase7_sessions:
+                base_for_phase = course_display.replace("-TUT", "").replace("-LAB", "").split("-")[0].strip().upper()
+                for _p7s in phase7_sessions:
+                    p7_base = str(getattr(_p7s, "course_code", "") or "").split("-")[0].strip().upper()
+                    if p7_base == base_for_phase:
+                        orig_phase = "Phase 7"
+                        break
         else:
             orig_phase = "Phase 7"
             
@@ -3301,15 +5993,17 @@ def generate_24_sheets(sessions_from_log: List[Dict] = None):
         faculty_tt_path = f"{base_out_dir}/faculty_timetables_{timestamp}.xlsx"
         print(f"\nCreating per-faculty timetables at: {faculty_tt_path}")
 
-        # Include synthetic elective sessions with faculty names so electives
-        # appear in per-faculty timetables as well.
-        try:
-            from modules_v2.phase3_elective_baskets_v2 import build_faculty_elective_sessions
-            faculty_elective_sessions = build_faculty_elective_sessions(courses)
-        except Exception:
-            faculty_elective_sessions = []
-
-        faculty_all_sessions = list(all_sessions) + list(faculty_elective_sessions or [])
+        # If regenerating from UI, final_ui_sessions holds the exact grid state 
+        # (including parsed periods, edited classrooms, and edited faculty).
+        if sessions_from_log is not None:
+            faculty_all_sessions = final_ui_sessions
+        else:
+            try:
+                from modules_v2.phase3_elective_baskets_v2 import build_faculty_elective_sessions
+                faculty_elective_sessions = build_faculty_elective_sessions(courses)
+            except Exception:
+                faculty_elective_sessions = []
+            faculty_all_sessions = list(all_sessions) + list(faculty_elective_sessions or [])
 
         ft_written = write_faculty_timetables(faculty_all_sessions, faculty_conflicts, faculty_tt_path)
         if ft_written:
@@ -3329,13 +6023,35 @@ def generate_24_sheets(sessions_from_log: List[Dict] = None):
         )
         print(f"\nCreating per-classroom timetables at: {classroom_tt_path}")
 
-        # Include elective room assignments as real sessions for per-room view.
-        room_all_sessions = list(all_sessions)
-        try:
-            room_all_sessions += list(elective_sessions_with_rooms or [])
-        except NameError:
-            # Fallback if elective_sessions_with_rooms is not defined
-            pass
+        # Always use final_ui_sessions as authoritative source for room clash reporting.
+        # These rows are produced after all repair/strict phases. Mixing in raw elective
+        # rows again can duplicate occupancy and create false classroom clashes.
+        room_all_sessions = list(final_ui_sessions)
+
+        # Defensive dedupe for room-report path only.
+        # Key by physical occupancy identity to eliminate repeated rows without
+        # altering actual timetable generation.
+        deduped_room_rows = []
+        seen_room_keys = set()
+        for s in room_all_sessions:
+            if not isinstance(s, dict):
+                continue
+            tb = s.get("time_block")
+            day = str(getattr(tb, "day", s.get("day", "")) or "").strip()
+            st = str(getattr(tb, "start", s.get("start_time", "")) or "").strip()
+            et = str(getattr(tb, "end", s.get("end_time", "")) or "").strip()
+            room = str(s.get("room", "") or "").strip().upper()
+            if not room:
+                continue
+            code = str(s.get("course_code", "") or "").strip().upper()
+            sec = str(s.get("section", "") or "").strip().upper()
+            period = str(s.get("period", "") or "").strip().upper()
+            skey = (room, day, st, et, code, sec, period)
+            if skey in seen_room_keys:
+                continue
+            seen_room_keys.add(skey)
+            deduped_room_rows.append(s)
+        room_all_sessions = deduped_room_rows
 
         ct_written = write_classroom_timetables(room_all_sessions, classroom_tt_path)
         if ct_written:
@@ -3384,8 +6100,20 @@ def main():
     print()
     
     try:
-        output_file, _ = generate_24_sheets()
-        
+        from utils.generation_verify_bridge import GenerationViolationError
+
+        try:
+            output_file, _ = generate_24_sheets()
+        except GenerationViolationError as gve:
+            print("\n" + "=" * 70)
+            print("GENERATION FAILED: verification violations (zero-violations mode).")
+            print("=" * 70)
+            for err in (gve.errors or [])[:60]:
+                print(f"  [{err.get('rule', '')}] {err.get('message', '')}")
+            if len(gve.errors or []) > 60:
+                print(f"  ... and {len(gve.errors) - 60} more.")
+            sys.exit(1)
+
         print("\n" + "=" * 70)
         # Save rescheduling conflict log if any conflicts occurred
         from generate_24_sheets import rescheduling_conflicts
