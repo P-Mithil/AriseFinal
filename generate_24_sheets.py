@@ -2963,8 +2963,8 @@ def generate_24_sheets(sessions_from_log: List[Dict] = None):
     if _seed_raw.isdigit():
         random.seed(int(_seed_raw))
     else:
-        import time
-        _seed = int(time.time() * 1000) % 100000
+        import time as time_lib
+        _seed = int(time_lib.time() * 1000) % 100000
         random.seed(_seed)
         # Intentionally leave _seed_raw empty so macro-retries can sweep seeds if needed
 
