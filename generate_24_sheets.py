@@ -2963,13 +2963,10 @@ def generate_24_sheets(sessions_from_log: List[Dict] = None):
     if _seed_raw.isdigit():
         random.seed(int(_seed_raw))
     else:
-        _variant = (
-            str(os.environ.get("ARISE_COURSE_DATA_VARIANT", "") or "").strip().lower()
-            or str(os.environ.get("ARISE_OFFERING", "") or "").strip().lower()
-        )
-        _default_seed = 1829 if _variant in ("odd", "1", "course_data1", "course_data1.xlsx") else 1830
-        random.seed(_default_seed)
-        _seed_raw = str(_default_seed)
+        import time
+        _seed = int(time.time() * 1000) % 100000
+        random.seed(_seed)
+        # Intentionally leave _seed_raw empty so macro-retries can sweep seeds if needed
 
     from utils.time_slot_logger import reset_logger
     if sessions_from_log is None:
