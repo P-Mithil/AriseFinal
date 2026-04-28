@@ -19,6 +19,7 @@ from utils.room_priority_policy import (
     should_prefer_top_large_rooms,
     top_large_classrooms,
 )
+from config.schedule_config import COMBINED_RESERVED_ROOM_NUMBER
 
 
 def _room_tier_by_capacity(capacity: int) -> str:
@@ -268,7 +269,7 @@ def find_available_classroom(capacity_needed: int, session_type: str, period: st
         # only excluding the reserved C004 room.
         all_labs = [room for room in classrooms 
                 if room.room_type.lower() == "lab"
-                and room.room_number != "C004"]
+                and room.room_number != COMBINED_RESERVED_ROOM_NUMBER]
         
         labs = all_labs
         if course_code:
@@ -290,7 +291,7 @@ def find_available_classroom(capacity_needed: int, session_type: str, period: st
         return None
     else:
         # User requested: C004 is ONLY for combined classes. Never assign it here.
-        classrooms = [r for r in classrooms if r.room_number != 'C004']
+        classrooms = [r for r in classrooms if r.room_number != COMBINED_RESERVED_ROOM_NUMBER]
         
         top2 = top_large_classrooms(classrooms, n=2)
         prefer_top = should_prefer_top_large_rooms(capacity_needed, top2)
@@ -340,7 +341,7 @@ def assign_labs_for_practical(enrollment: int, period: str, day: str, time_block
     
     labs = [room for room in classrooms 
             if room.room_type.lower() == 'lab'
-            and room.room_number != 'C004']  # Exclude C004
+            and room.room_number != COMBINED_RESERVED_ROOM_NUMBER]
     
     # Sort by capacity (prefer smaller labs first for better utilization)
     labs.sort(key=lambda r: r.capacity)
@@ -392,7 +393,7 @@ def assign_labs_to_combined_practicals(
         if getattr(room, 'is_research_lab', False):
             return False
         rt = (room.room_type or "").lower()
-        return (rt == 'lab' or 'lab' in rt) and room.room_number != 'C004'
+        return (rt == 'lab' or 'lab' in rt) and room.room_number != COMBINED_RESERVED_ROOM_NUMBER
 
     all_labs_base = [r for r in classrooms if _is_lab_room(r)]
     if not all_labs_base:
@@ -513,7 +514,7 @@ def assign_classrooms_to_core_sessions(phase5_sessions: List[ScheduledSession],
             continue
         
         # Skip if room is C004 (reserved for combined courses)
-        if session.room == 'C004':
+        if session.room == COMBINED_RESERVED_ROOM_NUMBER:
             continue
         
         # Get time block
@@ -630,7 +631,7 @@ def assign_classrooms_to_core_sessions(phase5_sessions: List[ScheduledSession],
             
             suitable_classrooms = [
                 room for room in non_lab_classrooms
-                if room.capacity >= enrollment and room.room_number != 'C004'
+                if room.capacity >= enrollment and room.room_number != COMBINED_RESERVED_ROOM_NUMBER
             ]
             
             suitable_classrooms = [
@@ -707,7 +708,7 @@ def assign_classrooms_to_core_sessions(phase5_sessions: List[ScheduledSession],
                 if (not allow_research) and getattr(room, 'is_research_lab', False):
                     return False
                 rt = (room.room_type or "").lower()
-                return (rt == 'lab' or 'lab' in rt) and room.room_number != 'C004'
+                return (rt == 'lab' or 'lab' in rt) and room.room_number != COMBINED_RESERVED_ROOM_NUMBER
             all_labs = [r for r in classrooms if _is_lab_room(r, allow_research=False)]
             all_labs_with_research = [r for r in classrooms if _is_lab_room(r, allow_research=True)]
             # Filter by course code: EC -> Hardware; CS/DS/other -> Software
@@ -1217,21 +1218,21 @@ def run_phase8(phase5_sessions: List[ScheduledSession],
             sec_str = str(sec).strip()
             key = (base_code, sec_str, period_val)
             if key not in room_assignments:
-                room_assignments[key] = {"classroom": "C004", "labs": []}
+                room_assignments[key] = {"classroom": COMBINED_RESERVED_ROOM_NUMBER, "labs": []}
                 combined_c004_count += 1
             else:
                 # Force C004 even if a smaller room was assigned earlier.
-                if room_assignments[key].get("classroom") != "C004":
-                    room_assignments[key]["classroom"] = "C004"
+                if room_assignments[key].get("classroom") != COMBINED_RESERVED_ROOM_NUMBER:
+                    room_assignments[key]["classroom"] = COMBINED_RESERVED_ROOM_NUMBER
                     combined_c004_count += 1
 
         # Also assign room to the session object itself
         if isinstance(session, dict):
             if not session.get('room') or session.get('room') in ('', 'None', 'TBD', 'nan'):
-                session['room'] = 'C004'
+                session['room'] = COMBINED_RESERVED_ROOM_NUMBER
         elif hasattr(session, 'room'):
             if not session.room or str(session.room).strip().lower() in ('', 'none', 'tbd', 'nan'):
-                session.room = 'C004'
+                session.room = COMBINED_RESERVED_ROOM_NUMBER
 
     print(f"  Assigned C004 to {combined_c004_count} combined course entries")
     print()
@@ -1265,7 +1266,7 @@ def run_phase8(phase5_sessions: List[ScheduledSession],
             if getattr(room, "is_research_lab", False):
                 return False
             rt = (room.room_type or "").lower()
-            return (rt == "lab" or "lab" in rt) and room.room_number != "C004"
+            return (rt == "lab" or "lab" in rt) and room.room_number != COMBINED_RESERVED_ROOM_NUMBER
 
         lab_rooms_all = [r for r in (classrooms or []) if _is_lab_room(r)]
 

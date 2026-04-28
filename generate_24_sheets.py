@@ -22,6 +22,7 @@ from config.schedule_config import (
     LUNCH_WINDOWS,
     GENERATION_RUNTIME_MODE,
     GENERATION_RUNTIME_SCALE,
+    COMBINED_RESERVED_ROOM_NUMBER,
 )
 from utils.time_validator import validate_time_range
 from config.structure_config import DEPARTMENTS, SECTIONS_BY_DEPT, STUDENTS_PER_SECTION, get_group_for_section
@@ -108,10 +109,9 @@ def identify_course_sync_type(course_code: str, semester: int, courses: List[Cou
     - Course has 1 faculty
     
     Returns:
-    - 'cross_group': Course common in ALL sections (CSE + DSAI/ECE) - CSE PreMid ↔ DSAI/ECE PostMid
-    - 'within_group_cse': Course common only in CSE (CSE-A + CSE-B) - CSE-A PreMid ↔ CSE-B PostMid
-    - 'within_group_other': Course common only in one department of Group 2 - similar sync
-    - 'standard': Default - all sections get same period
+    - 'cross_group': Course appears across more than one configured group
+    - 'within_group': Course appears in exactly one configured group with multiple sections
+    - 'standard': Default
     """
     if not courses:
         return 'standard'
@@ -126,32 +126,29 @@ def identify_course_sync_type(course_code: str, semester: int, courses: List[Cou
     if first_course.credits > 2 or len(first_course.instructors) != 1:
         return 'standard'  # Doesn't meet criteria for special sync
     
-    # Get departments that have this course
+    # Get departments that have this course and map them to configured groups.
     departments_with_course = set(c.department for c in course_instances)
-    
-    # Check which groups have this course
-    group1_sections = [s for s in sections if s.semester == semester and s.program == 'CSE']
-    group2_sections = [s for s in sections if s.semester == semester and s.program in ['DSAI', 'ECE']]
-    
-    group1_has_course = 'CSE' in departments_with_course
-    group2_has_course = any(dept in departments_with_course for dept in ['DSAI', 'ECE'])
-    
-    # Determine sync type
-    if group1_has_course and group2_has_course:
-        # Course appears in both groups (CSE + DSAI/ECE) - CROSS-GROUP synchronization
-        # CSE PreMid ↔ DSAI/ECE PostMid (opposite periods)
-        return 'cross_group'
-    elif group1_has_course and len(group1_sections) > 1:
-        # Course appears only in CSE and CSE has multiple sections (CSE-A, CSE-B)
-        # WITHIN-GROUP synchronization: CSE-A PreMid ↔ CSE-B PostMid
-        return 'within_group_cse'
-    elif group2_has_course and len(group2_sections) > 1:
-        # Course appears only in Group 2 and Group 2 has multiple sections
-        # WITHIN-GROUP synchronization
-        return 'within_group_other'
-    else:
-        # Standard - all sections get same period
-        return 'standard'
+    semester_sections = [s for s in sections if s.semester == semester]
+    dept_to_group = {}
+    group_section_counts = {}
+    for sec in semester_sections:
+        dept = getattr(sec, "program", "")
+        gid = int(getattr(sec, "group", 1) or 1)
+        dept_to_group[dept] = gid
+        group_section_counts[gid] = group_section_counts.get(gid, 0) + 1
+
+    groups_with_course = {
+        dept_to_group[d]
+        for d in departments_with_course
+        if d in dept_to_group
+    }
+    if len(groups_with_course) > 1:
+        return "cross_group"
+    if len(groups_with_course) == 1:
+        only_group = next(iter(groups_with_course))
+        if group_section_counts.get(only_group, 0) > 1:
+            return "within_group"
+    return "standard"
 
 def map_corrected_schedule_to_sessions(schedule: Dict, sections: List[Section], periods: List[str], courses: List = None, classrooms: List = None) -> List[dict]:
     """
@@ -209,7 +206,7 @@ def map_corrected_schedule_to_sessions(schedule: Dict, sections: List[Section], 
         postmid_course_objects = sem_data.get('postmid', {}).get('course_objects', [])
         premid_slots = sem_data.get('premid', {}).get('slots', [])
         postmid_slots = sem_data.get('postmid', {}).get('slots', [])
-        default_room = sem_data.get('premid', {}).get('room', 'C004')
+        default_room = sem_data.get('premid', {}).get('room', COMBINED_RESERVED_ROOM_NUMBER)
         
         # Helper function to format course code with suffixes based on duration
         def format_course_code(course_code, slot_index_in_course, start, end, slots_info):
@@ -612,8 +609,8 @@ def map_corrected_schedule_to_sessions_v2(
         premid_slots = premid.get("slots", []) or []
         postmid_slots = postmid.get("slots", []) or []
 
-        default_room_premid = premid.get("room", "C004")
-        default_room_postmid = postmid.get("room", "C004")
+        default_room_premid = premid.get("room", COMBINED_RESERVED_ROOM_NUMBER)
+        default_room_postmid = postmid.get("room", COMBINED_RESERVED_ROOM_NUMBER)
 
         # Index course objects by (code, semester)
         course_map: Dict[tuple, object] = {}
@@ -2992,8 +2989,9 @@ def generate_24_sheets(sessions_from_log: List[Dict] = None, is_re_render: bool 
     courses, classrooms, statistics = run_phase1()
     
     # Extract unique semesters from course data
-    unique_semesters = sorted(set(course.semester for course in courses 
-                                 if course.department in ['CSE', 'DSAI', 'ECE']))
+    unique_semesters = sorted(
+        set(course.semester for course in courses if course.department in DEPARTMENTS)
+    )
     print(f"Detected semesters from data: {unique_semesters}")
     
     # Create sections based on the data & config
@@ -3004,6 +3002,19 @@ def generate_24_sheets(sessions_from_log: List[Dict] = None, is_re_render: bool 
                 group = get_group_for_section(dept, sec_label)
                 sections.append(Section(dept, group, sec_label, sem, STUDENTS_PER_SECTION))
     
+    # Resolve combined-class reserved room dynamically (no hardcoded room ID).
+    combined_room_default = ""
+    try:
+        non_lab_rooms = [
+            r for r in (classrooms or [])
+            if "lab" not in str(getattr(r, "room_type", "") or "").lower()
+        ]
+        non_lab_rooms.sort(key=lambda r: int(getattr(r, "capacity", 0) or 0), reverse=True)
+        if non_lab_rooms:
+            combined_room_default = str(getattr(non_lab_rooms[0], "room_number", "") or "").strip()
+    except Exception:
+        combined_room_default = ""
+
     # Step 2-6: Scheduling Phases (Skip if pre-loaded from log)
     elective_sessions = []
     combined_sessions = []
@@ -3022,7 +3033,7 @@ def generate_24_sheets(sessions_from_log: List[Dict] = None, is_re_render: bool 
 
         # Build room_assignments from the log so verification table has correct rooms
         # Also detect combined courses (same course+day+time in multiple sections)
-        # and ensure they get C004 if no room was already assigned.
+        # and ensure they get a configured combined-room fallback if missing.
         from collections import defaultdict as _defaultdict
         _combined_course_codes: set = set()
         _slot_sections = _defaultdict(set)  # (course_code_base, day, start) -> set(sections)
@@ -3079,9 +3090,9 @@ def generate_24_sheets(sessions_from_log: List[Dict] = None, is_re_render: bool 
                 elif not room_assignments[room_key]['classroom']:
                     room_assignments[room_key]['classroom'] = room
 
-            # Phase 4 combined courses: default to C004 if no classroom found
+            # Phase 4 combined courses: default to configured top large room if missing
             if not room_assignments[room_key]['classroom'] and base_code in _combined_course_codes:
-                room_assignments[room_key]['classroom'] = 'C004'
+                room_assignments[room_key]['classroom'] = combined_room_default
 
         
         # Load cached elective assignments to prevent "TBD" in the Excel tables
@@ -4146,7 +4157,7 @@ def generate_24_sheets(sessions_from_log: List[Dict] = None, is_re_render: bool 
         unmodified_final_ui_sessions = [dict(s) for s in final_ui_sessions] if final_ui_sessions else []
         if final_ui_sessions:
             # Repair pass: eliminate room double-bookings + under-capacity rooms
-            # (C004 reserved for Phase 4 only)
+            # (reserved combined room is kept for Phase 4 only)
             try:
                 def _t_overlap(a_s, a_e, b_s, b_e):
                     return not (a_e <= b_s or b_e <= a_s)
@@ -4160,7 +4171,7 @@ def generate_24_sheets(sessions_from_log: List[Dict] = None, is_re_render: bool 
                     r
                     for r in (classrooms or [])
                     if "lab" in str(getattr(r, "room_type", "")).lower()
-                    and getattr(r, "room_number", "") != "C004"
+                    and getattr(r, "room_number", "") != combined_room_default
                     and not getattr(r, "is_research_lab", False)
                 ]
                 # Last-resort fallback (only if needed): include research labs so strict verify can reach 0.
@@ -4168,9 +4179,14 @@ def generate_24_sheets(sessions_from_log: List[Dict] = None, is_re_render: bool 
                     r
                     for r in (classrooms or [])
                     if "lab" in str(getattr(r, "room_type", "")).lower()
-                    and getattr(r, "room_number", "") != "C004"
+                    and getattr(r, "room_number", "") != combined_room_default
                 ]
-                class_rooms = [r for r in (classrooms or []) if "lab" not in str(getattr(r, "room_type", "")).lower() and getattr(r, "room_number", "") != "C004"]
+                class_rooms = [
+                    r
+                    for r in (classrooms or [])
+                    if "lab" not in str(getattr(r, "room_type", "")).lower()
+                    and getattr(r, "room_number", "") != combined_room_default
+                ]
 
                 # Prefer smaller rooms first
                 lab_rooms.sort(key=lambda r: int(getattr(r, "capacity", 0) or 0))
@@ -5748,10 +5764,10 @@ def generate_24_sheets(sessions_from_log: List[Dict] = None, is_re_render: bool 
                         rooms = [x.strip() for x in room.split(",") if x.strip()]
                         if not rooms:
                             rooms = [room]
-                        # Preserve canonical Phase 4 combined C004 sessions; all other C004 uses
-                        # are eligible for reassignment if they create strict conflicts.
+                        # Preserve canonical Phase 4 combined reserved-room sessions;
+                        # all other reserved-room uses are eligible for reassignment.
                         is_phase4_combined = str(s.get("phase") or "").strip().lower() == "phase 4"
-                        if room == "C004" and is_phase4_combined and stype in ("L", "T"):
+                        if room == combined_room_default and is_phase4_combined and stype in ("L", "T"):
                             for rname in rooms:
                                 occ.setdefault((period, rname, day), []).append((st, et))
                             continue
@@ -6247,10 +6263,11 @@ def generate_24_sheets(sessions_from_log: List[Dict] = None, is_re_render: bool 
         else:
             break
 
-    # Create dedicated C004 (240-seater) timetable sheets for quick visual inspection
-    print("Creating C004 room timetable sheets (PreMid/PostMid)...")
+    # Create dedicated combined-room timetable sheets for quick visual inspection
+    combined_sheet_room = combined_room_default or "COMBINED_ROOM"
+    print(f"Creating {combined_sheet_room} room timetable sheets (PreMid/PostMid)...")
     for period_name, period_flag in [("PreMid", "PRE"), ("PostMid", "POST")]:
-        sheet_title = f"C004 {period_name}"
+        sheet_title = f"{combined_sheet_room} {period_name}"
         sheet = writer.workbook.create_sheet(title=sheet_title)
 
         # Set column widths
@@ -6261,7 +6278,7 @@ def generate_24_sheets(sessions_from_log: List[Dict] = None, is_re_render: bool 
 
         # Title
         title_cell = sheet["A1"]
-        title_cell.value = f"C004 240-Seater Timetable {period_name}"
+        title_cell.value = f"{combined_sheet_room} Timetable {period_name}"
         title_cell.font = writer.header_font
         title_cell.fill = writer.colors["header"]
 
@@ -6275,7 +6292,7 @@ def generate_24_sheets(sessions_from_log: List[Dict] = None, is_re_render: bool 
             for sess in combined_sessions:
                 if not isinstance(sess, dict):
                     continue
-                if sess.get("room") != "C004":
+                if sess.get("room") != combined_sheet_room:
                     continue
                 if sess.get("period") != period_flag:
                     continue

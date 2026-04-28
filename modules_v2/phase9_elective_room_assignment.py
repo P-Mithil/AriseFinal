@@ -17,6 +17,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from utils.data_models import Course, ClassRoom, TimeBlock, ScheduledSession
 from modules_v2.phase3_elective_baskets_v2 import group_electives_by_semester, ELECTIVE_BASKET_SLOTS
+from config.schedule_config import COMBINED_RESERVED_ROOM_NUMBER
 
 def _elective_room_tier(capacity: int) -> str:
     cap = int(capacity or 0)
@@ -149,7 +150,7 @@ def check_room_availability_at_time(room_number: str, period: str, day: str,
     Returns:
         True if room is available, False otherwise
     """
-    if room_number == 'C004' and not allow_c004:
+    if str(room_number).strip().upper() == str(COMBINED_RESERVED_ROOM_NUMBER).strip().upper() and not allow_c004:
         return False
     period_norm = _normalize_period(period)
     # Check elective occupancy from this run (electives not yet in all_sessions with room)
@@ -327,7 +328,7 @@ def find_suitable_room(capacity_needed: int, period: str, time_slots: Dict[str, 
         r for r in classrooms
         if r.room_type.lower() != 'lab'
         and 'lab' not in r.room_type.lower()
-        and r.room_number.upper() != 'C004'
+        and r.room_number.upper() != str(COMBINED_RESERVED_ROOM_NUMBER).strip().upper()
         and r.room_number not in already_assigned_rooms
         and _elective_room_allowed(r.capacity, capacity_needed, allow_relaxed_tier=allow_relaxed_tier)
     ]
@@ -341,7 +342,7 @@ def find_suitable_room(capacity_needed: int, period: str, time_slots: Dict[str, 
         r for r in classrooms
         if r.room_type.lower() != 'lab'
         and 'lab' not in r.room_type.lower()
-        and r.room_number.upper() != 'C004'
+        and r.room_number.upper() != str(COMBINED_RESERVED_ROOM_NUMBER).strip().upper()
         and r.room_number not in already_assigned_rooms
         and int(r.capacity or 0) >= int(capacity_needed or 0)
         and r not in normal_rooms  # skip already checked
@@ -353,7 +354,7 @@ def find_suitable_room(capacity_needed: int, period: str, time_slots: Dict[str, 
 
     # --- Tier 3: C004 (240-seat auditorium) as absolute last resort ---
     if allow_c004:
-        c004_list = [r for r in classrooms if r.room_number.upper() == 'C004'
+        c004_list = [r for r in classrooms if r.room_number.upper() == str(COMBINED_RESERVED_ROOM_NUMBER).strip().upper()
                      and r.room_number not in already_assigned_rooms
                      and int(r.capacity or 0) >= int(capacity_needed or 0)]
         for room in c004_list:
@@ -388,7 +389,7 @@ def find_rooms_per_slot(
         [r for r in classrooms
          if r.room_type.lower() != 'lab'
          and 'lab' not in r.room_type.lower()
-         and r.room_number.upper() != 'C004'
+         and r.room_number.upper() != str(COMBINED_RESERVED_ROOM_NUMBER).strip().upper()
          and int(r.capacity or 0) >= int(capacity_needed or 0)],
         key=lambda r: (abs(int(r.capacity or 0) - int(capacity_needed or 0)), r.capacity, r.room_number)
     )

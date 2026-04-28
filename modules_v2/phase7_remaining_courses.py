@@ -1627,8 +1627,10 @@ if __name__ == "__main__":
     courses, classrooms, statistics = run_phase1()
     
     # Extract unique semesters from course data
-    unique_semesters = sorted(set(course.semester for course in courses 
-                                 if course.department in ['CSE', 'DSAI', 'ECE']))
+    from config.structure_config import DEPARTMENTS
+    unique_semesters = sorted(
+        set(course.semester for course in courses if course.department in DEPARTMENTS)
+    )
     
     # Create sections
     sections = []

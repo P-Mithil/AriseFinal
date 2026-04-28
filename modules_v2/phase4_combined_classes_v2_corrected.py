@@ -20,7 +20,7 @@ from utils.data_models import Course, Section, TimeBlock
 from utils.time_slot_logger import get_logger
 from utils.session_rules_validator import SessionRulesValidator
 from utils.time_validator import validate_time_range, can_fit_duration, slot_end_within_day
-from config.schedule_config import WORKING_DAYS
+from config.schedule_config import WORKING_DAYS, LUNCH_WINDOWS
 from config.structure_config import (
     DEPARTMENTS,
     SECTION_GROUPS,
@@ -333,13 +333,23 @@ def get_combined_courses(courses: List[Course], sections: List[Section] = None) 
     1. Core (not elective)
     2. <=2 credits
     3. Single instructor
-    4. Common for ALL branches (CSE, DSAI, ECE) - offered in each department
+    4. Common for all configured base-group branches (groups 1 and 2)
     5. Has multiple instances (same code + same instructor across branches) OR
        is common to multiple sections within a department that has multiple sections
     """
-    # Phase 4 "common for all branches" is defined by the core UG trio.
-    # Do not auto-expand with extra programs (e.g., AIC) from global config.
-    REQUIRED_BRANCHES = {"CSE", "DSAI", "ECE"}
+    # Build required branches from active sections for base groups (1,2).
+    # This keeps behavior dynamic for newly added branches without hardcoded names.
+    required_branches = set()
+    if sections:
+        for s in sections:
+            try:
+                if int(getattr(s, "group", 1) or 1) in (1, 2):
+                    required_branches.add(str(getattr(s, "program", "") or "").strip())
+            except Exception:
+                continue
+    required_branches = {d for d in required_branches if d}
+    if not required_branches:
+        required_branches = set(DEPARTMENTS)
 
     # v1-inspired, pipeline-safe identification:
     # Group by (code, semester), not by (code, instructor), so a course stays eligible
@@ -360,7 +370,7 @@ def get_combined_courses(courses: List[Course], sections: List[Section] = None) 
             continue
         departments_with_course = set(c.department for c in course_list)
         # Strict rule: only all-branch common courses are Phase 4.
-        if departments_with_course < REQUIRED_BRANCHES:
+        if departments_with_course < required_branches:
             continue
         for course in course_list:
             combined_courses[course.semester].append(course)
@@ -522,10 +532,7 @@ def create_non_overlapping_schedule(unique_courses: Dict[int, List[Course]], sec
         base_days = list(WORKING_DAYS)
         
         # Get lunch block for this semester
-        lunch_blocks = {1: (time(12, 30), time(13, 30)),
-                       3: (time(12, 45), time(13, 45)),
-                       5: (time(13, 0), time(14, 0))}
-        lunch_start, lunch_end = lunch_blocks.get(semester, (time(12, 30), time(13, 30)))
+        lunch_start, lunch_end = LUNCH_WINDOWS.get(semester, (time(12, 30), time(13, 30)))
         
         # Dynamically generate available time slots based on 9:00-18:00 window
         available_slots = []
@@ -709,11 +716,13 @@ def create_non_overlapping_schedule(unique_courses: Dict[int, List[Course]], sec
             
             return course_slots, occupied_slots
         
+        reserved_large_room = available_large_rooms[0] if available_large_rooms else ""
+
         def find_available_room(day: str, start: time, end: time, global_room_occupancy: dict,
                                 available_large_rooms: list, allow_fallback: bool = False):
             """Find an available large room for the time slot.
             When allow_fallback=False (default), returns None if no room is free (caller should try another slot).
-            When allow_fallback=True, returns C004 if no room is free so the course can still be scheduled."""
+            When allow_fallback=True, returns configured largest room as last resort."""
             test_block = TimeBlock(day, start, end)
             import random
             shuffled_rooms = available_large_rooms.copy()
@@ -730,7 +739,7 @@ def create_non_overlapping_schedule(unique_courses: Dict[int, List[Course]], sec
                 if not has_conflict:
                     return room
             if allow_fallback:
-                return 'C004'
+                return reserved_large_room
             return None
         
         def mark_room_occupied(room: str, day: str, start: time, end: time, global_room_occupancy: dict):
@@ -1425,7 +1434,7 @@ def create_non_overlapping_schedule(unique_courses: Dict[int, List[Course]], sec
                     day, start, end, session_type, assigned_room = slot_info
                 else:
                     day, start, end, session_type = slot_info[:4]
-                    assigned_room = "C004"
+                    assigned_room = reserved_large_room
                 all_slots.append((day, start, end, session_type, section_labels, assigned_room))
             
             return all_slots, occupied_slots, global_room_occupancy
@@ -1894,7 +1903,7 @@ def create_non_overlapping_schedule(unique_courses: Dict[int, List[Course]], sec
                                         )
                                     else:
                                         # Use default room
-                                        default_room = available_large_rooms[0] if available_large_rooms else 'C004'
+                                        default_room = available_large_rooms[0] if available_large_rooms else reserved_large_room
                                         corrected_slots.append((day, start, adjusted_end, corrected_session_type, section_labels, default_room))
                                         mark_room_occupied(
                                             default_room, day, start, adjusted_end, postmid_room_occupancy

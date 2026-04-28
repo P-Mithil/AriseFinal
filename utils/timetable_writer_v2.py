@@ -16,7 +16,7 @@ from openpyxl.utils import get_column_letter
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from utils.data_models import DayScheduleGrid, TimeBlock
-from config.schedule_config import WORKING_DAYS
+from config.schedule_config import WORKING_DAYS, COMBINED_RESERVED_ROOM_NUMBER
 
 def extract_department_from_section(section: str) -> str:
     """
@@ -1827,7 +1827,7 @@ class TimetableWriterV2:
 
                     # Default only when truly unknown; preserve intentional NA.
                     if not assigned_classroom:
-                        assigned_classroom = 'C004' if is_combined else ''
+                        assigned_classroom = COMBINED_RESERVED_ROOM_NUMBER if is_combined else ''
                 
                 # Time slot issues / displayed counts: full-semester combined uses semester totals
                 disp_l = total_lectures if is_full_semester_combined else scheduled_lectures
@@ -2237,7 +2237,7 @@ class TimetableWriterV2:
                             (hasattr(s, 'course_code') and s.course_code.split('-')[0] == course_code)
                             for s in (combined_sessions or [])
                         )
-                        assigned_classroom = 'C004' if is_combined else ''
+                        assigned_classroom = COMBINED_RESERVED_ROOM_NUMBER if is_combined else ''
 
                 
                 if is_phase5:

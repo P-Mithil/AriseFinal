@@ -1,6 +1,7 @@
 from typing import Iterable, List, Optional
 
 from utils.data_models import ClassRoom
+from config.schedule_config import COMBINED_RESERVED_ROOM_NUMBER
 
 
 def _is_lab_room(room: ClassRoom) -> bool:
@@ -10,14 +11,14 @@ def _is_lab_room(room: ClassRoom) -> bool:
 
 def classroom_rooms(classrooms: Iterable[ClassRoom]) -> List[ClassRoom]:
     """Return non-lab, non-research, non-auditorium classrooms in deterministic order.
-    C004 (240-seater auditorium) is strictly reserved for Phase 4 combined courses only.
+    The configured reserved combined room is excluded here.
     """
     out = [
         r
         for r in (classrooms or [])
         if not _is_lab_room(r)
         and not bool(getattr(r, "is_research_lab", False))
-        and str(getattr(r, "room_number", "") or "").strip().upper() != "C004"
+        and str(getattr(r, "room_number", "") or "").strip().upper() != str(COMBINED_RESERVED_ROOM_NUMBER).strip().upper()
     ]
     out.sort(key=lambda r: (-int(getattr(r, "capacity", 0) or 0), str(getattr(r, "room_number", "") or "")))
     return out

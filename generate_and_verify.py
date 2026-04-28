@@ -26,6 +26,8 @@ from utils.faculty_conflict_resolver import resolve_all_faculty_conflicts
 from datetime import time
 import openpyxl
 from generate_24_sheets import map_corrected_schedule_to_sessions_v2 as map_corrected_schedule_to_sessions
+from config.schedule_config import COMBINED_RESERVED_ROOM_NUMBER
+from config.structure_config import DEPARTMENTS
 
 # Global variables to store results
 generated_file = None
@@ -232,23 +234,23 @@ def verify_phase4_rules(courses, sections, classrooms, elective_sessions):
             except Exception:
                 return 1
 
-        # Rule 2 (INFO): 240-seater usage in C004
+        # Rule 2 (INFO): large combined-room usage
         #
         # Deep verification already guarantees:
-        #   - No real time conflicts for any section (including in C004)
+        #   - No real time conflicts for any section (including in reserved combined room)
         #   - LTPSC is satisfied for all courses
         # For combined courses, it is acceptable – and expected – that different
-        # combined courses may run back‑to‑back or even concurrently in C004 as
+        # combined courses may run back‑to‑back or even concurrently in that room as
         # long as they involve disjoint section sets and do not violate section‑
         # or faculty‑level conflict rules.
         #
         # Therefore we keep this analysis purely informational and do NOT treat
-        # any C004 overlaps as a Phase 4 failure.
+        # any overlaps in that room as a Phase 4 failure.
         unique_c004 = {}
         for sess in combined_sessions:
             if not isinstance(sess, dict):
                 continue
-            if sess.get("room") != "C004":
+            if str(sess.get("room") or "").strip().upper() != str(COMBINED_RESERVED_ROOM_NUMBER).strip().upper():
                 continue
             block = sess.get("time_block")
             if not block:
@@ -272,7 +274,7 @@ def verify_phase4_rules(courses, sections, classrooms, elective_sessions):
                     room_conflicts.append((p1, b1, c1, c2))
 
         if room_conflicts:
-            print("Rule 2 (INFO): potential C004 overlaps (same period):")
+            print(f"Rule 2 (INFO): potential {COMBINED_RESERVED_ROOM_NUMBER} overlaps (same period):")
             for p, block1, c1, c2 in room_conflicts[:10]:
                 print(f"  - period={p}, {block1.day} {block1.start}-{block1.end}: {c1} vs {c2}")
 
@@ -732,7 +734,7 @@ def verify_all_courses_scheduled(excel_path, courses, sections):
         phase7_course_codes = set()
         
         # Extract semesters from courses dynamically
-        unique_semesters = sorted(set(c.semester for c in courses if c.department in ['CSE', 'DSAI', 'ECE']))
+        unique_semesters = sorted(set(c.semester for c in courses if c.department in DEPARTMENTS))
         
         def _is_schedulable_for_verification(course_obj) -> bool:
             if getattr(course_obj, "is_elective", False):

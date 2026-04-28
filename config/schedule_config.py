@@ -49,6 +49,7 @@ LUNCH_WINDOWS: Dict[int, Tuple[time, time]] = {
 
 # Large-room / 240-seater configuration
 LARGE_ROOM_CAPACITY_THRESHOLD: int = 240
+COMBINED_RESERVED_ROOM_NUMBER: str = "C004"
 
 # Default fallback section capacity used when the real enrollment cannot be
 # determined from session/section data (smallest single-section cohort size).
