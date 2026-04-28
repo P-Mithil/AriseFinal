@@ -413,14 +413,42 @@ def schedule_synchronized_sessions(course: Course, sections: List[Section], peri
                         if not conflicts:
                             lab = lab_room.room_number
                             break
-            
+
+            # ---- Always assign a SECOND lab ----
+            lab2 = None
+            all_labs_for_second = _typed_lab_pool(classrooms, course.code)
+            for lr in all_labs_for_second:
+                if lr.room_number == lab:
+                    continue
+                if lr.room_number not in room_occupancy:
+                    lab2 = lr.room_number
+                    break
+                conflicts = False
+                for occ_block in room_occupancy[lr.room_number]:
+                    if practical_slot.overlaps(occ_block):
+                        conflicts = True
+                        break
+                if not conflicts:
+                    lab2 = lr.room_number
+                    break
+            # If still no free second lab, force-pick any other
+            if lab2 is None and all_labs_for_second:
+                for lr in all_labs_for_second:
+                    if lr.room_number != lab:
+                        lab2 = lr.room_number
+                        break
+            # ---- End second lab ----
+
             if lab:
+                room_str = lab
+                if lab2:
+                    room_str = ", ".join(sorted([lab, lab2]))
                 session = ScheduledSession(
                     course_code=course.code,
                     section=section.label,
                     kind="P",
                     block=practical_slot,
-                    room=lab,
+                    room=room_str,
                     period=period,
                     lab_number=f"LAB{lab_number}",
                     faculty=None  # Labs don't need faculty
@@ -430,6 +458,7 @@ def schedule_synchronized_sessions(course: Course, sections: List[Section], peri
             else:
                 # Log warning but continue - this should be rare with improved fallback
                 print(f"WARNING: Could not assign lab room for {course.code} {section.label} {period} practical at {practical_slot}")
+
         
         if room_index > 0:
             practical_count += 1
@@ -1443,7 +1472,7 @@ def schedule_course_sessions(course: Course, section: Section, period: str,
 
         # As requested: do not apply faculty conflict checks for practical sessions.
         
-        # Assign lab
+        # Assign first lab
         lab = assign_room_for_session("P", 40, classrooms, room_occupancy or {}, practical_slot, course.code)
         
         # Fallback: If no lab found, retry only within the strict typed lab pool.
@@ -1464,14 +1493,46 @@ def schedule_course_sessions(course: Course, section: Section, period: str,
                     if not conflicts:
                         lab = lab_room.room_number
                         break
-        
+
+        # ---- Always try to assign a SECOND lab (mandatory for all practicals) ----
+        lab2 = None
+        all_labs_for_second = _typed_lab_pool(classrooms, course.code)
+        room_occ_check = room_occupancy or {}
+        for lab_room in all_labs_for_second:
+            if lab_room.room_number == lab:
+                continue  # Skip first lab already assigned
+            # Check if free at this slot
+            if lab_room.room_number not in room_occ_check:
+                lab2 = lab_room.room_number
+                break
+            conflicts = False
+            for occupied_block in room_occ_check[lab_room.room_number]:
+                if practical_slot.overlaps(occupied_block):
+                    conflicts = True
+                    break
+            if not conflicts:
+                lab2 = lab_room.room_number
+                break
+
+        # If no free second lab, use the least-conflicting one
+        if lab2 is None and all_labs_for_second:
+            for lab_room in all_labs_for_second:
+                if lab_room.room_number != lab:
+                    lab2 = lab_room.room_number
+                    break
+        # ---- End second lab logic ----
+
         if lab:
+            # Build combined room string: "L105, L106" or just "L105" if second unavailable
+            room_str = lab
+            if lab2:
+                room_str = ", ".join(sorted([lab, lab2]))
             session = ScheduledSession(
                 course_code=course.code,
                 section=section.label,
                 kind="P",
                 block=practical_slot,
-                room=lab,
+                room=room_str,
                 period=period,
                 lab_number=f"LAB{lab_number}",
                 faculty=None  # Ignore faculty constraints for practicals
@@ -1482,6 +1543,7 @@ def schedule_course_sessions(course: Course, section: Section, period: str,
         else:
             # Log warning but continue - this should be rare with improved fallback
             print(f"WARNING: Could not assign lab room for {course.code} {section.label} {period} practical at {practical_slot}")
+
     
     # Verify all target sessions were scheduled
     if lecture_count < target_lectures:

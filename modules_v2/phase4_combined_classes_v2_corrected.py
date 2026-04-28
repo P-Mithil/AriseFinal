@@ -239,6 +239,7 @@ def get_period_assignments_for_courses(
     import os
 
     force_prompts = os.environ.get("ARISE_FORCE_PHASE_PROMPTS", "").strip().lower() in ("1", "true", "yes")
+    # Default behavior: ask only when assignment is missing; then persist and reuse.
 
     # Load any existing assignments from disk. If forcing prompts (interactive runs),
     # we still load but allow overwriting keys by re-prompting.
@@ -294,55 +295,33 @@ def get_combined_courses(courses: List[Course], sections: List[Section] = None) 
     5. Has multiple instances (same code + same instructor across branches) OR
        is common to multiple sections within a department that has multiple sections
     """
-    REQUIRED_BRANCHES = set(DEPARTMENTS)
+    # Phase 4 "common for all branches" is defined by the core UG trio.
+    # Do not auto-expand with extra programs (e.g., AIC) from global config.
+    REQUIRED_BRANCHES = {"CSE", "DSAI", "ECE"}
 
-    # Group courses by (code, instructor) to find duplicates
-    course_groups = defaultdict(list)
-
+    # v1-inspired, pipeline-safe identification:
+    # Group by (code, semester), not by (code, instructor), so a course stays eligible
+    # even when branch-wise instructor names differ (as requested).
+    eligible_by_code_sem = defaultdict(list)
     for course in courses:
-        # Must be core, <=2 credits, single instructor
-        if (not course.is_elective and
-            course.credits <= 2 and
-            course.instructors and
-            len(course.instructors) == 1):
+        if (
+            not course.is_elective
+            and course.credits <= 2
+            and course.instructors
+            and len(course.instructors) == 1
+        ):
+            eligible_by_code_sem[(course.code, course.semester)].append(course)
 
-            key = (course.code, course.instructors[0])
-            course_groups[key].append(course)
-
-    # Filter to only courses with multiple instances AND common for all branches
     combined_courses = defaultdict(list)
-
-    for (code, instructor), course_list in course_groups.items():
+    for (_code, _sem), course_list in eligible_by_code_sem.items():
         if len(course_list) <= 1:
             continue
-        # Check: course must be common for ALL branches (CSE, DSAI, ECE)
         departments_with_course = set(c.department for c in course_list)
+        # Strict rule: only all-branch common courses are Phase 4.
         if departments_with_course < REQUIRED_BRANCHES:
-            continue  # Not offered in all branches - skip
+            continue
         for course in course_list:
             combined_courses[course.semester].append(course)
-
-    # Also include within-group combined: common to multiple sections of same department,
-    # BUT only if the course is also common for ALL branches
-    if sections:
-        for course in courses:
-            if (not course.is_elective and
-                course.credits <= 2 and
-                course.instructors and
-                len(course.instructors) == 1 and
-                course.code not in [c.code for c_list in combined_courses.values() for c in c_list]):
-
-                # Must be common for ALL branches
-                course_instances = [c for c in courses if c.code == course.code and c.semester == course.semester
-                                   and not c.is_elective and c.credits <= 2 and c.instructors and len(c.instructors) == 1]
-                depts_with_course = set(c.department for c in course_instances)
-                if depts_with_course < REQUIRED_BRANCHES:
-                    continue
-
-                # Check if this department has multiple sections for this semester
-                dept_sections = [s for s in sections if s.program == course.department and s.semester == course.semester]
-                if len(dept_sections) > 1:
-                    combined_courses[course.semester].append(course)
 
     return combined_courses
 
@@ -1465,14 +1444,53 @@ def create_non_overlapping_schedule(unique_courses: Dict[int, List[Course]], sec
             for day, start, end in unique:
                 bucket.append(TimeBlock(day, start, end))
 
-        # PASS 1 (PreMid): schedule by GROUP and enforce 30-min gap between groups.
-        # - Group 1 gets the user's chosen PreMid courses.
-        # - Group 2 gets the opposite-period courses (i.e., Group 1's PostMid list).
+        # PASS 1 (PreMid/PostMid): schedule by GROUP.
+        #
+        # For cross-group combined courses, we keep the existing behavior:
+        # - Group 1 uses the chosen period for that (course_code, semester)
+        # - Group 2 uses the opposite period for the same course code
+        #
+        # For group-only within-department combined courses (e.g. CSE-only),
+        # schedule ONLY for the sections that actually take the course.
         premid_course_slots_map: Dict[str, List[tuple]] = {}
         premid_group1_blocks: List[TimeBlock] = []
         premid_group2_blocks: List[TimeBlock] = []
 
-        for course in premid_courses:
+        # Build per-group course lists based on course classification.
+        premid_courses_group1: List[Course] = []
+        postmid_courses_group1: List[Course] = []
+        premid_courses_group2: List[Course] = []
+        postmid_courses_group2: List[Course] = []
+
+        for course in courses_for_semester:
+            key = (course.code.upper(), semester)
+            is_premid = period_assignments.get(key, True)
+            course_group = get_course_group_for_phase4(course.code, semester)
+            if course_group == "cross_group":
+                if is_premid:
+                    premid_courses_group1.append(course)
+                    postmid_courses_group2.append(course)
+                else:
+                    postmid_courses_group1.append(course)
+                    premid_courses_group2.append(course)
+            elif course_group == "group1_only":
+                if is_premid:
+                    premid_courses_group1.append(course)
+                else:
+                    postmid_courses_group1.append(course)
+            elif course_group == "group2_only":
+                if is_premid:
+                    premid_courses_group2.append(course)
+                else:
+                    postmid_courses_group2.append(course)
+            else:
+                # Default: treat like group1_only if only group1 has configured sections, else group2_only.
+                if group1_sections:
+                    (premid_courses_group1 if is_premid else postmid_courses_group1).append(course)
+                elif group2_sections:
+                    (premid_courses_group2 if is_premid else postmid_courses_group2).append(course)
+
+        for course in premid_courses_group1:
             if course.code in premid_course_slots_map:
                 continue
             if not group1_sections:
@@ -1491,7 +1509,7 @@ def create_non_overlapping_schedule(unique_courses: Dict[int, List[Course]], sec
             _track_unique_blocks(course_slots, premid_group1_blocks)
             print(f"  PRE: Group 1 scheduled {course.code}: {len(course_slots)} sessions")
 
-        for course in postmid_courses:
+        for course in premid_courses_group2:
             if course.code in premid_course_slots_map:
                 continue
             if not group2_sections:
@@ -1510,15 +1528,13 @@ def create_non_overlapping_schedule(unique_courses: Dict[int, List[Course]], sec
             _track_unique_blocks(course_slots, premid_group2_blocks)
             print(f"  PRE: Group 2 scheduled {course.code}: {len(course_slots)} sessions")
 
-        # PASS 1 (PostMid): schedule by GROUP and enforce 30-min gap between groups.
-        # - Group 1 gets the user's chosen PostMid courses.
-        # - Group 2 gets the opposite-period courses (i.e., Group 1's PreMid list).
+        # PASS 1 (PostMid): schedule by GROUP (same per-course classification as above).
         print(f"DEBUG: Starting PostMid scheduling for semester {semester}")
         postmid_course_slots_map: Dict[str, List[tuple]] = {}
         postmid_group1_blocks: List[TimeBlock] = []
         postmid_group2_blocks: List[TimeBlock] = []
 
-        for course in postmid_courses:
+        for course in postmid_courses_group1:
             if course.code in postmid_course_slots_map:
                 continue
             if not group1_sections:
@@ -1537,7 +1553,7 @@ def create_non_overlapping_schedule(unique_courses: Dict[int, List[Course]], sec
             _track_unique_blocks(course_slots, postmid_group1_blocks)
             print(f"  POST: Group 1 scheduled {course.code}: {len(course_slots)} sessions")
 
-        for course in premid_courses:
+        for course in postmid_courses_group2:
             if course.code in postmid_course_slots_map:
                 continue
             if not group2_sections:
@@ -1900,7 +1916,7 @@ def create_non_overlapping_schedule(unique_courses: Dict[int, List[Course]], sec
                 if len(slot) == 6 and isinstance(slot[4], str):
                     # New format: (day, start, end, session_type, section_str, room)
                     day, start, end, session_type, section_str, assigned_room = slot
-                    log_room = 'L105' if session_type == 'P' else assigned_room
+                    log_room = assigned_room  # Use actual assigned room (Phase 8 will finalize labs)
                     # Store ONE slot tuple per time block (section_str may be comma-joined)
                     semester_schedule['premid']['slots'].append((course_code, day, start, end, session_type, section_str, assigned_room))
                     # Log once per section
@@ -1913,7 +1929,7 @@ def create_non_overlapping_schedule(unique_courses: Dict[int, List[Course]], sec
                     # Already prefixed: (course_code, day, start, end, session_type, section, room)
                     semester_schedule['premid']['slots'].append(slot)
                     _, day, start, end, session_type, section_str, assigned_room = slot
-                    log_room = 'L105' if session_type == 'P' else assigned_room
+                    log_room = assigned_room  # Use actual assigned room (Phase 8 will finalize labs)
                     sec_name = section_str.label if hasattr(section_str, 'label') else str(section_str)
                     for sec_label in sec_name.split(','):
                         sec_label = sec_label.strip()
@@ -1929,7 +1945,7 @@ def create_non_overlapping_schedule(unique_courses: Dict[int, List[Course]], sec
                 if len(slot) == 6 and isinstance(slot[4], str):
                     # New format: (day, start, end, session_type, section_str, room)
                     day, start, end, session_type, section_str, assigned_room = slot
-                    log_room = 'L105' if session_type == 'P' else assigned_room
+                    log_room = assigned_room  # Use actual assigned room (Phase 8 will finalize labs)
                     semester_schedule['postmid']['slots'].append((course_code, day, start, end, session_type, section_str, assigned_room))
                     for sec_label in section_str.split(','):
                         sec_label = sec_label.strip()
@@ -1939,7 +1955,7 @@ def create_non_overlapping_schedule(unique_courses: Dict[int, List[Course]], sec
                 elif len(slot) == 7 and slot[0] == course_code:
                     semester_schedule['postmid']['slots'].append(slot)
                     _, day, start, end, session_type, section_str, assigned_room = slot
-                    log_room = 'L105' if session_type == 'P' else assigned_room
+                    log_room = assigned_room  # Use actual assigned room (Phase 8 will finalize labs)
                     sec_name = section_str.label if hasattr(section_str, 'label') else str(section_str)
                     for sec_label in sec_name.split(','):
                         sec_label = sec_label.strip()

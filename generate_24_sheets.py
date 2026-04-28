@@ -1459,18 +1459,26 @@ def create_integrated_schedule(
         # FAST PATH: use pre-existing sessions from log to rebuild exactly
         relevant = []
         for s in sessions_from_log:
-            if (match_section(expected_section, s.get("Section", "")) and 
-                str(s.get("Day", "")).strip().upper() == str(day).strip().upper() and 
-                normalize_period(s.get("Period", "")) == period_code):
+            _sec = s.get("Section") or s.get("section", "")
+            _day = s.get("Day") or s.get("day", "")
+            _per = s.get("Period") or s.get("period", "")
+            if (match_section(expected_section, _sec) and 
+                str(_day).strip().upper() == str(day).strip().upper() and 
+                normalize_period(_per) == period_code):
                 relevant.append(s)
         
         final_sessions = []
         for s in relevant:
             try:
-                start_str = s.get("Start Time", "00:00")
-                end_str = s.get("End Time", "00:00")
-                sh, sm = map(int, start_str.split(':')[:2])
-                eh, em = map(int, end_str.split(':')[:2])
+                # Handle both datetime.time objects and strings
+                _start = s.get("Start Time") or s.get("start_time", "00:00")
+                _end = s.get("End Time") or s.get("end_time", "00:00")
+                if hasattr(_start, 'strftime'):
+                    _start = _start.strftime("%H:%M")
+                if hasattr(_end, 'strftime'):
+                    _end = _end.strftime("%H:%M")
+                sh, sm = map(int, str(_start).split(':')[:2])
+                eh, em = map(int, str(_end).split(':')[:2])
                 block = TimeBlock(day, time(sh, sm), time(eh, em))
                 # Skip if already in final_sessions (some logs might have redundancy if not cleaned)
                 if any(b.start == block.start and b.end == block.end for b, c, p, bse, *rest in final_sessions):
@@ -2948,13 +2956,14 @@ def _lookup_faculty_room_from_pipeline_map(
     return "", ""
 
 
-def generate_24_sheets(sessions_from_log: List[Dict] = None):
+def generate_24_sheets(sessions_from_log: List[Dict] = None, is_re_render: bool = False):
     """Generate all 24 sheets for the timetable.
     If sessions_from_log is provided, it use those sessions directly and skips the scheduling phases.
     """
     import random
 
     _run_started_at = datetime.now()
+    base_out_dir = "DATA/EDITED OUTPUT" if (sessions_from_log is not None and not is_re_render) else "DATA/OUTPUT"
 
     # Reproducible scheduling:
     # - If ARISE_GENERATION_SEED is set, honor it.
@@ -3046,15 +3055,27 @@ def generate_24_sheets(sessions_from_log: List[Dict] = None):
                 room_assignments[room_key] = {'classroom': '', 'labs': []}
 
             if room and room.lower() not in ('nan', 'none', 'tbd', ''):
-                # Classify as lab or classroom using room_type from classrooms list
-                is_lab = any(
-                    hasattr(cr, 'room_number') and str(cr.room_number).strip() == room
-                    and hasattr(cr, 'room_type') and 'lab' in str(cr.room_type).lower()
-                    for cr in classrooms
-                )
+                room_parts = [p.strip() for p in room.split(',') if p.strip()]
+                is_lab = False
+                
+                if room_parts:
+                    is_lab = True
+                    for rp in room_parts:
+                        rp_is_lab = any(
+                            hasattr(cr, 'room_number') and str(cr.room_number).strip() == rp
+                            and hasattr(cr, 'room_type') and 'lab' in str(cr.room_type).lower()
+                            for cr in classrooms
+                        )
+                        if not rp_is_lab and rp.upper().startswith('L') and rp[1:].isdigit():
+                            rp_is_lab = True
+                        if not rp_is_lab:
+                            is_lab = False
+                            break
+
                 if is_lab:
-                    if room not in room_assignments[room_key]['labs']:
-                        room_assignments[room_key]['labs'].append(room)
+                    for rp in room_parts:
+                        if rp not in room_assignments[room_key]['labs']:
+                            room_assignments[room_key]['labs'].append(rp)
                 elif not room_assignments[room_key]['classroom']:
                     room_assignments[room_key]['classroom'] = room
 
@@ -3071,7 +3092,6 @@ def generate_24_sheets(sessions_from_log: List[Dict] = None):
                 with open(cache_file, "r") as f:
                     cache_data = json.load(f)
                 # Reconstruct course objects for the assignments
-                course_map = {getattr(c, 'code', ''): c for c in courses}
                 for sem_str, assignments in cache_data.items():
                     try:
                         sem = int(sem_str)
@@ -3079,11 +3099,17 @@ def generate_24_sheets(sessions_from_log: List[Dict] = None):
                         sem = sem_str
                     elective_assignments[sem] = []
                     for a in assignments:
-                        course_obj = course_map.get(a.get('course_code', ''))
+                        c_code = a.get('course_code', '')
+                        # Match by code AND semester so multi-semester electives get the right course object
+                        course_obj = next((c for c in courses if getattr(c, 'code', '') == c_code and getattr(c, 'semester', None) == sem), None)
+                        if not course_obj:
+                            # Fallback if semester mismatch (shouldn't happen but safe to have)
+                            course_obj = next((c for c in courses if getattr(c, 'code', '') == c_code), None)
                         if course_obj:
                             elective_assignments[sem].append({
                                 'course': course_obj,
                                 'room': a.get('room', ''),
+                                'slot_rooms': a.get('slot_rooms') or None,
                                 'period': a.get('period', ''),
                                 'faculty': a.get('faculty', ''),
                                 'group_key': a.get('group_key', '')
@@ -3184,6 +3210,7 @@ def generate_24_sheets(sessions_from_log: List[Dict] = None):
                     cache_data[sem].append({
                         'course_code': getattr(a.get('course'), 'code', '') if a.get('course') else '',
                         'room': a.get('room', ''),
+                        'slot_rooms': a.get('slot_rooms') or None,
                         'period': a.get('period', ''),
                         'faculty': a.get('faculty', ''),
                         'group_key': a.get('group_key', '')
@@ -3212,13 +3239,16 @@ def generate_24_sheets(sessions_from_log: List[Dict] = None):
                     course = a.get('course')
                     course_code = getattr(course, 'code', '') if course else ''
                     room = a.get('room') if a.get('room') is not None else ''
+                    slot_rooms = a.get('slot_rooms')  # dict {slot_name: room} or None
                     period_val = a.get('period', 'PRE')
                     for slot_name in ('lecture_1', 'lecture_2', 'tutorial'):
                         tb = slots.get(slot_name)
                         if not tb:
                             continue
+                        # Use per-slot room if available, otherwise the shared room
+                        slot_room = (slot_rooms.get(slot_name) if slot_rooms else None) or room
                         elective_sessions_with_rooms.append({
-                            'room': room,
+                            'room': slot_room,
                             'period': period_val,
                             'time_block': tb,
                             'course_code': f"{course_code}-Elective",
@@ -3851,9 +3881,26 @@ def generate_24_sheets(sessions_from_log: List[Dict] = None):
                             if course_display != "LUNCH" and course_display != "Break(15min)":
                                 section_key = f"{section_name}-Sem{semester}"
                                 stype = 'L'
-                                if '-TUT' in course_display: stype = 'T'
-                                elif '-LAB' in course_display: stype = 'P'
-                                if course_display.startswith("ELECTIVE_BASKET_"): stype = 'ELECTIVE'
+                                if '-TUT' in course_display:
+                                    stype = 'T'
+                                elif '-LAB' in course_display:
+                                    stype = 'P'
+                                else:
+                                    # Defensive typing by block duration for rows that may not carry
+                                    # explicit -TUT/-LAB suffix in display code.
+                                    try:
+                                        _dur_m = (
+                                            (block.end.hour * 60 + block.end.minute)
+                                            - (block.start.hour * 60 + block.start.minute)
+                                        )
+                                        if _dur_m == 60:
+                                            stype = 'T'
+                                        elif _dur_m == 120:
+                                            stype = 'P'
+                                        else:
+                                            stype = 'L'
+                                    except Exception:
+                                        stype = 'L'
                                 
                                 base_code = course_display.replace('-TUT', '').replace('-LAB', '').split('-')[0]
     
@@ -3883,6 +3930,19 @@ def generate_24_sheets(sessions_from_log: List[Dict] = None):
                                         and normalize_period(cs.get("period")) == normalize_period(period)
                                         and str(cs.get("session_type", cs.get("kind", "L")) or "L").strip().upper() == stype
                                         and any(str(sec).startswith(section_key) for sec in cs.get("sections", []))
+                                        and (
+                                            (
+                                                isinstance(cs.get("time_block"), dict)
+                                                and str((cs.get("time_block") or {}).get("day", "")).strip() == str(day).strip()
+                                                and str((cs.get("time_block") or {}).get("start", "")) == block.start.strftime("%H:%M")
+                                                and str((cs.get("time_block") or {}).get("end", "")) == block.end.strftime("%H:%M")
+                                            )
+                                            or (
+                                                getattr(cs.get("time_block"), "day", None) == day
+                                                and getattr(cs.get("time_block"), "start", None) == block.start
+                                                and getattr(cs.get("time_block"), "end", None) == block.end
+                                            )
+                                        )
                                     ),
                                     None,
                                 )
@@ -4008,7 +4068,7 @@ def generate_24_sheets(sessions_from_log: List[Dict] = None):
                                             # the log stores one faculty per section row.
                                             meta_fac = orig_s.get('Faculty') or orig_s.get('faculty') or meta_fac
 
-                                # Policy: practical sessions do not participate in faculty conflicts.
+                                # Practicals do not participate in faculty conflicts.
                                 # Keep faculty blank for P rows to align strict verification semantics.
                                 if stype == "P":
                                     meta_fac = ""
@@ -4083,6 +4143,7 @@ def generate_24_sheets(sessions_from_log: List[Dict] = None):
                     print("[OK] Done")
     
         # Strict gate: zero-tolerance verification before writing workbook/CSV.
+        unmodified_final_ui_sessions = [dict(s) for s in final_ui_sessions] if final_ui_sessions else []
         if final_ui_sessions:
             # Repair pass: eliminate room double-bookings + under-capacity rooms
             # (C004 reserved for Phase 4 only)
@@ -4145,6 +4206,7 @@ def generate_24_sheets(sessions_from_log: List[Dict] = None):
                         "time_constraints": [],
                         "faculty_conflicts": [],
                         "section_overlaps": [],
+                        "session_duration": [],
                     }
                     for e in errors or []:
                         rule = str(e.get("rule", "") or "").strip().lower()
@@ -4244,6 +4306,22 @@ def generate_24_sheets(sessions_from_log: List[Dict] = None):
                                         "end": str(m3.group(7)).strip(),
                                         "period": "",
                                     })
+                        if "session duration" in rule and "duration mismatch" in msg:
+                            m_d = re.search(
+                                r"(Lecture|Tutorial|Practical)\s+duration mismatch:\s+expected\s+(\d+)\s+min,\s+got\s+(\d+)\s+min",
+                                msg,
+                                flags=re.IGNORECASE,
+                            )
+                            if m_d:
+                                tasks["session_duration"].append({
+                                    "kind_label": str(m_d.group(1)).strip().upper(),
+                                    "expected_minutes": int(m_d.group(2)),
+                                    "got_minutes": int(m_d.group(3)),
+                                    "course_code": str(e.get("course_code", "") or "").strip(),
+                                    "section": str(e.get("section", "") or "").strip(),
+                                    "day": str(e.get("day", "") or "").strip(),
+                                    "time": str(e.get("time", "") or "").strip(),
+                                })
                     return tasks
 
                 def _parse_clock(v: str):
@@ -4255,8 +4333,12 @@ def generate_24_sheets(sessions_from_log: List[Dict] = None):
                         return None
                     return None
 
-                def _slot_conflicts_for_section(sec: str, period: str, day: str, st, et) -> bool:
-                    for row in final_ui_sessions:
+                def _slot_conflicts_for_section(
+                    sec: str, period: str, day: str, st, et, exclude_idx: Optional[int] = None
+                ) -> bool:
+                    for idx, row in enumerate(final_ui_sessions):
+                        if exclude_idx is not None and idx == exclude_idx:
+                            continue
                         if str(row.get("section", "") or "").strip() != sec:
                             continue
                         if normalize_period(row.get("period")) != normalize_period(period):
@@ -5216,6 +5298,118 @@ def generate_24_sheets(sessions_from_log: List[Dict] = None):
                                 return 1
                     return 0
 
+                def _atomic_fix_parsed_duration(tasks: Dict[str, List[Dict]]) -> int:
+                    def _target_kind_from_minutes(minutes: int) -> str:
+                        if minutes == 60:
+                            return "T"
+                        if minutes == 120:
+                            return "P"
+                        return "L"
+
+                    for t in tasks.get("session_duration", []):
+                        sec = str(t.get("section", "") or "").strip()
+                        day = str(t.get("day", "") or "").strip()
+                        cc = str(t.get("course_code", "") or "").strip()
+                        base = _base_code_of(cc)
+                        t_rng = str(t.get("time", "") or "").strip()
+                        expected_minutes = int(t.get("expected_minutes", 0) or 0)
+                        if expected_minutes <= 0:
+                            continue
+                        target_kind = _target_kind_from_minutes(expected_minutes)
+
+                        t_st = t_et = None
+                        if "-" in t_rng:
+                            _a, _b = t_rng.split("-", 1)
+                            t_st = _parse_clock(_a.strip())
+                            t_et = _parse_clock(_b.strip())
+
+                        candidates = []
+                        for idx, row in enumerate(final_ui_sessions):
+                            if sec and str(row.get("section", "") or "").strip() != sec:
+                                continue
+                            if day and str(row.get("day", "") or "").strip() != day:
+                                continue
+                            if base and _base_code_of(row.get("course_code")) != base:
+                                continue
+                            rs, re_ = row.get("start_time"), row.get("end_time")
+                            if t_st and t_et:
+                                if not (rs == t_st and re_ == t_et):
+                                    continue
+                            candidates.append((idx, row))
+
+                        if not candidates:
+                            continue
+
+                        idx, row = candidates[0]
+                        per = normalize_period(row.get("period"))
+                        sec = str(row.get("section", "") or "").strip()
+                        day = str(row.get("day", "") or "").strip()
+                        st = row.get("start_time")
+                        if not (sec and day and st):
+                            continue
+
+                        sem = 0
+                        for s0 in sections or []:
+                            if str(getattr(s0, "label", "") or "") == sec:
+                                sem = int(getattr(s0, "semester", 0) or 0)
+                                break
+                        lw = LUNCH_WINDOWS.get(sem)
+                        fac = str(row.get("faculty", "") or "").strip()
+
+                        def _try_place(d0: str, ns, exclude_idx: int) -> bool:
+                            end_m = ns.hour * 60 + ns.minute + expected_minutes
+                            eh, em = divmod(end_m, 60)
+                            if eh > 18 or (eh == 18 and em > 0):
+                                return False
+                            ne = time(eh, em)
+                            if lw and _t_overlap(ns, ne, lw[0], lw[1]):
+                                return False
+                            if _slot_conflicts_for_section(sec, per, d0, ns, ne, exclude_idx=exclude_idx):
+                                return False
+                            if target_kind != "P" and fac and _faculty_slot_busy(fac, per, d0, ns, ne, exclude_idx):
+                                return False
+                            rn = _pick_room_for_slot(
+                                target_kind,
+                                sec,
+                                per,
+                                d0,
+                                ns,
+                                ne,
+                                exclude_idx=exclude_idx,
+                                faculty_raw=fac,
+                                allow_faculty_fallback=False,
+                            )
+                            if not rn:
+                                return False
+                            row["session_type"] = target_kind
+                            row["course_code"] = _display_code_for_kind(base, target_kind)
+                            row["day"] = d0
+                            row["start_time"] = ns
+                            row["end_time"] = ne
+                            row["time_block"] = TimeBlock(d0, ns, ne)
+                            row["room"] = rn
+                            return True
+
+                        # Try preserving same day + start first.
+                        if _try_place(day, st, idx):
+                            return 1
+
+                        # Then same day, alternate starts.
+                        for hh in range(9, 18):
+                            for mm in (0, 15, 30, 45):
+                                ns = time(hh, mm)
+                                if _try_place(day, ns, idx):
+                                    return 1
+
+                        # Finally, search all working days.
+                        for d0 in WORKING_DAYS:
+                            for hh in range(9, 18):
+                                for mm in (0, 15, 30, 45):
+                                    ns = time(hh, mm)
+                                    if _try_place(d0, ns, idx):
+                                        return 1
+                    return 0
+
                 for _pass in range(10):
                     occ = {}  # (period, room, day) -> [(start,end)]
                     moved = 0
@@ -5518,6 +5712,7 @@ def generate_24_sheets(sessions_from_log: List[Dict] = None):
                     _has_lunch = bool(_tasks.get("time_constraints"))
                     _has_ltpsc = bool(_tasks.get("ltpsc"))
                     _has_faculty = bool(_tasks.get("faculty_conflicts"))
+                    _has_duration = bool(_tasks.get("session_duration")) or _count_errors_with("session duration", ver_errors) > 0
                     _has_section_overlap = bool(_tasks.get("section_overlaps")) or _count_errors_with("section overlap", ver_errors) > 0
                     _has_lab_doublebook = _count_errors_with("classroom conflict", ver_errors) > 0
                     _step = 0
@@ -5566,6 +5761,10 @@ def generate_24_sheets(sessions_from_log: List[Dict] = None):
                         _step += _atomic_fix_one_lunch(_tasks)
                         if _step:
                             _step_tag = "lunch"
+                    if (not _step) and _has_duration:
+                        _step += _atomic_fix_parsed_duration(_tasks)
+                        if _step:
+                            _step_tag = "duration"
                     if (not _step) and _has_room:
                         _step += _force_resolve_one_room_conflict()
                         if _step:
@@ -5582,7 +5781,7 @@ def generate_24_sheets(sessions_from_log: List[Dict] = None):
                         _step += _atomic_ltpsc_one(_tasks)
                         if _step:
                             _step_tag = "ltpsc"
-                    if (not _step) and (not _has_lunch):
+                    if (not _step) and (not _has_lunch) and (not _has_duration):
                         # Last-resort deterministic nudge only when typed tasks cannot progress.
                         _step += _force_resolve_one_room_conflict()
                         if _step:
@@ -5671,8 +5870,6 @@ def generate_24_sheets(sessions_from_log: List[Dict] = None):
                     import json
                     import csv
                     from datetime import datetime as _dt
-
-                    base_out_dir = "DATA/EDITED OUTPUT" if sessions_from_log is not None else "DATA/OUTPUT"
                     debug_ts = _dt.now().strftime("%Y%m%d_%H%M%S")
                     debug_dir = f"{base_out_dir}/strict_verify_DEBUG_{debug_ts}"
                     os.makedirs(debug_dir, exist_ok=True)
@@ -5732,8 +5929,6 @@ def generate_24_sheets(sessions_from_log: List[Dict] = None):
                     debug_faculty_path = None
                     try:
                         from modules_v2.phase6_faculty_conflicts import detect_faculty_conflicts
-
-                        base_out_dir = "DATA/EDITED OUTPUT" if sessions_from_log is not None else "DATA/OUTPUT"
                         debug_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
                         debug_faculty_path = f"{base_out_dir}/faculty_timetables_DEBUG_{debug_ts}.xlsx"
                         os.makedirs(os.path.dirname(debug_faculty_path), exist_ok=True)
@@ -5764,6 +5959,9 @@ def generate_24_sheets(sessions_from_log: List[Dict] = None):
                 )
                 continue
             print("[OK] Strict verification passed.")
+            if sessions_from_log is None and _initial_errs > 0:
+                print("Re-rendering beautiful Excel with fixed sessions to ensure 1:1 match with 0 issues...")
+                return generate_24_sheets(sessions_from_log=[dict(s) for s in final_ui_sessions], is_re_render=True)
             break
         else:
             break
@@ -5820,9 +6018,6 @@ def generate_24_sheets(sessions_from_log: List[Dict] = None):
     # Create summary sheet
     print("Creating summary sheet...")
     writer.create_summary_sheet(courses)
-    
-    # Set base output directory
-    base_out_dir = "DATA/EDITED OUTPUT" if sessions_from_log is not None else "DATA/OUTPUT"
     
     # Save the main timetable workbook
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -5927,18 +6122,19 @@ def generate_24_sheets(sessions_from_log: List[Dict] = None):
                 
         # If generating from log (UI edits), the session's faculty/room are already authoritative
         # (set by create_integrated_schedule fast path).  Only do a secondary lookup if truly empty.
+        orig_s = None
         if sessions_from_log is not None and (not room or not faculty):
-             orig_s = next((os_item for os_item in sessions_from_log if 
-                  (os_item.get('Section') == section_key or os_item.get('section') == section_key) and 
-                  (os_item.get('Course Code') == course_display or os_item.get('course_code') == course_display) and 
-                  str(os_item.get('Day') or os_item.get('day')).strip().upper() == str(s['day']).strip().upper() and 
-                  str(os_item.get('Start Time') or os_item.get('start_time')).replace(':', '') == s['start_time'].strftime("%H%M")
-             ), None)
-             if orig_s:
-                 if not room:
-                     room = orig_s.get('Room') or orig_s.get('room') or room
-                 if not faculty:
-                     faculty = orig_s.get('Faculty') or orig_s.get('faculty') or faculty
+            orig_s = next((os_item for os_item in sessions_from_log if 
+                (os_item.get('Section') == section_key or os_item.get('section') == section_key) and 
+                (os_item.get('Course Code') == course_display or os_item.get('course_code') == course_display) and 
+                str(os_item.get('Day') or os_item.get('day')).strip().upper() == str(s['day']).strip().upper() and 
+                str(os_item.get('Start Time') or os_item.get('start_time')).replace(':', '') == s['start_time'].strftime("%H%M")
+            ), None)
+            if orig_s:
+                if not room:
+                    room = orig_s.get('Room') or orig_s.get('room') or room
+                if not faculty:
+                    faculty = orig_s.get('Faculty') or orig_s.get('faculty') or faculty
                 
                 
         # Determine Phase for UI syncing

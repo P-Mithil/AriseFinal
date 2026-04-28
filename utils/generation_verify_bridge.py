@@ -59,42 +59,48 @@ def final_ui_rows_to_verify_sessions(rows: List[Dict[str, Any]]) -> List[Dict[st
     """
     grouped: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
 
+    def _txt(v: Any) -> str:
+        if v is None:
+            return ""
+        s = str(v).strip()
+        return "" if s.lower() in ("nan", "none") else s
+
     for s in rows:
-        course_code = (s.get("course_code") or "").strip()
-        section = (s.get("section") or "").strip()
+        course_code = _txt(s.get("course_code"))
+        section = _txt(s.get("section"))
         tb = s.get("time_block")
         if not course_code or not section or not isinstance(tb, TimeBlock):
             continue
         day = tb.day
-        session_type = (s.get("session_type") or "L").strip().upper()
+        session_type = _txt(s.get("session_type") or "L").upper()
         if session_type == "ELECTIVE":
-            session_type = "L"
+            # Preserve duration semantics for elective rows that use legacy ELECTIVE tag.
+            try:
+                _dur_m = (tb.end.hour * 60 + tb.end.minute) - (tb.start.hour * 60 + tb.start.minute)
+                if _dur_m == 60:
+                    session_type = "T"
+                elif _dur_m == 120:
+                    session_type = "P"
+                else:
+                    session_type = "L"
+            except Exception:
+                session_type = "L"
         period = normalize_period(s.get("period"))
-        phase = (s.get("phase") or "").strip()
+        phase = _txt(s.get("phase"))
         phase_lc = phase.lower()
-        faculty_raw = (s.get("faculty") or "").strip()
-        room = (s.get("room") or "").strip()
+        faculty_raw = _txt(s.get("faculty"))
+        room = _txt(s.get("room"))
 
         # Phase-aware grouping:
-        # - Phase 4 combined sessions merge by slot (multiple sections).
-        # - Shared-room joint lectures (historically C004; also C202/C203/…): merge *all* Phase N
-        #   (not Phase 3 electives) rows with the same (course, day, time, type, period, room)
-        #   into one verify session, even when one sheet row is tagged "Phase 4" and another
-        #   "Phase 5"/"Phase 7". If we only merged C004, the same physical joint class in another
-        #   room stayed as two one-section sessions and LTPSC compliance under-counted one section.
-        # - All other sessions stay per-section so parallel classes with different faculty/rooms stay valid.
+        # - Only true Phase 4 rows are merged across sections by slot.
+        # - Non-Phase-4 rows (Phase 5/7 etc.) must remain per-section, even if they share room/time,
+        #   so Phase 4 synchronization checks do not accidentally include non-Phase-4 sessions.
+        # - Phase 3 electives are always per-section rows in verification input.
         cc_upper = course_code.upper()
         room_k = str(room or "").strip().upper()
-        is_shared_room_joint_bucket = (
-            bool(room_k)
-            and phase_lc.startswith("phase")
-            and phase_lc != "phase 3"
-            and not cc_upper.startswith("ELECTIVE_BASKET")
-        )
-        is_phase4_combined = phase_lc == "phase 4" or is_shared_room_joint_bucket
+        is_phase4_combined = phase_lc == "phase 4" and not cc_upper.startswith("ELECTIVE_BASKET")
         if is_phase4_combined:
-            # Omit *phase* from the merge key for shared-room joint buckets so Phase 4 /
-            # Phase 5 / Phase 7 tags for the same slot unify.
+            # Group across sections for the exact same Phase 4 slot.
             group_key = (course_code, day, tb.start, tb.end, session_type, period, room_k)
         else:
             group_key = (phase, course_code, section, day, tb.start, tb.end, session_type, period)
@@ -115,7 +121,7 @@ def final_ui_rows_to_verify_sessions(rows: List[Dict[str, Any]]) -> List[Dict[st
         if phase_lc == "phase 4":
             g["phase"] = "Phase 4"
         grouped[group_key]["sections"].add(section)
-        rm = (s.get("room") or "").strip()
+        rm = _txt(s.get("room"))
         if rm and not (g.get("room") or "").strip():
             g["room"] = rm
         if faculty_raw and not (g.get("instructor") or "").strip():

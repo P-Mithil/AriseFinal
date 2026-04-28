@@ -340,6 +340,7 @@ def get_phase7_period_assignments(
     import os
 
     force_prompts = os.environ.get("ARISE_FORCE_PHASE_PROMPTS", "").strip().lower() in ("1", "true", "yes")
+    # Default behavior: ask only when assignment is missing; then persist and reuse.
 
     existing = load_phase7_period_assignments(assignments_path)
     assignments: Dict[Tuple[str, int, str], bool] = dict(existing)
@@ -862,11 +863,26 @@ def schedule_within_group_combined(course: Course, sections: List[Section],
             if slot_duration >= 120 and not slot_end_within_day(slot.start, 120):
                 slot_idx += 1
                 continue
-            lab_rooms = [r for r in classrooms if hasattr(r, 'room_type') and r.room_type.lower() == 'lab']
+            lab_rooms = [r for r in classrooms if hasattr(r, 'room_type') and r.room_type.lower() == 'lab'
+                         and not getattr(r, 'is_research_lab', False)]
+            if not lab_rooms:
+                lab_rooms = [r for r in classrooms if hasattr(r, 'room_type') and r.room_type.lower() == 'lab']
             if not lab_rooms:
                 lab_rooms = classrooms
+
+            # Determine course type (EC → Hardware labs, others → Software labs)
+            course_code_upper = str(course.code or '').strip().upper()
+            wants_hardware = course_code_upper.startswith('EC')
+            if wants_hardware:
+                typed_labs = [r for r in lab_rooms if getattr(r, 'lab_type', None) == 'Hardware']
+            else:
+                typed_labs = [r for r in lab_rooms if getattr(r, 'lab_type', None) in (None, 'Software')]
+            if not typed_labs:
+                typed_labs = lab_rooms  # fallback to any lab
+
+            # Assign FIRST lab
             assigned_room = None
-            for lab in lab_rooms:
+            for lab in typed_labs:
                 room_num = lab.room_number if hasattr(lab, 'room_number') else str(lab)
                 if room_occupancy and room_num in room_occupancy:
                     has_conflict = False
@@ -875,15 +891,42 @@ def schedule_within_group_combined(course: Course, sections: List[Section],
                     if has_conflict: continue
                 assigned_room = room_num
                 break
-            if not assigned_room and lab_rooms:
-                assigned_room = lab_rooms[0].room_number if hasattr(lab_rooms[0], 'room_number') else str(lab_rooms[0])
+            if not assigned_room and typed_labs:
+                assigned_room = typed_labs[0].room_number if hasattr(typed_labs[0], 'room_number') else str(typed_labs[0])
             elif not assigned_room:
                 assigned_room = classrooms[0].room_number if classrooms and hasattr(classrooms[0], 'room_number') else 'LAB1'
+
+            # Assign SECOND lab (mandatory: always 2 labs per practical)
+            assigned_room2 = None
+            for lab in typed_labs:
+                room_num = lab.room_number if hasattr(lab, 'room_number') else str(lab)
+                if room_num == assigned_room:
+                    continue  # Skip first lab
+                if room_occupancy and room_num in room_occupancy:
+                    has_conflict = False
+                    for occupied_block in room_occupancy[room_num]:
+                        if slot.overlaps(occupied_block): has_conflict = True; break
+                    if has_conflict: continue
+                assigned_room2 = room_num
+                break
+            # If no free second lab, force-pick any other lab
+            if not assigned_room2 and typed_labs:
+                for lab in typed_labs:
+                    room_num = lab.room_number if hasattr(lab, 'room_number') else str(lab)
+                    if room_num != assigned_room:
+                        assigned_room2 = room_num
+                        break
+
+            # Build combined room string
+            if assigned_room2:
+                room_str = ', '.join(sorted([assigned_room, assigned_room2]))
+            else:
+                room_str = assigned_room
             
             for lbl in label_list:
                 session = ScheduledSession(
                     course_code=course.code, section=lbl, kind="P", block=slot,
-                    room=assigned_room, period=target_period,
+                    room=room_str, period=target_period,
                     faculty=faculty_name
                 )
                 sessions.append(session)
@@ -896,7 +939,11 @@ def schedule_within_group_combined(course: Course, sections: List[Section],
             if room_occupancy is not None:
                 if assigned_room not in room_occupancy: room_occupancy[assigned_room] = []
                 room_occupancy[assigned_room].append(slot)
+                if assigned_room2:
+                    if assigned_room2 not in room_occupancy: room_occupancy[assigned_room2] = []
+                    room_occupancy[assigned_room2].append(slot)
             slot_idx += 1
+
             
     # Group sections by period
     period_groups = {'PRE': [], 'POST': []}
@@ -1060,6 +1107,11 @@ def schedule_non_combined(course: Course, sections: List[Section],
                     break
                     
                 slot = available_slots[slot_idx]
+                slot_duration = (slot.end.hour * 60 + slot.end.minute) - (slot.start.hour * 60 + slot.start.minute)
+                if slot_duration != 90:
+                    # This pooled slot can be used by T/P; keep lecture strict at 90 minutes.
+                    slot_idx += 1
+                    continue
                 
                 # Check one-session-per-day rule
                 if slot.day in used_days_lectures:
@@ -1182,6 +1234,11 @@ def schedule_non_combined(course: Course, sections: List[Section],
                     break
                     
                 slot = available_slots[slot_idx]
+                slot_duration = (slot.end.hour * 60 + slot.end.minute) - (slot.start.hour * 60 + slot.start.minute)
+                if slot_duration != 60:
+                    # Keep tutorials strictly 60 minutes.
+                    slot_idx += 1
+                    continue
                 
                 # Check one-session-per-day rule - cannot be on same day as lecture
                 if slot.day in used_days_tutorials or slot.day in used_days_lectures:
@@ -1285,6 +1342,11 @@ def schedule_non_combined(course: Course, sections: List[Section],
                 break
             
         slot = available_slots[slot_idx]
+        slot_duration = (slot.end.hour * 60 + slot.end.minute) - (slot.start.hour * 60 + slot.start.minute)
+        if slot_duration != 120:
+            # Keep practicals strictly 120 minutes.
+            slot_idx += 1
+            continue
         lunch_block = (
             TimeBlock(slot.day, lunch_block_base.start, lunch_block_base.end)
             if lunch_block_base else None
@@ -1311,24 +1373,34 @@ def schedule_non_combined(course: Course, sections: List[Section],
         
         # Additional check: For 2-hour practicals, start must be <= 16:00
         # Check if this is a practical slot (2 hours duration)
-        slot_duration = (slot.end.hour * 60 + slot.end.minute) - (slot.start.hour * 60 + slot.start.minute)
-        if slot_duration >= 120 and not slot_end_within_day(slot.start, 120):
+        if not slot_end_within_day(slot.start, 120):
             slot_idx += 1
             continue
         
-        # For practicals, use labs - find available lab room
-        lab_rooms = [r for r in classrooms if hasattr(r, 'room_type') and r.room_type.lower() == 'lab']
+        # For practicals, use labs - find available lab rooms (always assign 2)
+        lab_rooms = [r for r in classrooms if hasattr(r, 'room_type') and r.room_type.lower() == 'lab'
+                     and not getattr(r, 'is_research_lab', False)]
+        if not lab_rooms:
+            lab_rooms = [r for r in classrooms if hasattr(r, 'room_type') and r.room_type.lower() == 'lab']
         if not lab_rooms:
             # Fallback to any classroom if no labs found
             lab_rooms = classrooms
-        
-        # Find first available lab room (check room_occupancy if available)
+
+        # Determine lab type (EC → Hardware, others → Software)
+        course_code_upper = str(course.code or '').strip().upper()
+        wants_hardware = course_code_upper.startswith('EC')
+        if wants_hardware:
+            typed_labs = [r for r in lab_rooms if getattr(r, 'lab_type', None) == 'Hardware']
+        else:
+            typed_labs = [r for r in lab_rooms if getattr(r, 'lab_type', None) in (None, 'Software')]
+        if not typed_labs:
+            typed_labs = lab_rooms
+
+        # Find FIRST available lab
         assigned_room = None
-        for lab in lab_rooms:
+        for lab in typed_labs:
             room_num = lab.room_number if hasattr(lab, 'room_number') else str(lab)
-            # Check if room is available (if room_occupancy tracking exists)
             if room_occupancy and room_num in room_occupancy:
-                # Check for conflicts
                 has_conflict = False
                 for occupied_block in room_occupancy[room_num]:
                     if slot.overlaps(occupied_block):
@@ -1340,17 +1412,47 @@ def schedule_non_combined(course: Course, sections: List[Section],
             break
         
         # Fallback to first lab if no available one found
-        if not assigned_room and lab_rooms:
-            assigned_room = lab_rooms[0].room_number if hasattr(lab_rooms[0], 'room_number') else str(lab_rooms[0])
+        if not assigned_room and typed_labs:
+            assigned_room = typed_labs[0].room_number if hasattr(typed_labs[0], 'room_number') else str(typed_labs[0])
         elif not assigned_room:
             assigned_room = classrooms[0].room_number if classrooms and hasattr(classrooms[0], 'room_number') else 'LAB1'
+
+        # Find SECOND available lab (mandatory: always 2 labs)
+        assigned_room2 = None
+        for lab in typed_labs:
+            room_num = lab.room_number if hasattr(lab, 'room_number') else str(lab)
+            if room_num == assigned_room:
+                continue  # Skip first lab
+            if room_occupancy and room_num in room_occupancy:
+                has_conflict = False
+                for occupied_block in room_occupancy[room_num]:
+                    if slot.overlaps(occupied_block):
+                        has_conflict = True
+                        break
+                if has_conflict:
+                    continue
+            assigned_room2 = room_num
+            break
+        # Force-pick any second lab if none free
+        if not assigned_room2 and typed_labs:
+            for lab in typed_labs:
+                room_num = lab.room_number if hasattr(lab, 'room_number') else str(lab)
+                if room_num != assigned_room:
+                    assigned_room2 = room_num
+                    break
+
+        # Build combined room string
+        if assigned_room2:
+            room_str = ', '.join(sorted([assigned_room, assigned_room2]))
+        else:
+            room_str = assigned_room
         
         session = ScheduledSession(
             course_code=course.code,
             section=section_label,
             kind="P",
             block=slot,
-            room=assigned_room,
+            room=room_str,
             period=period,
             faculty=course.instructors[0] if course.instructors else 'TBD'
         )
@@ -1369,8 +1471,13 @@ def schedule_non_combined(course: Course, sections: List[Section],
             if assigned_room not in room_occupancy:
                 room_occupancy[assigned_room] = []
             room_occupancy[assigned_room].append(slot)
+            if assigned_room2:
+                if assigned_room2 not in room_occupancy:
+                    room_occupancy[assigned_room2] = []
+                room_occupancy[assigned_room2].append(slot)
         
         slot_idx += 1
+
     
     return sessions
 

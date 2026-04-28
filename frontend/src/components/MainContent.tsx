@@ -166,7 +166,7 @@ export function syncAllMovedRelatedSessions(oldTimetable: Session[], newTimetabl
 
   // Build a lookup to detect combined courses by actual data:
   // If the same course code + day + start time + session type exists in ANOTHER section,
-  // it's a combined / shared course that needs syncing (regardless of Phase label).
+  // it's a combined / shared course that needs syncing.
   const combinedLookup = new Map<string, number[]>()
   for (let i = 0; i < oldTimetable.length; i++) {
     const s = oldTimetable[i]
@@ -179,8 +179,10 @@ export function syncAllMovedRelatedSessions(oldTimetable: Session[], newTimetabl
     const oldS = oldTimetable[idx]
     const newS = finalState[idx]
 
-    // Phase 3 (Electives): sync across ALL sections of the same semester
-    const isPhase3 = oldS.Phase?.startsWith('Phase 3')
+    const phase = (oldS.Phase || '').trim()
+    const codeUpper = (oldS['Course Code'] || '').trim().toUpperCase()
+    const isPhase3 = phase.startsWith('Phase 3')
+    const isElectiveBasket = codeUpper.startsWith('ELECTIVE_BASKET')
 
     // Detect combined course by data: same course+day+time exists in other sections
     const dataKey = `${oldS['Course Code']}|${oldS.Day}|${oldS['Start Time']}|${oldS['Session Type']}`
@@ -188,11 +190,11 @@ export function syncAllMovedRelatedSessions(oldTimetable: Session[], newTimetabl
     const uniqueSections = new Set(sharedIndices.map(i => oldTimetable[i].Section))
     const isCombinedByData = uniqueSections.size > 1  // exists in multiple sections
 
-    // Also check Phase label as fallback
     const isPhase4Label = oldS.Phase?.startsWith('Phase 4')
     const isCombined = isCombinedByData || isPhase4Label
 
-    if (!isPhase3 && !isCombined) {
+    const shouldApplyElectiveBasketSync = isPhase3 || isElectiveBasket
+    if (!shouldApplyElectiveBasketSync && !isCombined) {
       continue
     }
 
@@ -207,14 +209,30 @@ export function syncAllMovedRelatedSessions(oldTimetable: Session[], newTimetabl
       // would BOTH get moved to the new slot, causing the Thursday block to vanish.
       const isSameDay = oldCand.Day === oldS.Day
 
-      const shouldSync =
+      // Elective basket drag policy:
+      // Move the entire semester basket slot (all sections/courses in that slot).
+      const isOldCandElectiveBasket = ((oldCand['Course Code'] || '').trim().toUpperCase()).startsWith('ELECTIVE_BASKET')
+      const shouldSyncElectiveBasket =
+        shouldApplyElectiveBasketSync &&
+        isOldCandElectiveBasket &&
+        oldCand['Start Time'] === oldS['Start Time'] &&
+        oldCand['End Time'] === oldS['End Time'] &&
+        isSameSemester &&
+        isSameDay
+
+      // Combined course sync policy:
+      // Keep same course/type/time synchronized within the same original group.
+      const shouldSyncCombined =
+        !shouldApplyElectiveBasketSync &&
         oldCand['Course Code'] === oldS['Course Code'] &&
         oldCand['Session Type'] === oldS['Session Type'] &&
-        oldCand['Start Time'] === oldS['Start Time'] &&  // must be same original time slot
+        oldCand['Start Time'] === oldS['Start Time'] &&
+        oldCand['End Time'] === oldS['End Time'] &&
         isSameSemester &&
-        isSameDay && // must be same original day — prevents vanishing of other weekly occurrences
-        (isPhase3 || isSameGroup) // Phase 3: all sections; Combined: same group only
+        isSameDay &&
+        isSameGroup
 
+      const shouldSync = shouldSyncElectiveBasket || shouldSyncCombined
       if (shouldSync) {
         return {
           ...cand,
@@ -242,6 +260,7 @@ function getGroupForSection(section: string | null): number {
   const s = section.toUpperCase()
   if (s.includes('CSE-A') || s.includes('CSE-B')) return 1
   if (s.includes('DSAI-A') || s.includes('ECE-A')) return 2
+  if (s.includes('AIC-A')) return 3
   return 1 // Default
 }
 
@@ -266,7 +285,35 @@ function MainContent({
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null)
   const [generateSheetsLoading, setGenerateSheetsLoading] = useState(false)
 
+  const buildVerifyFailureMessage = useCallback((errors: VerifyError[]): string => {
+    if (!errors || errors.length === 0) {
+      return 'Verification failed with unknown issue.'
+    }
+    const sections = Array.from(
+      new Set(
+        errors
+          .map((e) => (e.section || '').trim())
+          .filter((s) => s.length > 0),
+      ),
+    )
+    const previewSections = sections.slice(0, 3).join(', ')
+    if (sections.length > 0) {
+      return `Verification failed: ${errors.length} issue(s). Affected sections: ${previewSections}${sections.length > 3 ? ', ...' : ''}.`
+    }
+    return `Verification failed: ${errors.length} issue(s).`
+  }, [])
+
   const selectedSemester = useMemo(() => getSemesterFromSection(selectedSection), [selectedSection])
+
+  const inferOfferingVariant = useCallback((): 'odd' | 'even' | null => {
+    const sems = labels?.semesters ?? []
+    if (!sems.length) return null
+    const allOdd = sems.every((s) => Number(s) % 2 === 1)
+    const allEven = sems.every((s) => Number(s) % 2 === 0)
+    if (allOdd) return 'odd'
+    if (allEven) return 'even'
+    return null
+  }, [labels])
 
   const workingDays = labels?.working_days ?? ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']
   const dayStart = labels?.day_start ?? '09:00'
@@ -369,10 +416,13 @@ function MainContent({
       }
       const data = (await res.json()) as VerifyResponse
       onVerifyResult(data.success, data.errors ?? [])
+      if (!data.success) {
+        setMessage(buildVerifyFailureMessage(data.errors ?? []))
+      }
     } catch (err: any) {
       setMessage(`Verify failed: ${err.message ?? String(err)}`)
     }
-  }, [timetable, onVerifyResult, setMessage])
+  }, [timetable, onVerifyResult, setMessage, buildVerifyFailureMessage])
 
   const handleGenerateFromSessions = useCallback(async () => {
     if (!timetable) return
@@ -382,7 +432,10 @@ function MainContent({
       const res = await fetch(`${API_BASE}/api/generate-from-sessions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sessions: timetable }),
+        body: JSON.stringify({
+          sessions: timetable,
+          offering_variant: inferOfferingVariant(),
+        }),
       })
       if (!res.ok) {
         const text = await res.text()
@@ -407,7 +460,7 @@ function MainContent({
     } finally {
       setGenerateSheetsLoading(false)
     }
-  }, [timetable, onGenerateFirst, setMessage])
+  }, [timetable, onGenerateFirst, setMessage, inferOfferingVariant])
 
 
   const applyDrop = useCallback(
@@ -493,13 +546,16 @@ function MainContent({
           if (res.ok) {
             const data = (await res.json()) as VerifyResponse
             onVerifyResult(data.success, data.errors ?? [])
+            if (!data.success) {
+              setMessage(buildVerifyFailureMessage(data.errors ?? []))
+            }
           }
         } catch (_err) {
           // silence — user can still manually verify
         }
       })()
     },
-    [timetable, filteredSessions, onTimetableChange, onVerifyResult, selectedSection, dayStart, dayEnd, lunchWindow, setMessage],
+    [timetable, filteredSessions, onTimetableChange, onVerifyResult, selectedSection, dayStart, dayEnd, lunchWindow, setMessage, buildVerifyFailureMessage],
   )
 
   const handleDndDragStart = useCallback((e: DragStartEvent) => {
@@ -610,19 +666,9 @@ function MainContent({
                   if (session) {
                     const startMin = parseTimeToMinutes(session['Start Time'])
                     const endMin = parseTimeToMinutes(session['End Time'])
-                    const baseSpan = Math.max(1, Math.ceil((endMin - startMin) / 15))
-                    const endTimeStr = normalizeTimeStr(session['End Time'])
-
-                    // Check if the slot right after this session is occupied or is lunch.
-                    // If empty, extend the block visually by 1 extra slot so the end time
-                    // aligns with its column marker (fixes the "15-minute gap" appearance).
-                    const nextSlotHasSession = sessionsForDay.some(
-                      (s) => normalizeTimeStr(s['Start Time']) === endTimeStr,
-                    )
-                    const nextSlotIsLunch =
-                      lunchWindow && normalizeTimeStr(lunchWindow.start) === endTimeStr
-                    const span =
-                      nextSlotHasSession || nextSlotIsLunch ? baseSpan : baseSpan + 1
+                    // Keep grid span exactly aligned with timetable data and Excel:
+                    // duration = End Time - Start Time (in 15-minute slots).
+                    const span = Math.max(1, Math.ceil((endMin - startMin) / 15))
 
                     const droppableId = slotDroppableId(day, slotStart)
 

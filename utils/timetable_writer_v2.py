@@ -441,11 +441,21 @@ class TimetableWriterV2:
                 room_type_map[str(rnum).strip()] = str(rtype).strip()
 
         def is_lab_room(room_code) -> bool:
-            """Return True only if the room is an actual lab (per room_type description)."""
+            """Return True only if the room (or all rooms in a comma-separated list) is an actual lab."""
             if not room_code:
                 return False
-            rtype = room_type_map.get(str(room_code).strip(), '')
-            return 'lab' in rtype.lower()
+            
+            # If it's a comma-separated list of multiple rooms, check each one
+            room_str = str(room_code).strip()
+            if ',' in room_str:
+                parts = [p.strip() for p in room_str.split(',') if p.strip()]
+                return bool(parts) and all(is_lab_room(p) for p in parts)
+                
+            rtype = room_type_map.get(room_str, '')
+            if rtype:
+                return 'lab' in rtype.lower()
+            # Fallback: rooms prefixed with 'L' followed by digits are physical labs (e.g. L106, L107)
+            return room_str.upper().startswith('L') and room_str[1:].isdigit()
 
         def is_na_room(room_code) -> bool:
             if room_code is None:
@@ -1686,8 +1696,14 @@ class TimetableWriterV2:
                 
                 if room_assignments and room_key in room_assignments:
                     assignment = room_assignments[room_key]
-                    assigned_classroom = assignment.get('classroom', '') or ''
+                    raw_classroom = assignment.get('classroom', '') or ''
                     labs_list = assignment.get('labs', [])
+                    # Sanity check: if classroom field contains a lab room, reclassify it
+                    if raw_classroom and is_lab_room(raw_classroom):
+                        if raw_classroom not in labs_list:
+                            labs_list = list(labs_list) + [raw_classroom]
+                        raw_classroom = ''
+                    assigned_classroom = raw_classroom
                     if labs_list:
                         assigned_labs = ', '.join(labs_list)
                 
@@ -2057,19 +2073,32 @@ class TimetableWriterV2:
                         else:
                             total_lectures += 1
 
-                if grid_sessions and not phase5_sessions and not phase7_sessions:
-                    for day, sessions in grid_sessions.items():
-                        for s in sessions:
-                            block, course_display = s[0], s[1]
-                            if course_display in ("LUNCH", "Break(15min)"):
+                if not phase5_sessions and not phase7_sessions:
+                    if all_section_sessions:
+                        for session in all_section_sessions:
+                            course_display = str(session.get('Course Code', session.get('course_code', '')))
+                            sess_base = course_display.replace('-TUT', '').replace('-LAB', '').split('-')[0]
+                            if sess_base != course_code:
                                 continue
-                            if course_code in course_display:
-                                if '-LAB' in course_display:
-                                    total_labs += 1
-                                elif '-TUT' in course_display:
-                                    total_tutorials += 1
-                                else:
-                                    total_lectures += 1
+                            if '-LAB' in course_display:
+                                total_labs += 1
+                            elif '-TUT' in course_display:
+                                total_tutorials += 1
+                            else:
+                                total_lectures += 1
+                    elif grid_sessions:
+                        for day, sessions in grid_sessions.items():
+                            for s in sessions:
+                                block, course_display = s[0], s[1]
+                                if course_display in ("LUNCH", "Break(15min)"):
+                                    continue
+                                if course_code in course_display:
+                                    if '-LAB' in course_display:
+                                        total_labs += 1
+                                    elif '-TUT' in course_display:
+                                        total_tutorials += 1
+                                    else:
+                                        total_lectures += 1
 
                 # Legacy data can contain section-specific LTPSC variants for the same code
                 # (without Offering_ID), where some sections are lab-only offerings.
@@ -2146,8 +2175,14 @@ class TimetableWriterV2:
                 
                 if room_assignments and room_key in room_assignments:
                     assignment = room_assignments[room_key]
-                    assigned_classroom = assignment.get('classroom', '') or ''
+                    raw_classroom = assignment.get('classroom', '') or ''
                     labs_list = assignment.get('labs', [])
+                    # Sanity check: if classroom field contains a lab room, reclassify it
+                    if raw_classroom and is_lab_room(raw_classroom):
+                        if raw_classroom not in labs_list:
+                            labs_list = list(labs_list) + [raw_classroom]
+                        raw_classroom = ''
+                    assigned_classroom = raw_classroom
                     if labs_list:
                         assigned_labs = ', '.join(labs_list)
                 

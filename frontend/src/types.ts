@@ -32,6 +32,7 @@ export interface LabelsConfig {
   day_end: string;
   lunch_windows: Record<string, string[]>;
   programs: ProgramLabel[];
+  semesters: number[];
   section_labels: SectionLabel[];
 }
 
@@ -50,14 +51,6 @@ export interface VerificationRow {
   room_conflicts?: string;
 }
 
-export interface GenerateResponse {
-  success: boolean;
-  timetable: Session[];
-  labels: LabelsConfig;
-  verification_table?: Record<string, VerificationRow[]>;
-  log_timestamp?: string;
-}
-
 export interface VerifyError {
   rule: string;
   message: string;
@@ -70,6 +63,16 @@ export interface VerifyError {
 export interface VerifyResponse {
   success: boolean;
   errors: VerifyError[];
+}
+
+export interface GenerateResponse {
+  success: boolean;
+  timetable: Session[];
+  labels: LabelsConfig;
+  verification_table?: Record<string, VerificationRow[]>;
+  log_timestamp?: string;
+  /** Same checks as POST /api/verify on the exported timetable (main timetable consistency). */
+  post_generate_verify?: VerifyResponse;
 }
 
 export interface ReflowResponse {

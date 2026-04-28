@@ -73,38 +73,76 @@ def get_config(semesters: Optional[List[int]] = None):
 
 def load_timetable_from_csv(log_path: str) -> List[Dict[str, Any]]:
     """Load timetable sessions from time_slot_log CSV. Returns list of session dicts (API schema).
-    Deduplicates sessions that appear multiple times for the same slot (common with combined classes).
+    Deduplicates only truly identical rows.
     """
     seen: set = set()
     rows = []
     with open(log_path, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
+            phase = row.get("Phase", "")
             section = row.get("Section", "")
             course_code = row.get("Course Code", "")
             day = row.get("Day", "")
             start_time = row.get("Start Time", "")
+            end_time = row.get("End Time", "")
             session_type = row.get("Session Type", "")
             period = row.get("Period", "")
-            # Key for deduplication - same session shouldn't appear twice for the same section
-            # Include End Time to ensure sessions with different durations are not accidentally merged/dropped
-            dedup_key = (section, course_code, day, start_time, row.get("End Time", ""), session_type, period)
+            room = row.get("Room", "")
+            faculty = row.get("Faculty", "")
+            # Keep API rows aligned 1:1 with final log rows used for Excel render.
+            # Only collapse exact duplicates, never "same slot but different phase/room" rows.
+            dedup_key = (
+                phase,
+                section,
+                course_code,
+                day,
+                start_time,
+                end_time,
+                session_type,
+                period,
+                room,
+                faculty,
+            )
             if dedup_key in seen:
                 continue
             seen.add(dedup_key)
             rows.append({
-                "Phase": row.get("Phase", ""),
+                "Phase": phase,
                 "Course Code": course_code,
                 "Section": section,
                 "Day": day,
                 "Start Time": start_time,
-                "End Time": row.get("End Time", ""),
-                "Room": row.get("Room", ""),
+                "End Time": end_time,
+                "Room": room,
                 "Period": period,
                 "Session Type": session_type,
-                "Faculty": row.get("Faculty", ""),
+                "Faculty": faculty,
             })
     return rows
+
+
+def _resolve_log_path_for_timestamp(ts: str, prefer_edited: bool = False) -> str:
+    """
+    Resolve the actual time-slot log path for a given timestamp.
+    Some flows write to DATA/OUTPUT, while regenerate-from-sessions writes to DATA/EDITED OUTPUT.
+    """
+    candidates: List[str] = []
+    output_path = os.path.join(REPO_ROOT, "DATA", "OUTPUT", f"time_slot_log_{ts}.csv")
+    edited_output_path = os.path.join(REPO_ROOT, "DATA", "EDITED OUTPUT", f"time_slot_log_{ts}.csv")
+
+    if prefer_edited:
+        candidates = [edited_output_path, output_path]
+    else:
+        candidates = [output_path, edited_output_path]
+
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+
+    raise FileNotFoundError(
+        f"Time slot log not found for timestamp {ts}. Tried: {', '.join(candidates)}"
+    )
 
 
 # Verification table column indices (0-based) matching write_verification_table headers
@@ -180,6 +218,156 @@ def parse_verification_tables_from_excel(excel_path: str) -> Dict[str, List[Dict
     return result
 
 
+def parse_timetable_sessions_from_excel(excel_path: str) -> List[Dict[str, Any]]:
+    """
+    Parse the displayed timetable grid from generated Excel sheets.
+    This is the authoritative visual schedule source used by users.
+    """
+    import openpyxl
+
+    sessions: List[Dict[str, Any]] = []
+    if not os.path.isfile(excel_path):
+        return sessions
+
+    wb = openpyxl.load_workbook(excel_path, data_only=True)
+
+    def _to_str(v: Any) -> str:
+        return str(v).strip() if v is not None else ""
+
+    for sheet_name in wb.sheetnames:
+        key = _sheet_name_to_key(sheet_name)
+        if not key:
+            continue
+
+        # key format: "<section>-Sem<sem>-PRE|POST"
+        m = re.match(r"^(.+)-Sem(\d+)-(PRE|POST)$", key.strip(), re.IGNORECASE)
+        if not m:
+            continue
+        section = m.group(1).strip() + f"-Sem{m.group(2)}"
+        period = m.group(3).upper()
+
+        sheet = wb[sheet_name]
+        row = 1
+        max_row = sheet.max_row
+        max_col = sheet.max_column
+        while row <= max_row:
+            day_cell = _to_str(sheet.cell(row=row, column=1).value)
+            if day_cell.lower().startswith("day:"):
+                day = day_cell.split(":", 1)[1].strip()
+                time_row = row + 1
+                course_row = row + 2
+                if course_row <= max_row:
+                    for col in range(2, max_col + 1):
+                        time_val = _to_str(sheet.cell(row=time_row, column=col).value)
+                        course_val = _to_str(sheet.cell(row=course_row, column=col).value)
+                        if not time_val or not course_val:
+                            continue
+                        course_upper = course_val.upper()
+                        if course_upper in ("LUNCH", "BREAK(15MIN)"):
+                            continue
+                        if "-" not in time_val:
+                            continue
+                        time_parts = [p.strip() for p in time_val.split("-", 1)]
+                        if len(time_parts) != 2 or not time_parts[0] or not time_parts[1]:
+                            continue
+                        start_time, end_time = time_parts[0], time_parts[1]
+                        session_type = "L"
+                        if "-LAB" in course_upper:
+                            session_type = "P"
+                        elif "-TUT" in course_upper:
+                            session_type = "T"
+                        elif course_upper.startswith("ELECTIVE_BASKET_"):
+                            session_type = "ELECTIVE"
+                        sessions.append(
+                            {
+                                "Phase": "",
+                                "Course Code": course_val,
+                                "Section": section,
+                                "Day": day,
+                                "Start Time": start_time,
+                                "End Time": end_time,
+                                "Room": "",
+                                "Period": period,
+                                "Session Type": session_type,
+                                "Faculty": "",
+                            }
+                        )
+                row = course_row + 1
+                continue
+            row += 1
+    return sessions
+
+
+def merge_excel_sessions_with_log_details(
+    excel_sessions: List[Dict[str, Any]],
+    log_sessions: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    Keep Excel day/time placement authoritative and enrich room/faculty/phase from log rows.
+    """
+    merged: List[Dict[str, Any]] = []
+    log_index_exact: Dict[tuple, Dict[str, Any]] = {}
+    log_index_relaxed: Dict[tuple, Dict[str, Any]] = {}
+    # Cross-section fallback for synchronized slots that appear in Excel for multiple sections
+    # while the log may contain a single representative section row.
+    log_index_slot_exact: Dict[tuple, Dict[str, Any]] = {}
+    log_index_slot_relaxed: Dict[tuple, Dict[str, Any]] = {}
+
+    for r in log_sessions or []:
+        section = str((r or {}).get("Section", "") or "").strip()
+        day = str((r or {}).get("Day", "") or "").strip()
+        start = str((r or {}).get("Start Time", "") or "").strip()
+        end = str((r or {}).get("End Time", "") or "").strip()
+        period = normalize_period((r or {}).get("Period"))
+        code = str((r or {}).get("Course Code", "") or "").strip()
+        stype = str((r or {}).get("Session Type", "") or "").strip().upper()
+        if not (section and day and start and end and code):
+            continue
+        exact_key = (section, period, day, start, end, code, stype)
+        relaxed_key = (section, period, day, start, end, code)
+        slot_exact_key = (period, day, start, end, code, stype)
+        slot_relaxed_key = (period, day, start, end, code)
+        log_index_exact.setdefault(exact_key, r)
+        log_index_relaxed.setdefault(relaxed_key, r)
+        log_index_slot_exact.setdefault(slot_exact_key, r)
+        log_index_slot_relaxed.setdefault(slot_relaxed_key, r)
+
+    for s in excel_sessions or []:
+        section = str((s or {}).get("Section", "") or "").strip()
+        day = str((s or {}).get("Day", "") or "").strip()
+        start = str((s or {}).get("Start Time", "") or "").strip()
+        end = str((s or {}).get("End Time", "") or "").strip()
+        period = normalize_period((s or {}).get("Period"))
+        code = str((s or {}).get("Course Code", "") or "").strip()
+        stype = str((s or {}).get("Session Type", "") or "").strip().upper()
+        exact_key = (section, period, day, start, end, code, stype)
+        relaxed_key = (section, period, day, start, end, code)
+        slot_exact_key = (period, day, start, end, code, stype)
+        slot_relaxed_key = (period, day, start, end, code)
+        src = (
+            log_index_exact.get(exact_key)
+            or log_index_relaxed.get(relaxed_key)
+            or log_index_slot_exact.get(slot_exact_key)
+            or log_index_slot_relaxed.get(slot_relaxed_key)
+            or {}
+        )
+        merged.append(
+            {
+                "Phase": (src.get("Phase") or s.get("Phase") or ""),
+                "Course Code": code,
+                "Section": section,
+                "Day": day,
+                "Start Time": start,
+                "End Time": end,
+                "Room": (src.get("Room") or s.get("Room") or ""),
+                "Period": period,
+                "Session Type": (src.get("Session Type") or s.get("Session Type") or "L"),
+                "Faculty": (src.get("Faculty") or s.get("Faculty") or ""),
+            }
+        )
+    return merged
+
+
 def _count_unsatisfied_rows(verification_table: Dict[str, List[Dict[str, Any]]]) -> int:
     total = 0
     for rows in (verification_table or {}).values():
@@ -190,6 +378,82 @@ def _count_unsatisfied_rows(verification_table: Dict[str, List[Dict[str, Any]]])
     return total
 
 
+def _compute_zero_metrics(
+    timetable: List[Dict[str, Any]],
+    verification_table: Dict[str, List[Dict[str, Any]]],
+    post_generate_verify: Dict[str, Any],
+) -> Dict[str, int]:
+    """
+    Compute strict post-generation metrics used as an explicit zero gate.
+    """
+    errors = (post_generate_verify or {}).get("errors", []) or []
+    metrics = {
+        "classroom_conflicts": 0,
+        "capacity_violations": 0,
+        "faculty_conflicts": 0,
+        "overlaps": 0,
+        "unsatisfied": 0,
+        "tbd": 0,
+        "missing_faculty": 0,
+    }
+
+    for e in errors:
+        rule = str((e or {}).get("rule", "") or "").strip().lower()
+        if "faculty conflict" in rule:
+            metrics["faculty_conflicts"] += 1
+            continue
+        if "classroom conflict" in rule:
+            msg = str((e or {}).get("message", "") or "").strip().lower()
+            if "capacity" in msg:
+                metrics["capacity_violations"] += 1
+            else:
+                metrics["classroom_conflicts"] += 1
+            continue
+        if "section overlap" in rule or "time overlap" in rule or "overlap" in rule:
+            metrics["overlaps"] += 1
+            continue
+        if "ltpsc" in rule or "unsatisfied" in rule:
+            metrics["unsatisfied"] += 1
+
+    # NOTE: Verification-table UNSATISFIED rows are advisory and can be stale against
+    # strict verification output after final repairs. Zero gate should follow strict
+    # verifier truth only.
+
+    # "TBD" gate should track unresolved timetable allocations only.
+    # Faculty names can legitimately be blank/placeholder in some log rows and
+    # should not fail otherwise-valid strict generations.
+    tbd_count = 0
+    missing_faculty_count = 0
+    for row in timetable or []:
+        code = str((row or {}).get("Course Code", "") or "").strip().upper()
+        if code in ("LUNCH", "BREAK(15MIN)"):
+            continue
+        if code.startswith("ELECTIVE_BASKET_"):
+            # Synthetic basket rows don't carry a single definitive instructor.
+            continue
+        room = str((row or {}).get("Room", "") or "").strip().lower()
+        if room in ("tbd", "none", "nan", ""):
+            tbd_count += 1
+        stype = str((row or {}).get("Session Type", "") or "").strip().upper()
+        if stype == "P":
+            # Practicals intentionally keep blank/varied faculty to avoid false conflict linking.
+            continue
+        faculty = str((row or {}).get("Faculty", "") or "").strip().lower()
+        if faculty in ("", "tbd", "none", "nan", "-", "various", "multiple"):
+            missing_faculty_count += 1
+    metrics["tbd"] = tbd_count
+    metrics["missing_faculty"] = missing_faculty_count
+    return metrics
+
+
+def _api_fast_mode_enabled(request_fast: bool = False) -> bool:
+    """Enable faster API response shaping without changing generation rules."""
+    if request_fast:
+        return True
+    env_v = str(os.environ.get("ARISE_API_FAST_MODE", "0") or "").strip().lower()
+    return env_v in ("1", "true", "yes", "on")
+
+
 @app.get("/api/config")
 def api_config():
     """Working days, day start/end, lunch windows, programs and section labels for UI."""
@@ -197,7 +461,7 @@ def api_config():
 
 
 @app.post("/api/generate")
-async def api_generate():
+async def api_generate(fast: bool = False):
     """
     First-time Generate: run full pipeline, return timetable + structure for UI labels.
     Runs generate_24_sheets in a thread pool to avoid blocking the uvicorn event loop
@@ -225,20 +489,44 @@ async def api_generate():
                     status_code=422,
                     detail=detail,
                 )
-        log_path = os.path.join(REPO_ROOT, "DATA", "OUTPUT", f"time_slot_log_{ts}.csv")
-        if not os.path.exists(log_path):
-            raise HTTPException(status_code=500, detail=f"Time slot log not found: {log_path}")
-        timetable = load_timetable_from_csv(log_path)
+        try:
+            log_path = _resolve_log_path_for_timestamp(ts, prefer_edited=False)
+        except FileNotFoundError as ex:
+            raise HTTPException(status_code=500, detail=str(ex))
+        timetable_log = load_timetable_from_csv(log_path)
+        fast_mode = _api_fast_mode_enabled(fast)
         labels = get_config()
         excel_full_path = os.path.join(REPO_ROOT, output_path)
-        verification_table = parse_verification_tables_from_excel(excel_full_path)
-        post_generate_verify = run_verify(timetable)
-        unsatisfied_count = _count_unsatisfied_rows(verification_table)
+        if fast_mode:
+            # Fast mode avoids expensive Excel parsing; generation/strict rules remain unchanged.
+            timetable = timetable_log
+            verification_table = {}
+        else:
+            timetable_excel = parse_timetable_sessions_from_excel(excel_full_path)
+            timetable = merge_excel_sessions_with_log_details(timetable_excel, timetable_log)
+            verification_table = parse_verification_tables_from_excel(excel_full_path)
+        post_generate_verify = run_verify(timetable_log)
+        unsatisfied_count = _count_unsatisfied_rows(verification_table) if not fast_mode else 0
+        metrics = _compute_zero_metrics(timetable_log, verification_table, post_generate_verify)
+        zero_gate_ok = all(v == 0 for v in metrics.values())
         consistency = {
             "unsatisfied_rows": unsatisfied_count,
             "strict_success": bool(post_generate_verify.get("success", False)),
-            "consistent": not (post_generate_verify.get("success", False) and unsatisfied_count > 0),
+            "consistent": bool(post_generate_verify.get("success", False)) if fast_mode else not (post_generate_verify.get("success", False) and unsatisfied_count > 0),
+            "zero_metrics": metrics,
+            "zero_gate_ok": zero_gate_ok,
+            "fast_mode": fast_mode,
         }
+        if not zero_gate_ok:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "success": False,
+                    "message": "Post-generation zero gate failed",
+                    "post_generate_verify": post_generate_verify,
+                    "consistency": consistency,
+                },
+            )
         return {
             "success": True,
             "timetable": timetable,
@@ -259,9 +547,10 @@ async def api_generate():
 
 class GenerateFromSessionsRequest(BaseModel):
     sessions: List[Dict[str, Any]]
+    offering_variant: Optional[str] = None
 
 @app.post("/api/generate-from-sessions")
-async def api_generate_from_sessions(req: GenerateFromSessionsRequest):
+async def api_generate_from_sessions(req: GenerateFromSessionsRequest, fast: bool = False):
     """
     Re-generate all 24 Excel sheets from the current (possibly dragged/edited) session list.
     This preserves all manual drag changes while following existing scheduling rules for
@@ -271,11 +560,13 @@ async def api_generate_from_sessions(req: GenerateFromSessionsRequest):
     from concurrent.futures import ThreadPoolExecutor
 
     sessions = req.sessions
+    offering_variant = (req.offering_variant or "").strip().lower()
 
     def _do_generate():
         import pandas as pd
         from datetime import datetime
         from generate_24_sheets import generate_24_sheets_from_log
+        import math
 
         # Write the sessions to a new time-slot-log CSV so generate_24_sheets
         # can pick it up. We reuse the existing CSV format.
@@ -289,21 +580,35 @@ async def api_generate_from_sessions(req: GenerateFromSessionsRequest):
             with open(debug_path, "w", encoding="utf-8") as f:
                 json.dump(sessions, f, indent=2)
 
+        # Keep regenerate run on the same odd/even offering as the UI state.
+        if offering_variant in ("odd", "even"):
+            os.environ["ARISE_COURSE_DATA_VARIANT"] = offering_variant
+
         # Build a clean DataFrame from the session list
+        def _safe_text(v: Any, default: str = "") -> str:
+            if v is None:
+                return default
+            if isinstance(v, float) and math.isnan(v):
+                return default
+            txt = str(v).strip()
+            if txt.lower() in ("nan", "none"):
+                return default
+            return txt
+
         rows = []
         for s in sessions:
             rows.append({
-                "Phase": s.get("Phase", "Manual"),
-                "Course Code": s.get("Course Code", ""),
-                "Course Name": s.get("Course Name", ""),
-                "Section": s.get("Section", ""),
-                "Day": s.get("Day", ""),
-                "Start Time": s.get("Start Time", ""),
-                "End Time": s.get("End Time", ""),
-                "Room": s.get("Room", ""),
-                "Faculty": s.get("Faculty", ""),
-                "Session Type": s.get("Session Type", "L"),
-                "Period": s.get("Period", "PRE"),
+                "Phase": _safe_text(s.get("Phase"), "Manual"),
+                "Course Code": _safe_text(s.get("Course Code")),
+                "Course Name": _safe_text(s.get("Course Name")),
+                "Section": _safe_text(s.get("Section")),
+                "Day": _safe_text(s.get("Day")),
+                "Start Time": _safe_text(s.get("Start Time")),
+                "End Time": _safe_text(s.get("End Time")),
+                "Room": _safe_text(s.get("Room")),
+                "Faculty": _safe_text(s.get("Faculty")),
+                "Session Type": _safe_text(s.get("Session Type"), "L"),
+                "Period": _safe_text(s.get("Period"), "PRE"),
             })
         df = pd.DataFrame(rows)
         df.to_csv(log_path, index=False)
@@ -313,24 +618,60 @@ async def api_generate_from_sessions(req: GenerateFromSessionsRequest):
         return output_path, ts, log_path
 
     try:
+        from utils.generation_verify_bridge import GenerationViolationError
         loop = asyncio.get_event_loop()
         with ThreadPoolExecutor(max_workers=1) as pool:
-            output_path, ts, log_path = await loop.run_in_executor(pool, _do_generate)
+            try:
+                output_path, ts, log_path = await loop.run_in_executor(pool, _do_generate)
+            except GenerationViolationError as gve:
+                detail = {
+                    "success": False,
+                    "message": str(gve),
+                    "errors": gve.errors,
+                }
+                if getattr(gve, "debug_faculty_path", None):
+                    detail["debug_faculty_path"] = gve.debug_faculty_path
+                raise HTTPException(status_code=422, detail=detail)
 
-        if not os.path.exists(log_path):
-            raise HTTPException(status_code=500, detail=f"Time slot log not found: {log_path}")
+        try:
+            # Regenerate-from-sessions writes its final log to DATA/EDITED OUTPUT.
+            log_path = _resolve_log_path_for_timestamp(ts, prefer_edited=True)
+        except FileNotFoundError as ex:
+            raise HTTPException(status_code=500, detail=str(ex))
 
-        timetable = load_timetable_from_csv(log_path)
+        timetable_log = load_timetable_from_csv(log_path)
+        fast_mode = _api_fast_mode_enabled(fast)
         labels = get_config()
         excel_full_path = os.path.join(REPO_ROOT, output_path)
-        verification_table = parse_verification_tables_from_excel(excel_full_path)
-        post_generate_verify = run_verify(timetable)
-        unsatisfied_count = _count_unsatisfied_rows(verification_table)
+        if fast_mode:
+            timetable = timetable_log
+            verification_table = {}
+        else:
+            timetable_excel = parse_timetable_sessions_from_excel(excel_full_path)
+            timetable = merge_excel_sessions_with_log_details(timetable_excel, timetable_log)
+            verification_table = parse_verification_tables_from_excel(excel_full_path)
+        post_generate_verify = run_verify(timetable_log)
+        unsatisfied_count = _count_unsatisfied_rows(verification_table) if not fast_mode else 0
+        metrics = _compute_zero_metrics(timetable_log, verification_table, post_generate_verify)
+        zero_gate_ok = all(v == 0 for v in metrics.values())
         consistency = {
             "unsatisfied_rows": unsatisfied_count,
             "strict_success": bool(post_generate_verify.get("success", False)),
-            "consistent": not (post_generate_verify.get("success", False) and unsatisfied_count > 0),
+            "consistent": bool(post_generate_verify.get("success", False)) if fast_mode else not (post_generate_verify.get("success", False) and unsatisfied_count > 0),
+            "zero_metrics": metrics,
+            "zero_gate_ok": zero_gate_ok,
+            "fast_mode": fast_mode,
         }
+        if not zero_gate_ok:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "success": False,
+                    "message": "Post-generation zero gate failed",
+                    "post_generate_verify": post_generate_verify,
+                    "consistency": consistency,
+                },
+            )
         return {
             "success": True,
             "timetable": timetable,

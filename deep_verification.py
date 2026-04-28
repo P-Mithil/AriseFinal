@@ -359,6 +359,44 @@ class DeepVerification:
                 violations.append(f"Session overlaps lunch break: {lunch_block}")
         
         return violations
+
+    def verify_session_duration(self, session: Any) -> List[str]:
+        """
+        Verify fixed duration policy by session type:
+          - Lecture (L): 90 min
+          - Tutorial (T): 60 min
+          - Practical (P): 120 min
+        """
+        violations = []
+        block = None
+        session_type = "L"
+
+        if isinstance(session, dict):
+            block = session.get("time_block") or session.get("block")
+            session_type = str(session.get("session_type") or "L").strip().upper()
+        elif hasattr(session, "block"):
+            block = getattr(session, "block", None)
+            session_type = str(getattr(session, "kind", "L") or "L").strip().upper()
+
+        if not block:
+            return violations
+
+        # Ignore non-academic marker rows and non-standard synthetic types.
+        if session_type not in ("L", "T", "P"):
+            return violations
+
+        start_m = block.start.hour * 60 + block.start.minute
+        end_m = block.end.hour * 60 + block.end.minute
+        actual = end_m - start_m
+        expected_by_type = {"L": 90, "T": 60, "P": 120}
+        expected = expected_by_type.get(session_type)
+        if expected is not None and actual != expected:
+            kind_name = {"L": "Lecture", "T": "Tutorial", "P": "Practical"}[session_type]
+            violations.append(
+                f"{kind_name} duration mismatch: expected {expected} min, got {actual} min"
+            )
+
+        return violations
     
     def run_deep_verification(self, excel_path: str = None):
         """Run comprehensive deep verification"""
@@ -761,11 +799,14 @@ class DeepVerification:
                 for violation in violations:
                     self.log_issue("PHASE_RULES", course.code, f"{violation} in {section_name}")
 
-                # Time constraints across all scheduled sessions for this course+section
+                # Time constraints + fixed session duration policy across all sessions
                 for session in compliance["sessions"]:
                     time_violations = self.verify_time_constraints(session)
                     for violation in time_violations:
                         self.log_issue("TIME_CONSTRAINTS", course.code, f"{violation} in {section_name}")
+                    duration_violations = self.verify_session_duration(session)
+                    for violation in duration_violations:
+                        self.log_issue("SESSION_DURATION", course.code, f"{violation} in {section_name}")
         
         # Step 5: Summary statistics
         print("\n" + "="*100)
@@ -952,6 +993,7 @@ def run_verification_on_sessions(
     Run post-drag verification on in-memory sessions (internal dict format).
     Checks rules that a manual drag (or bad generator output) can break:
       1) Time constraints (session outside day bounds or inside lunch)
+      1b) Fixed session durations (L=1.5h, T=1h, P=2h)
       2) Section overlap  (two DIFFERENT courses in same section at same time)
       3) Faculty conflict (two different courses at same time; plus same course on parallel
          sections when course credits exceed FACULTY_PARALLEL_SAME_COURSE_CREDIT_THRESHOLD)
@@ -983,28 +1025,8 @@ def run_verification_on_sessions(
         return sem, dept
 
     def _max_lectures_same_day_allowed(code: str, sec: str) -> int:
-        """Align with Phase 5 Pass 2: allow multiple L same day up to LTPSC lecture slot count."""
-        sem, dept = _section_semester_dept(sec)
-        course_obj = None
-        for c in courses:
-            if str(c.code).upper() != str(code).upper():
-                continue
-            if sem is not None and getattr(c, "semester", None) != sem:
-                continue
-            if dept and getattr(c, "department", None) == dept:
-                course_obj = c
-                break
-        if course_obj is None:
-            for c in courses:
-                if str(c.code).upper() != str(code).upper():
-                    continue
-                if sem is None or getattr(c, "semester", None) == sem:
-                    course_obj = c
-                    break
-        if course_obj is None or not getattr(course_obj, "ltpsc", None):
-            return 1
-        sn = calculate_slots_needed(course_obj.ltpsc)
-        return max(1, int(sn.get("lectures", 1)))
+        """Strict rule: at most one lecture per course per day per section."""
+        return 1
 
     def _course_credits_for_code_section(code: str, sec: str) -> Optional[int]:
         """Match Phase1 course row by code + section semester/dept; None if not found."""
@@ -1076,6 +1098,15 @@ def run_verification_on_sessions(
             for v in time_violations:
                 _add_error(
                     "Time constraints", v,
+                    sess.get("course_code", ""), section_str,
+                    getattr(tb, "day", ""),
+                    f"{tb.start.strftime('%H:%M')}-{tb.end.strftime('%H:%M')}" if hasattr(tb, "start") else "",
+                )
+        duration_violations = verifier.verify_session_duration(sess)
+        if tb and duration_violations:
+            for v in duration_violations:
+                _add_error(
+                    "Session duration", v,
                     sess.get("course_code", ""), section_str,
                     getattr(tb, "day", ""),
                     f"{tb.start.strftime('%H:%M')}-{tb.end.strftime('%H:%M')}" if hasattr(tb, "start") else "",
@@ -1346,6 +1377,10 @@ def run_verification_on_sessions(
                     continue
                 code_a = (a.get("course_code") or "").strip()
                 code_b = (b.get("course_code") or "").strip()
+                code_a_base = code_a.split("-")[0].strip().upper()
+                code_b_base = code_b.split("-")[0].strip().upper()
+                stype_a = str(a.get("session_type") or "L").strip().upper()
+                stype_b = str(b.get("session_type") or "L").strip().upper()
                 secs_a = a.get("sections") or [""]
                 secs_b = b.get("sections") or [""]
                 if isinstance(secs_a, str):
@@ -1360,6 +1395,10 @@ def run_verification_on_sessions(
                     and (a.get("session_type") or "L") == (b.get("session_type") or "L")
                 ):
                     continue
+                # Shared/combined class represented once per section (same course+type+slot+room)
+                # is a single teaching event, not a room double-booking.
+                if code_a_base == code_b_base and stype_a == stype_b:
+                    continue
                 overlap_start = max(tb_a.start, tb_b.start).strftime("%H:%M")
                 overlap_end = min(tb_a.end, tb_b.end).strftime("%H:%M")
                 _add_error(
@@ -1371,12 +1410,13 @@ def run_verification_on_sessions(
                     f"{overlap_start}-{overlap_end}",
                 )
 
-    # 5) 1 day 1 course rule (for lectures)
-    # A normal course should not have two lectures on the same day for the same section in the SAME period
-    course_day_counts = defaultdict(list)
+    # 5) Day-level session rules (same section/course/day/period):
+    #    - No L+L same day
+    #    - No T+T same day
+    #    - No L+T same day
+    #    - L+P and T+P are allowed
+    day_bucket = defaultdict(list)
     for s in all_sessions:
-        if (s.get("session_type") or "L").upper() != "L":
-            continue
         code = (s.get("course_code") or "").split("-")[0].strip().upper()
         
         # Skip elective baskets and phase 3 electives as they can have multiple sessions 
@@ -1393,15 +1433,44 @@ def run_verification_on_sessions(
             if not sec:
                 continue
             key = (sec, code, tb.day, period)
-            course_day_counts[key].append(s)
+            day_bucket[key].append(s)
 
-    for (sec, code, day, period), sessions in course_day_counts.items():
-        cap = _max_lectures_same_day_allowed(code, sec)
-        if len(sessions) > cap:
-            times = ", ".join([f"{s['time_block'].start.strftime('%H:%M')}-{s['time_block'].end.strftime('%H:%M')}" for s in sessions if s.get('time_block')])
+    for (sec, code, day, period), sessions in day_bucket.items():
+        l_sessions = [s for s in sessions if str(s.get("session_type") or "L").strip().upper() == "L"]
+        t_sessions = [s for s in sessions if str(s.get("session_type") or "L").strip().upper() == "T"]
+
+        if len(l_sessions) > 1:
+            times = ", ".join(
+                f"{s['time_block'].start.strftime('%H:%M')}-{s['time_block'].end.strftime('%H:%M')}"
+                for s in l_sessions if s.get("time_block")
+            )
             _add_error(
                 "1 Day 1 Course",
-                f"Course {code} has {len(sessions)} lectures on {day} in section {sec} ({period}) but LTPSC allows at most {cap}: {times}",
+                f"Course {code} has {len(l_sessions)} lectures on {day} in section {sec} ({period}) but max allowed is 1: {times}",
+                code, sec, day, ""
+            )
+        if len(t_sessions) > 1:
+            times = ", ".join(
+                f"{s['time_block'].start.strftime('%H:%M')}-{s['time_block'].end.strftime('%H:%M')}"
+                for s in t_sessions if s.get("time_block")
+            )
+            _add_error(
+                "1 Day 1 Course",
+                f"Course {code} has {len(t_sessions)} tutorials on {day} in section {sec} ({period}) but max allowed is 1: {times}",
+                code, sec, day, ""
+            )
+        if l_sessions and t_sessions:
+            l_times = ", ".join(
+                f"{s['time_block'].start.strftime('%H:%M')}-{s['time_block'].end.strftime('%H:%M')}"
+                for s in l_sessions if s.get("time_block")
+            )
+            t_times = ", ".join(
+                f"{s['time_block'].start.strftime('%H:%M')}-{s['time_block'].end.strftime('%H:%M')}"
+                for s in t_sessions if s.get("time_block")
+            )
+            _add_error(
+                "1 Day 1 Course",
+                f"Course {code} has lecture+tutorial on same day {day} in section {sec} ({period}) [L: {l_times}] [T: {t_times}]",
                 code, sec, day, ""
             )
 
@@ -1474,6 +1543,88 @@ def run_verification_on_sessions(
                             f"{target_tb.start.strftime('%H:%M')}-{target_tb.end.strftime('%H:%M')}"
                         )
                         break
+
+    # 6b) Phase 4 within-group synchronization (hard rule requested by user):
+    # Apply ONLY to sessions that are actually produced by Phase 4 (combined-class phase),
+    # not to Phase 7 courses (which may also be <=2 credits and single-instructor).
+    from config.structure_config import get_group_for_section
+
+    def _section_group_id(section_label: str) -> int:
+        try:
+            s = str(section_label or "").strip()
+            parts = s.split("-")
+            if len(parts) >= 2:
+                dept = parts[0].strip().upper()
+                sec = parts[1].strip().upper()
+                return int(get_group_for_section(dept, sec))
+        except Exception:
+            return 1
+        return 1
+
+    # Identify course codes that actually appear in Phase 4 log rows.
+    phase4_codes: set = set()
+    for s in all_sessions:
+        try:
+            ph = str(s.get("phase", "") or "")
+            if not ph.startswith("Phase 4"):
+                continue
+            raw = (s.get("course_code") or "").strip()
+            if not raw:
+                continue
+            code = raw.split("-")[0].strip().upper()
+            if code:
+                phase4_codes.add(code)
+        except Exception:
+            continue
+
+    # Map: (code, group, period, session_type) -> { section -> set((day,start,end)) }
+    sync_map: Dict[tuple, Dict[str, set]] = defaultdict(lambda: defaultdict(set))
+    for s in all_sessions:
+        raw = (s.get("course_code") or "").strip()
+        if not raw:
+            continue
+        code = raw.split("-")[0].strip().upper()
+        if not code or code not in phase4_codes:
+            continue
+        ph = str(s.get("phase", "") or "")
+        if not ph.startswith("Phase 4"):
+            continue
+        if "ELECTIVE_BASKET" in code:
+            continue
+        tb = s.get("time_block")
+        if not tb:
+            continue
+        period = normalize_period(s.get("period"))
+        stype = (s.get("session_type") or "L").strip().upper()
+        secs = s.get("sections") or []
+        if isinstance(secs, str):
+            secs = [secs]
+        for sec in secs:
+            sec_label = str(sec).strip()
+            if not sec_label:
+                continue
+            grp = _section_group_id(sec_label)
+            sync_map[(code, grp, period, stype)][sec_label].add((tb.day, tb.start, tb.end))
+
+    for (code, grp, period, stype), by_section in sync_map.items():
+        if len(by_section) <= 1:
+            continue
+        # Compare slot sets across sections
+        ref_sec, ref_slots = next(iter(by_section.items()))
+        for sec_label, slots in by_section.items():
+            if slots != ref_slots:
+                _add_error(
+                    "Phase 4 synchronization",
+                    (
+                        f"Within-group combined course desync for {code} (group {grp}, {period}, {stype}): "
+                        f"{sec_label} slots != {ref_sec} slots"
+                    ),
+                    code,
+                    f"{sec_label} vs {ref_sec}",
+                    "",
+                    "",
+                )
+                break
 
     # 7) LTPSC compliance: full semester (PRE+POST) totals vs course_data for every
     #    course code that actually appears on the schedule for that section.

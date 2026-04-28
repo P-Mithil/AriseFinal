@@ -9,13 +9,14 @@ students each section has, without touching the phase logic.
 """
 
 # Core departments considered in timetable generation
-DEPARTMENTS: List[str] = ["CSE", "DSAI", "ECE"]
+DEPARTMENTS: List[str] = ["CSE", "DSAI", "ECE","AIC"]
 
 # Sections per department (labels only)
 SECTIONS_BY_DEPT: Dict[str, List[str]] = {
     "CSE": ["A", "B"],
     "DSAI": ["A"],
     "ECE": ["A"],
+    "AIC": ["A"],
 }
 
 # Group mapping per section (used for combined / group1 vs group2 logic)
@@ -26,6 +27,7 @@ SECTION_GROUPS: Dict[str, Dict[str, int]] = {
     "CSE": {"A": 1, "B": 1},
     "DSAI": {"A": 2},
     "ECE": {"A": 2},
+    "AIC": {"A": 3},
 }
 
 # Default number of students per section

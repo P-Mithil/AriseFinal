@@ -127,7 +127,8 @@ def _normalize_period(raw: str) -> str:
 def check_room_availability_at_time(room_number: str, period: str, day: str, 
                                    start: time, end: time,
                                    all_sessions: List, room_assignments: Dict,
-                                   elective_room_occupancy: Dict = None) -> bool:
+                                   elective_room_occupancy: Dict = None,
+                                   allow_c004: bool = False) -> bool:
     """
     Check if a room is available at a specific time slot.
     Capacity filtering (including 240-seaters) is handled by the callers; this
@@ -143,11 +144,12 @@ def check_room_availability_at_time(room_number: str, period: str, day: str,
         room_assignments: Room assignments from Phase 8
         elective_room_occupancy: Optional dict period -> room -> day -> [(start, end, course_code)]
                                 for electives already assigned in this Phase 9 run
+        allow_c004: If True, C004 is treated as a normal room (last-resort fallback).
     
     Returns:
         True if room is available, False otherwise
     """
-    if room_number in ['C004']:
+    if room_number == 'C004' and not allow_c004:
         return False
     period_norm = _normalize_period(period)
     # Check elective occupancy from this run (electives not yet in all_sessions with room)
@@ -291,52 +293,143 @@ def find_suitable_room(capacity_needed: int, period: str, time_slots: Dict[str, 
                       classrooms: List[ClassRoom],
                       already_assigned_rooms: set = None,
                       elective_room_occupancy: Dict = None,
-                      allow_relaxed_tier: bool = False) -> Optional[str]:
+                      allow_relaxed_tier: bool = False,
+                      allow_c004: bool = False) -> Optional[str]:
     """
     Find a suitable room that's available at all elective time slots.
     Rooms already assigned to other electives in the same period are excluded.
-    
+    Tier cascade: normal rooms -> large rooms -> C004 (only when allow_c004=True).
+
     Args:
         already_assigned_rooms: Set of room numbers already assigned to electives in this period
         elective_room_occupancy: Optional dict period -> room -> day -> [(start, end, course_code)] for this run
+        allow_c004: Allow C004 (240-seat auditorium) as an option (used only as last resort)
     """
     if already_assigned_rooms is None:
         already_assigned_rooms = set()
-    
-    # Filter rooms: exclude labs, capacity >= capacity_needed, not already assigned.
-    # 240‑seater rooms (capacity >= 240) are now allowed here so electives can
-    # legitimately use large halls when their registered_students demand it.
-    suitable_rooms = [room for room in classrooms 
-                     if room.room_type.lower() != 'lab' 
-                     and 'lab' not in room.room_type.lower()
-                     and room.room_number not in already_assigned_rooms
-                     and _elective_room_allowed(room.capacity, capacity_needed, allow_relaxed_tier=allow_relaxed_tier)]
-    
-    # Sort by best-fit first so larger rooms stay available for larger demand.
-    suitable_rooms.sort(key=lambda r: (abs(int(r.capacity or 0) - int(capacity_needed or 0)), r.capacity, r.room_number))
-    
-    # Check each room for availability at all time slots
-    for room in suitable_rooms:
-        room_available = True
-        
-        # Check all three time slots
+
+    def _room_is_free(room_number: str, _allow_c004: bool = False) -> bool:
         for slot_name, time_block in time_slots.items():
             if not time_block:
                 continue
-            
             if not check_room_availability_at_time(
-                room.room_number, period, time_block.day,
+                room_number, period, time_block.day,
                 time_block.start, time_block.end,
                 all_sessions, room_assignments,
-                elective_room_occupancy=elective_room_occupancy
+                elective_room_occupancy=elective_room_occupancy,
+                allow_c004=_allow_c004,
             ):
-                room_available = False
-                break
-        
-        if room_available:
+                return False
+        return True
+
+    # --- Tier 1: Normal / correctly-sized rooms (strict tier, no C004) ---
+    normal_rooms = [
+        r for r in classrooms
+        if r.room_type.lower() != 'lab'
+        and 'lab' not in r.room_type.lower()
+        and r.room_number.upper() != 'C004'
+        and r.room_number not in already_assigned_rooms
+        and _elective_room_allowed(r.capacity, capacity_needed, allow_relaxed_tier=allow_relaxed_tier)
+    ]
+    normal_rooms.sort(key=lambda r: (abs(int(r.capacity or 0) - int(capacity_needed or 0)), r.capacity, r.room_number))
+    for room in normal_rooms:
+        if _room_is_free(room.room_number):
             return room.room_number
-    
+
+    # --- Tier 2: Larger rooms (relax tier, still no C004) ---
+    large_rooms = [
+        r for r in classrooms
+        if r.room_type.lower() != 'lab'
+        and 'lab' not in r.room_type.lower()
+        and r.room_number.upper() != 'C004'
+        and r.room_number not in already_assigned_rooms
+        and int(r.capacity or 0) >= int(capacity_needed or 0)
+        and r not in normal_rooms  # skip already checked
+    ]
+    large_rooms.sort(key=lambda r: (r.capacity, r.room_number))
+    for room in large_rooms:
+        if _room_is_free(room.room_number):
+            return room.room_number
+
+    # --- Tier 3: C004 (240-seat auditorium) as absolute last resort ---
+    if allow_c004:
+        c004_list = [r for r in classrooms if r.room_number.upper() == 'C004'
+                     and r.room_number not in already_assigned_rooms
+                     and int(r.capacity or 0) >= int(capacity_needed or 0)]
+        for room in c004_list:
+            if _room_is_free(room.room_number, _allow_c004=True):
+                return room.room_number
+
     return None
+
+
+def find_rooms_per_slot(
+    capacity_needed: int,
+    period: str,
+    time_slots: Dict[str, TimeBlock],
+    all_sessions: List,
+    room_assignments: Dict,
+    classrooms: List[ClassRoom],
+    already_assigned_rooms: set = None,
+    elective_room_occupancy: Dict = None,
+) -> Optional[Dict[str, str]]:
+    """
+    Last-resort strategy: assign a SEPARATE normal classroom for each elective slot
+    (lecture_1, lecture_2, tutorial) independently instead of requiring one shared room.
+
+    Returns a dict like {'lecture_1': 'C101', 'lecture_2': 'C203', 'tutorial': 'C104'}
+    or None if even per-slot assignment fails.
+    The returned rooms may be different for each slot.
+    """
+    if already_assigned_rooms is None:
+        already_assigned_rooms = set()
+
+    non_lab_rooms = sorted(
+        [r for r in classrooms
+         if r.room_type.lower() != 'lab'
+         and 'lab' not in r.room_type.lower()
+         and r.room_number.upper() != 'C004'
+         and int(r.capacity or 0) >= int(capacity_needed or 0)],
+        key=lambda r: (abs(int(r.capacity or 0) - int(capacity_needed or 0)), r.capacity, r.room_number)
+    )
+
+    slot_rooms: Dict[str, str] = {}
+    used_in_this_call: set = set()
+
+    for slot_name, tb in time_slots.items():
+        if not tb:
+            continue
+        assigned_slot_room = None
+        for r in non_lab_rooms:
+            if r.room_number in already_assigned_rooms:
+                continue
+            if r.room_number in used_in_this_call:
+                continue
+            if check_room_availability_at_time(
+                r.room_number, period, tb.day, tb.start, tb.end,
+                all_sessions, room_assignments,
+                elective_room_occupancy=elective_room_occupancy,
+            ):
+                assigned_slot_room = r.room_number
+                used_in_this_call.add(r.room_number)
+                break
+        if not assigned_slot_room:
+            # Try reusing a room already picked for another slot in this call
+            for r in non_lab_rooms:
+                if r.room_number in already_assigned_rooms:
+                    continue
+                if check_room_availability_at_time(
+                    r.room_number, period, tb.day, tb.start, tb.end,
+                    all_sessions, room_assignments,
+                    elective_room_occupancy=elective_room_occupancy,
+                ):
+                    assigned_slot_room = r.room_number
+                    break
+        if not assigned_slot_room:
+            return None  # Could not assign even per-slot
+        slot_rooms[slot_name] = assigned_slot_room
+
+    return slot_rooms if slot_rooms else None
 
 
 def assign_electives_to_rooms_and_periods(elective_courses: List[Course], semester: int,
@@ -430,6 +523,7 @@ def assign_electives_to_rooms_and_periods(elective_courses: List[Course], semest
         if course.credits > 2:
             period = 'FULL'
             capacity_needed = _capacity_for_course(course)
+            slot_rooms = None  # always initialize here; set only by per-slot fallback
             # For FULL semester, try to find room in either period (use PRE as default for room search)
             room = find_suitable_room(capacity_needed, 'PRE', time_slots, all_sessions, room_assignments, classrooms, premid_assigned_rooms, elective_room_occupancy)
             if not room:
@@ -508,6 +602,7 @@ def assign_electives_to_rooms_and_periods(elective_courses: List[Course], semest
             period = preferred_period
             capacity_needed = _capacity_for_course(course)
             assigned_rooms_set = premid_assigned_rooms if period == 'PRE' else postmid_assigned_rooms
+            slot_rooms = None  # will be set only when per-slot fallback is used
             room = find_suitable_room(capacity_needed, period, time_slots, all_sessions, room_assignments, classrooms, assigned_rooms_set, elective_room_occupancy)
         
             # If no room in preferred period, try other period
@@ -528,48 +623,73 @@ def assign_electives_to_rooms_and_periods(elective_courses: List[Course], semest
                     assigned_rooms_set = postmid_assigned_rooms
                     room = find_suitable_room(capacity_needed, period, time_slots, all_sessions, room_assignments, classrooms, assigned_rooms_set, elective_room_occupancy)
 
-            # FALLBACK: Relax only room-tier preference, never capacity requirement.
+            # FALLBACK cascade: relax tier → try other period → large rooms → C004
             if not room:
+                course_code_log = getattr(course, 'code', 'Unknown')
+
+                # Fallback 1: relax tier in preferred period
                 period = preferred_period
                 assigned_rooms_set = premid_assigned_rooms if period == 'PRE' else postmid_assigned_rooms
-                room = find_suitable_room(capacity_needed, period, time_slots, all_sessions, room_assignments, classrooms, assigned_rooms_set, elective_room_occupancy, allow_relaxed_tier=True)
+                room = find_suitable_room(capacity_needed, period, time_slots, all_sessions, room_assignments,
+                                         classrooms, assigned_rooms_set, elective_room_occupancy,
+                                         allow_relaxed_tier=True)
+
+                # Fallback 2: relax tier in other period
                 if not room:
                     period = 'POST' if preferred_period == 'PRE' else 'PRE'
                     assigned_rooms_set = premid_assigned_rooms if period == 'PRE' else postmid_assigned_rooms
-                    room = find_suitable_room(capacity_needed, period, time_slots, all_sessions, room_assignments, classrooms, assigned_rooms_set, elective_room_occupancy, allow_relaxed_tier=True)
+                    room = find_suitable_room(capacity_needed, period, time_slots, all_sessions, room_assignments,
+                                             classrooms, assigned_rooms_set, elective_room_occupancy,
+                                             allow_relaxed_tier=True)
+
                 if room:
-                    course_code_log = getattr(course, 'code', 'Unknown')
-                    print(f"    [Phase 9 Fallback] Assigned tier-relaxed room {room} for elective {course_code_log} in {period}")
-                else:
-                    # ABSOLUTE FINAL FALLBACK: Force assign the largest available non-lab room
-                    # that isn't already assigned to another elective in this period.
-                    # This WILL cause a clash with a core course, but prevents 'TBD' mashups.
-                    sorted_cls = sorted(
-                        [r for r in classrooms 
-                         if r.room_type.lower() != 'lab' and 'lab' not in r.room_type.lower()
-                         and r.room_number not in assigned_rooms_set
-                         and r.room_number.upper() != 'C004'],
-                        key=lambda r: -r.capacity
-                    )
-                    # If all non-C004 rooms are exhausted, try C004 or even labs as absolute last resort
-                    if not sorted_cls:
-                        sorted_cls = sorted(
-                            [r for r in classrooms if r.room_number not in assigned_rooms_set],
-                            key=lambda r: -r.capacity
+                    print(f"    [Phase 9 Fallback-Tier] Assigned tier-relaxed room {room} for {course_code_log} in {period}")
+
+                # Fallback 3: PER-SLOT rooms — assign a separate normal classroom per slot
+                # (lecture_1 gets its own room, lecture_2 another, tutorial another)
+                # This avoids needing any single room to cover all 3 slots.
+                if not room:
+                    for _try_period in (preferred_period, ('POST' if preferred_period == 'PRE' else 'PRE')):
+                        _assigned = premid_assigned_rooms if _try_period == 'PRE' else postmid_assigned_rooms
+                        slot_rooms = find_rooms_per_slot(
+                            capacity_needed, _try_period, time_slots,
+                            all_sessions, room_assignments, classrooms,
+                            already_assigned_rooms=_assigned,
+                            elective_room_occupancy=elective_room_occupancy,
                         )
-                    
-                    if sorted_cls:
-                        room = sorted_cls[0].room_number
-                        course_code_log = getattr(course, 'code', 'Unknown')
-                        print(f"    [Phase 9 STRICT FALLBACK] Forced room {room} for elective {course_code_log} in {period} (causes clash with core courses)")
-                    else:
-                        room = 'TBD'
-                        course_code_log = getattr(course, 'code', 'Unknown')
-                        print(f"    [Phase 9 FATAL] Could not assign ANY room for {course_code_log}!")
+                        if slot_rooms:
+                            period = _try_period
+                            assigned_rooms_set = _assigned
+                            # Use the first unique room as the "primary" room for backwards compatibility
+                            room = next(iter(slot_rooms.values()))
+                            print(f"    [Phase 9 Per-Slot] Assigned separate rooms per slot for {course_code_log} in {period}: {slot_rooms}")
+                            break
+
+                # Fallback 4: try C004 (240-seat) with time-conflict checking
+                if not room:
+                    for _try_period in (preferred_period, ('POST' if preferred_period == 'PRE' else 'PRE')):
+                        _assigned = premid_assigned_rooms if _try_period == 'PRE' else postmid_assigned_rooms
+                        room = find_suitable_room(capacity_needed, _try_period, time_slots, all_sessions,
+                                                  room_assignments, classrooms, _assigned,
+                                                  elective_room_occupancy,
+                                                  allow_relaxed_tier=True, allow_c004=True)
+                        if room:
+                            period = _try_period
+                            assigned_rooms_set = _assigned
+                            print(f"    [Phase 9 C004 Fallback] Assigned C004 for {course_code_log} in {period}")
+                            break
+
+                # No unsafe force-allocation beyond validated availability checks.
+                # If still unresolved here, leave room unset and let strict verification
+                # fail this run rather than exporting a conflict-prone or fake assignment.
+                if not room:
+                    room = None
+                    print(f"    [Phase 9 UNRESOLVED] Could not assign a valid room for {course_code_log} without violating constraints.")
         
         assignment = {
             'course': course,
-            'room': room,  # None when no room found; resolver will assign
+            'room': room,  # primary room (first slot's room if per-slot, or shared room)
+            'slot_rooms': slot_rooms,  # dict {slot_name: room} or None when all slots share one room
             'period': period if period else ('FULL' if course.credits > 2 else 'PRE'),
             'faculty': faculty,
             'room_assignment_reason': 'standard_fit'
@@ -608,7 +728,9 @@ def assign_electives_to_rooms_and_periods(elective_courses: List[Course], semest
     faculty_period_map = {}  # {(faculty_normalized, period): [assignments]}
     
     for assignment in assignments:
-        # Skip TBD assignments (but we shouldn't have any now)
+        # Skip unresolved assignments
+        if not assignment.get('room') or not assignment.get('period'):
+            continue
         if assignment.get('room') == 'TBD' or assignment.get('period') == 'TBD':
             continue
         
@@ -753,70 +875,11 @@ def assign_electives_to_rooms_and_periods(elective_courses: List[Course], semest
                                 break
             
             if moved_count == 0 and len(faculty_assignments) >= 2:
-                # Could not move any with room availability - force move with fallback room
-                course_codes = [getattr(a.get('course'), 'code', 'Unknown') for a in faculty_assignments if a.get('course')]
-                print(f"    WARNING: Could not find available room for '{faculty_normalized}' electives, forcing move with fallback room")
-                
-                # Force move at least one elective to other period (use fallback room)
-                for assignment in faculty_assignments[:num_to_move]:  # Move first num_to_move electives
-                    course = assignment.get('course')
-                    if not course:
-                        continue
-                    
-                    course_code = getattr(course, 'code', 'Unknown')
-                    
-                    # Find any available room (even if it means a conflict)
-                    # Exclude labs only
-                    fallback_room = None
-                    for classroom in classrooms:
-                        if (classroom.room_type.lower() != 'lab' 
-                            and 'lab' not in classroom.room_type.lower()
-                            and classroom.room_number not in other_assigned_rooms):
-                            fallback_room = classroom.room_number
-                            break
-                    
-                    if not fallback_room:
-                        # Last resort: pick largest available non-lab, non-C004 room dynamically
-                        sorted_cls = sorted(
-                            [r for r in classrooms
-                             if r.room_type.lower() != 'lab' and 'lab' not in r.room_type.lower()
-                             and r.room_number not in other_assigned_rooms
-                             and r.room_number.upper() != 'C004'],
-                            key=lambda r: -r.capacity
-                        )
-                        fallback_room = sorted_cls[0].room_number if sorted_cls else None
-                    
-                    # Remove from old period's assigned rooms
-                    old_room = assignment.get('room')
-                    if old_room:
-                        if period == 'PRE':
-                            premid_assigned_rooms.discard(old_room)
-                        else:
-                            postmid_assigned_rooms.discard(old_room)
-                    
-                    # Move to other period
-                    assignment['period'] = other_period
-                    assignment['room'] = fallback_room
-                    
-                    # Add to new period's assigned rooms
-                    if other_period == 'PRE':
-                        premid_assigned_rooms.add(fallback_room)
-                    else:
-                        postmid_assigned_rooms.add(fallback_room)
-                    
-                    print(f"    FORCED: Moved {course_code} from {period} to {other_period} (room: {fallback_room}, forced move)")
-                    
-                    # Update counts
-                    if period == 'PRE':
-                        premid_count -= 1
-                        postmid_count += 1
-                    else:
-                        postmid_count -= 1
-                        premid_count += 1
-                    
-                    moved_count += 1
-                    if moved_count >= num_to_move:
-                        break
+                # Keep existing valid assignments; do NOT force a conflicting move.
+                print(
+                    f"    WARNING: Could not resolve faculty elective balancing for '{faculty_normalized}' "
+                    f"without violating room/slot constraints; keeping existing validated assignments."
+                )
     
     return assignments
 

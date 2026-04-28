@@ -451,12 +451,35 @@ def assign_labs_to_combined_practicals(
             if len(assigned_labs) >= 2:
                 break
 
+        # If we couldn't find 2 free labs, force assignment of conflicting labs
+        # so that the room conflict resolver will reschedule the course properly!
+        if len(assigned_labs) < 2 and labs:
+            def _overlap_count(room_number: str) -> int:
+                try:
+                    pv = str(period).strip().upper()
+                    if pv in ("PREMID", "PRE"): pv = "PRE"
+                    elif pv in ("POSTMID", "POST"): pv = "POST"
+                    occ_list = room_occupancy.get(pv, {}).get(room_number, {}).get(day, []) or []
+                    n = 0
+                    for occ_s, occ_e, _cc in occ_list:
+                        if not (end_time <= occ_s or start_time >= occ_e):
+                            n += 1
+                    return n
+                except Exception:
+                    return 10**9
+
+            ranked = sorted([lab.room_number for lab in labs], key=lambda rn: (_overlap_count(rn), rn))
+            for r in ranked:
+                if len(assigned_labs) >= 2:
+                    break
+                if r not in assigned_labs:
+                    assigned_labs.append(r)
+                    mark_room_occupied(r, period, day, start_time, end_time, course_code_base, room_occupancy)
+
         if assigned_labs:
             labs_str = ", ".join(sorted(assigned_labs))
             for sess in sessions:
                 sess['room'] = labs_str
-            if len(assigned_labs) < 2 and labs:
-                print(f"  [Combined Labs] NOTE: {course_code_base} ({period} {day}): only {len(assigned_labs)} lab(s) assigned")
 
     return combined_sessions
 
@@ -746,20 +769,18 @@ def assign_classrooms_to_core_sessions(phase5_sessions: List[ScheduledSession],
                 session_labs: List[str] = []
                 if len(free_labs) >= needed_n:
                     session_labs = free_labs[:needed_n]
-                elif free_labs:
-                    # If we cannot satisfy full N, still assign at least one lab deterministically.
-                    session_labs = [free_labs[0]]
                 else:
-                    # Last resort: no lab is free at this slot. Pick the least-conflicting labs
-                    # so later repair/reschedule has the best chance to resolve.
+                    # We need exactly needed_n labs. If we don't have enough free ones,
+                    # we must assign conflicting ones so that the room conflict resolver 
+                    # correctly identifies the collision and reschedules the session!
+                    # Do NOT silently assign just 1 lab.
+                    session_labs = list(free_labs)
+                    
                     def _overlap_count(room_number: str) -> int:
                         try:
-                            # check_room_conflict is bool; we want an approximate count
                             pv = str(period).strip().upper()
-                            if pv in ("PREMID", "PRE"):
-                                pv = "PRE"
-                            elif pv in ("POSTMID", "POST"):
-                                pv = "POST"
+                            if pv in ("PREMID", "PRE"): pv = "PRE"
+                            elif pv in ("POSTMID", "POST"): pv = "POST"
                             occ_list = room_occupancy.get(pv, {}).get(room_number, {}).get(day, []) or []
                             n = 0
                             for occ_s, occ_e, _cc in occ_list:
@@ -769,9 +790,15 @@ def assign_classrooms_to_core_sessions(phase5_sessions: List[ScheduledSession],
                         except Exception:
                             return 10**9
 
+                    # Sort ALL labs by overlap count
                     ranked = sorted([lab.room_number for lab in labs], key=lambda rn: (_overlap_count(rn), rn))
-                    if ranked:
-                        session_labs = ranked[: min(needed_n, len(ranked))]
+                    
+                    # Fill the rest of session_labs with the least-conflicting rooms that aren't already in session_labs
+                    for r in ranked:
+                        if len(session_labs) >= needed_n:
+                            break
+                        if r not in session_labs:
+                            session_labs.append(r)
 
                 if session_labs:
                     any_assigned = True
