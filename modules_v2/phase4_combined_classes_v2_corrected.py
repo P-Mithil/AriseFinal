@@ -54,14 +54,14 @@ def get_period_assignments_path() -> str:
     return os.path.join(base_dir, "DATA", "INPUT", fn)
 
 
-def load_period_assignments(path: str) -> Dict[Tuple[str, int], bool]:
+def load_period_assignments(path: str) -> Dict[Tuple[str, int, int], bool]:
     """
     Load period assignments from Excel.
 
     Returns:
-        {(course_code, semester): True for PreMid, False for PostMid}
+        {(course_code, semester, group_id): True for PreMid, False for PostMid}
     """
-    assignments: Dict[Tuple[str, int], bool] = {}
+    assignments: Dict[Tuple[str, int, int], bool] = {}
 
     if not os.path.exists(path):
         return assignments
@@ -91,7 +91,7 @@ def load_period_assignments(path: str) -> Dict[Tuple[str, int], bool]:
     except Exception:
         return {}  # safest: re-ask if meta cannot be read
 
-    # Expect header row: Course_Code | Semester | Pre | Post
+    # Expect header row: Course_Code | Semester | [Group] | Pre | Post
     header = [str(cell.value).strip() if cell.value is not None else "" for cell in next(sheet.iter_rows(min_row=1, max_row=1))]
     # Build a mapping from expected column names to indices
     name_to_idx = {name.upper(): idx for idx, name in enumerate(header)}
@@ -101,6 +101,7 @@ def load_period_assignments(path: str) -> Dict[Tuple[str, int], bool]:
 
     col_code = _get_col("COURSE_CODE")
     col_sem = _get_col("SEMESTER")
+    col_group = _get_col("GROUP")
     col_pre = _get_col("PRE")
     col_post = _get_col("POST")
 
@@ -128,9 +129,21 @@ def load_period_assignments(path: str) -> Dict[Tuple[str, int], bool]:
 
         # A valid row has exactly one of Pre/Post set to 1
         if pre_val == 1 and post_val == 0:
-            assignments[(code, semester)] = True
+            group_id = 1
+            if col_group >= 0 and row[col_group].value is not None:
+                try:
+                    group_id = int(row[col_group].value)
+                except Exception:
+                    group_id = 1
+            assignments[(code, semester, group_id)] = True
         elif pre_val == 0 and post_val == 1:
-            assignments[(code, semester)] = False
+            group_id = 1
+            if col_group >= 0 and row[col_group].value is not None:
+                try:
+                    group_id = int(row[col_group].value)
+                except Exception:
+                    group_id = 1
+            assignments[(code, semester, group_id)] = False
         else:
             # Invalid or ambiguous row - ignore, will be re-asked
             continue
@@ -138,11 +151,11 @@ def load_period_assignments(path: str) -> Dict[Tuple[str, int], bool]:
     return assignments
 
 
-def save_period_assignments(path: str, assignments: Dict[Tuple[str, int], bool]) -> None:
+def save_period_assignments(path: str, assignments: Dict[Tuple[str, int, int], bool]) -> None:
     """
     Save period assignments to Excel.
 
-    assignments: {(course_code, semester): True for PreMid, False for PostMid}
+    assignments: {(course_code, semester, group_id): True for PreMid, False for PostMid}
     """
     wb = openpyxl.Workbook()
     sheet = wb.active
@@ -154,14 +167,14 @@ def save_period_assignments(path: str, assignments: Dict[Tuple[str, int], bool])
     meta.append(["GROUPING_SIGNATURE", get_grouping_signature()])
 
     # Header
-    sheet.append(["Course_Code", "Semester", "Pre", "Post"])
+    sheet.append(["Course_Code", "Semester", "Group", "Pre", "Post"])
 
     # Sort for stable, readable output
-    for (code, semester) in sorted(assignments.keys(), key=lambda x: (x[1], x[0])):
-        is_premid = assignments[(code, semester)]
+    for (code, semester, group_id) in sorted(assignments.keys(), key=lambda x: (x[1], x[2], x[0])):
+        is_premid = assignments[(code, semester, group_id)]
         pre_val = 1 if is_premid else 0
         post_val = 0 if is_premid else 1
-        sheet.append([code, semester, pre_val, post_val])
+        sheet.append([code, semester, group_id, pre_val, post_val])
 
     # Ensure directory exists
     dir_name = os.path.dirname(path)
@@ -171,29 +184,29 @@ def save_period_assignments(path: str, assignments: Dict[Tuple[str, int], bool])
     wb.save(path)
 
 
-def prompt_user_for_period(course_code: str, course_name: str, semester: int) -> bool:
+def prompt_user_for_period(course_code: str, course_name: str, semester: int, group_id: int = 1) -> bool:
     """
-    Prompt the user to choose PreMid or PostMid for Group 1 for a course.
+    Prompt the user to choose PreMid or PostMid for a course/group.
 
     Returns:
-        True  -> PreMid for Group 1
-        False -> PostMid for Group 1
+        True  -> PreMid
+        False -> PostMid
     """
 
-    # Build a human-readable description of current Group 1 sections (e.g. CSE-A, CSE-B, DSAI-A)
+    # Build a human-readable description of current sections for this group.
     try:
-        group1_sections = []
+        group_sections = []
         for dept, sec_map in SECTION_GROUPS.items():
             for sec_label, grp in sec_map.items():
-                if grp == 1 and sec_label in SECTIONS_BY_DEPT.get(dept, []):
-                    group1_sections.append(f"{dept}-{sec_label}")
-        group1_desc = ", ".join(sorted(group1_sections)) if group1_sections else "Group 1 sections"
+                if grp == group_id and sec_label in SECTIONS_BY_DEPT.get(dept, []):
+                    group_sections.append(f"{dept}-{sec_label}")
+        group_desc = ", ".join(sorted(group_sections)) if group_sections else f"Group {group_id} sections"
     except Exception:
-        group1_desc = "Group 1 sections"
+        group_desc = f"Group {group_id} sections"
 
     prompt = (
         f"\nPhase 4: Choose period for combined course {course_code} - {course_name} (Sem {semester}) "
-        f"for Group 1 ({group1_desc}).\n"
+        f"for Group {group_id} ({group_desc}).\n"
         f"  [1] PreMid\n"
         f"  [2] PostMid\n"
         f"Enter 1 or 2 (or 'pre'/'post'): "
@@ -202,7 +215,7 @@ def prompt_user_for_period(course_code: str, course_name: str, semester: int) ->
     if skip_interactive_prompts():
         pre = default_period_is_pre_mid("ARISE_PHASE4_DEFAULT_PERIOD")
         label = "PreMid" if pre else "PostMid"
-        print(f"[non-interactive] Phase 4 period for {course_code} (Sem {semester}) -> {label}")
+        print(f"[non-interactive] Phase 4 period for {course_code} (Sem {semester}, Group {group_id}) -> {label}")
         return pre
 
     while True:
@@ -222,8 +235,9 @@ def prompt_user_for_period(course_code: str, course_name: str, semester: int) ->
 
 def get_period_assignments_for_courses(
     unique_courses: Dict[int, List[Course]],
+    sections: List[Section],
     assignments_path: str,
-) -> Tuple[Dict[Tuple[str, int], bool], bool]:
+) -> Tuple[Dict[Tuple[str, int, int], bool], bool]:
     """
     Build period assignments for all combined courses handled in Phase 4.
 
@@ -233,7 +247,7 @@ def get_period_assignments_for_courses(
 
     Returns:
         (assignments, any_prompted)
-        - assignments: {(course_code, semester): True for PreMid, False for PostMid}
+        - assignments: {(course_code, semester, group_id): True for PreMid, False for PostMid}
         - any_prompted: True if we asked the user for at least one course this run
     """
     import os
@@ -244,19 +258,47 @@ def get_period_assignments_for_courses(
     # Load any existing assignments from disk. If forcing prompts (interactive runs),
     # we still load but allow overwriting keys by re-prompting.
     existing = load_period_assignments(assignments_path)
-    assignments: Dict[Tuple[str, int], bool] = dict(existing)
+    assignments: Dict[Tuple[str, int, int], bool] = dict(existing)
     any_prompted = False
 
-    for semester, courses in unique_courses.items():
-        for course in courses:
-            key = (course.code.upper(), semester)
-            if (not force_prompts) and (key in assignments):
+    def _groups_for_course(course_code: str, semester: int) -> List[int]:
+        groups = set()
+        code = str(course_code).upper()
+        for c in courses_for_semester:
+            if str(c.code).upper() != code:
                 continue
+            if int(getattr(c, "semester", -1) or -1) != int(semester):
+                continue
+            for sec in sections:
+                if getattr(sec, "semester", None) != semester:
+                    continue
+                if getattr(sec, "program", None) == getattr(c, "department", None):
+                    groups.add(int(getattr(sec, "group", 1) or 1))
+        return sorted(groups)
 
-            # Ask user once per (course_code, semester)
-            is_premid = prompt_user_for_period(course.code, course.name, semester)
-            assignments[key] = is_premid
-            any_prompted = True
+    for semester, courses in unique_courses.items():
+        courses_for_semester = list(courses or [])
+        for course in courses:
+            code = course.code.upper()
+            key_g1 = (code, semester, 1)
+            if force_prompts or (key_g1 not in assignments):
+                # Keep Group 1 behavior unchanged.
+                is_premid_g1 = prompt_user_for_period(course.code, course.name, semester, group_id=1)
+                assignments[key_g1] = is_premid_g1
+                any_prompted = True
+            else:
+                is_premid_g1 = assignments[key_g1]
+
+            # Group 3+ are independent: ask first time, then reuse saved value.
+            for gid in _groups_for_course(code, semester):
+                if gid < 3:
+                    continue
+                gkey = (code, semester, gid)
+                if (not force_prompts) and (gkey in assignments):
+                    continue
+                is_premid = prompt_user_for_period(course.code, course.name, semester, group_id=gid)
+                assignments[gkey] = is_premid
+                any_prompted = True
 
     return assignments, any_prompted
 
@@ -437,6 +479,7 @@ def create_non_overlapping_schedule(unique_courses: Dict[int, List[Course]], sec
     period_assignments_path = get_period_assignments_path()
     period_assignments, period_assignments_modified = get_period_assignments_for_courses(
         unique_courses,
+        sections,
         period_assignments_path,
     )
 
@@ -459,7 +502,7 @@ def create_non_overlapping_schedule(unique_courses: Dict[int, List[Course]], sec
         premid_courses: List[Course] = []
         postmid_courses: List[Course] = []
         for course in courses_for_semester:
-            key = (course.code.upper(), semester)
+            key = (course.code.upper(), semester, 1)
             is_premid = period_assignments.get(key, True)
             if is_premid:
                 premid_courses.append(course)
@@ -1429,6 +1472,25 @@ def create_non_overlapping_schedule(unique_courses: Dict[int, List[Course]], sec
             and s.semester == semester
             and getattr(s, "group", 1) == 2
         ]
+        sections_by_group: Dict[int, List[Section]] = defaultdict(list)
+        for s in sections:
+            if hasattr(s, "semester") and s.semester == semester:
+                sections_by_group[int(getattr(s, "group", 1) or 1)].append(s)
+
+        def get_groups_for_course(course_code: str, sem: int) -> List[int]:
+            depts = {
+                c.department
+                for c in courses
+                if str(getattr(c, "code", "")).upper() == str(course_code).upper()
+                and int(getattr(c, "semester", -1) or -1) == int(sem)
+            }
+            group_ids = set()
+            for sec in sections:
+                if getattr(sec, "semester", None) != sem:
+                    continue
+                if getattr(sec, "program", None) in depts:
+                    group_ids.add(int(getattr(sec, "group", 1) or 1))
+            return sorted(group_ids)
 
         print(
             f"DEBUG: Semester {semester} group sections: "
@@ -1455,18 +1517,25 @@ def create_non_overlapping_schedule(unique_courses: Dict[int, List[Course]], sec
         premid_course_slots_map: Dict[str, List[tuple]] = {}
         premid_group1_blocks: List[TimeBlock] = []
         premid_group2_blocks: List[TimeBlock] = []
+        premid_extra_blocks: Dict[int, List[TimeBlock]] = defaultdict(list)
 
         # Build per-group course lists based on course classification.
         premid_courses_group1: List[Course] = []
         postmid_courses_group1: List[Course] = []
         premid_courses_group2: List[Course] = []
         postmid_courses_group2: List[Course] = []
+        premid_courses_extra: Dict[int, List[Course]] = defaultdict(list)
+        postmid_courses_extra: Dict[int, List[Course]] = defaultdict(list)
 
         for course in courses_for_semester:
-            key = (course.code.upper(), semester)
-            is_premid = period_assignments.get(key, True)
+            # Group-specific period lookup:
+            # - Group 1/2 behavior remains unchanged for cross-group courses.
+            # - Group 3+ uses independent saved keys.
+            key_g1 = (course.code.upper(), semester, 1)
+            key_g2 = (course.code.upper(), semester, 2)
             course_group = get_course_group_for_phase4(course.code, semester)
             if course_group == "cross_group":
+                is_premid = period_assignments.get(key_g1, True)
                 if is_premid:
                     premid_courses_group1.append(course)
                     postmid_courses_group2.append(course)
@@ -1474,11 +1543,13 @@ def create_non_overlapping_schedule(unique_courses: Dict[int, List[Course]], sec
                     postmid_courses_group1.append(course)
                     premid_courses_group2.append(course)
             elif course_group == "group1_only":
+                is_premid = period_assignments.get(key_g1, True)
                 if is_premid:
                     premid_courses_group1.append(course)
                 else:
                     postmid_courses_group1.append(course)
             elif course_group == "group2_only":
+                is_premid = period_assignments.get(key_g2, period_assignments.get(key_g1, True))
                 if is_premid:
                     premid_courses_group2.append(course)
                 else:
@@ -1486,9 +1557,21 @@ def create_non_overlapping_schedule(unique_courses: Dict[int, List[Course]], sec
             else:
                 # Default: treat like group1_only if only group1 has configured sections, else group2_only.
                 if group1_sections:
+                    is_premid = period_assignments.get(key_g1, True)
                     (premid_courses_group1 if is_premid else postmid_courses_group1).append(course)
                 elif group2_sections:
+                    is_premid = period_assignments.get(key_g2, period_assignments.get(key_g1, True))
                     (premid_courses_group2 if is_premid else postmid_courses_group2).append(course)
+
+            for gid in get_groups_for_course(course.code, semester):
+                if gid < 3:
+                    continue
+                gkey = (course.code.upper(), semester, gid)
+                is_premid_extra = period_assignments.get(gkey, period_assignments.get(key_g1, True))
+                if is_premid_extra:
+                    premid_courses_extra[gid].append(course)
+                else:
+                    postmid_courses_extra[gid].append(course)
 
         for course in premid_courses_group1:
             if course.code in premid_course_slots_map:
@@ -1528,11 +1611,37 @@ def create_non_overlapping_schedule(unique_courses: Dict[int, List[Course]], sec
             _track_unique_blocks(course_slots, premid_group2_blocks)
             print(f"  PRE: Group 2 scheduled {course.code}: {len(course_slots)} sessions")
 
+        for gid, course_list in sorted(premid_courses_extra.items()):
+            target_sections = sections_by_group.get(gid, [])
+            if not target_sections:
+                continue
+            for course in course_list:
+                if course.code in premid_course_slots_map:
+                    continue
+                other_blocks = list(premid_group1_blocks) + list(premid_group2_blocks)
+                for ogid, blocks in premid_extra_blocks.items():
+                    if ogid != gid:
+                        other_blocks.extend(blocks)
+                course_slots, occupied_slots_premid, premid_room_occupancy = generate_synchronized_course_slots(
+                    course,
+                    target_sections,
+                    occupied_slots_premid,
+                    base_days,
+                    available_slots,
+                    premid_room_occupancy,
+                    other_group_blocks=other_blocks,
+                    period_label="PRE",
+                )
+                premid_course_slots_map[course.code] = course_slots
+                _track_unique_blocks(course_slots, premid_extra_blocks[gid])
+                print(f"  PRE: Group {gid} scheduled {course.code}: {len(course_slots)} sessions")
+
         # PASS 1 (PostMid): schedule by GROUP (same per-course classification as above).
         print(f"DEBUG: Starting PostMid scheduling for semester {semester}")
         postmid_course_slots_map: Dict[str, List[tuple]] = {}
         postmid_group1_blocks: List[TimeBlock] = []
         postmid_group2_blocks: List[TimeBlock] = []
+        postmid_extra_blocks: Dict[int, List[TimeBlock]] = defaultdict(list)
 
         for course in postmid_courses_group1:
             if course.code in postmid_course_slots_map:
@@ -1571,6 +1680,31 @@ def create_non_overlapping_schedule(unique_courses: Dict[int, List[Course]], sec
             postmid_course_slots_map[course.code] = course_slots
             _track_unique_blocks(course_slots, postmid_group2_blocks)
             print(f"  POST: Group 2 scheduled {course.code}: {len(course_slots)} sessions")
+
+        for gid, course_list in sorted(postmid_courses_extra.items()):
+            target_sections = sections_by_group.get(gid, [])
+            if not target_sections:
+                continue
+            for course in course_list:
+                if course.code in postmid_course_slots_map:
+                    continue
+                other_blocks = list(postmid_group1_blocks) + list(postmid_group2_blocks)
+                for ogid, blocks in postmid_extra_blocks.items():
+                    if ogid != gid:
+                        other_blocks.extend(blocks)
+                course_slots, occupied_slots_postmid, postmid_room_occupancy = generate_synchronized_course_slots(
+                    course,
+                    target_sections,
+                    occupied_slots_postmid,
+                    base_days,
+                    available_slots,
+                    postmid_room_occupancy,
+                    other_group_blocks=other_blocks,
+                    period_label="POST",
+                )
+                postmid_course_slots_map[course.code] = course_slots
+                _track_unique_blocks(course_slots, postmid_extra_blocks[gid])
+                print(f"  POST: Group {gid} scheduled {course.code}: {len(course_slots)} sessions")
 
         """
         

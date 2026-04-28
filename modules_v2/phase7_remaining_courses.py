@@ -346,13 +346,28 @@ def get_phase7_period_assignments(
     assignments: Dict[Tuple[str, int, str], bool] = dict(existing)
     any_prompted = False
 
+    section_to_group: Dict[str, int] = {}
+    for s in sections:
+        label = f"{s.program}-{s.name}-Sem{s.semester}"
+        section_to_group[label] = int(getattr(s, "group", 1) or 1)
+
+    def _assignment_section_key(section_label: str) -> str:
+        gid = section_to_group.get(section_label, 1)
+        if gid >= 3:
+            # Group 3+ decisions are shared within that group and independent of Group 1/2.
+            return f"__GROUP__{gid}"
+        return section_label
+
     # Helper to ensure a mapping for given course & section
     def ensure_assignment(course: Course, section_label: str) -> None:
         nonlocal any_prompted
-        key = (course.code.upper(), course.semester, section_label)
+        key_section = _assignment_section_key(section_label)
+        key = (course.code.upper(), course.semester, key_section)
         if (not force_prompts) and (key in assignments):
             return
-        is_premid = prompt_user_for_phase7_period(course, section_label)
+        gid = section_to_group.get(section_label, 1)
+        prompt_target = section_label if gid < 3 else f"Group {gid}"
+        is_premid = prompt_user_for_phase7_period(course, prompt_target)
         assignments[key] = is_premid
         any_prompted = True
 
@@ -950,7 +965,8 @@ def schedule_within_group_combined(course: Course, sections: List[Section],
     for section in dept_sections:
         section_label = f"{section.program}-{section.name}-Sem{section.semester}"
         key = (course.code.upper(), course.semester, section_label)
-        is_premid = period_assignments.get(key, True)
+        group_key = (course.code.upper(), course.semester, f"__GROUP__{int(getattr(section, 'group', 1) or 1)}")
+        is_premid = period_assignments.get(key, period_assignments.get(group_key, True))
         period = 'PRE' if is_premid else 'POST'
         period_groups[period].append((section, section_label))
 
@@ -1011,7 +1027,8 @@ def schedule_non_combined(course: Course, sections: List[Section],
     
     # User-driven period selection (default to PRE if missing for robustness)
     key = (course.code.upper(), course.semester, section_label)
-    is_premid = period_assignments.get(key, True)
+    group_key = (course.code.upper(), course.semester, f"__GROUP__{int(getattr(section_obj, 'group', 1) or 1)}")
+    is_premid = period_assignments.get(key, period_assignments.get(group_key, True))
     preferred_period = 'PRE' if is_premid else 'POST'
     # Try preferred period first, then the other as fallback
     periods_to_try = [preferred_period, 'POST' if preferred_period == 'PRE' else 'PRE']
