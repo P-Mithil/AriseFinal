@@ -4207,6 +4207,8 @@ def generate_24_sheets(sessions_from_log: List[Dict] = None, is_re_render: bool 
                         "faculty_conflicts": [],
                         "section_overlaps": [],
                         "session_duration": [],
+                        "one_day_course": [],
+                        "phase4_sync": [],
                     }
                     for e in errors or []:
                         rule = str(e.get("rule", "") or "").strip().lower()
@@ -4321,6 +4323,61 @@ def generate_24_sheets(sessions_from_log: List[Dict] = None, is_re_render: bool 
                                     "section": str(e.get("section", "") or "").strip(),
                                     "day": str(e.get("day", "") or "").strip(),
                                     "time": str(e.get("time", "") or "").strip(),
+                                })
+                        if "1 day 1 course" in rule:
+                            m_ll = re.search(
+                                r"Course\s+([A-Z0-9/]+)\s+has\s+\d+\s+lectures\s+on\s+(\w+)\s+in\s+section\s+([A-Za-z0-9\-]+)\s+\((PRE|POST)\)",
+                                msg,
+                                flags=re.IGNORECASE,
+                            )
+                            m_tt = re.search(
+                                r"Course\s+([A-Z0-9/]+)\s+has\s+\d+\s+tutorials\s+on\s+(\w+)\s+in\s+section\s+([A-Za-z0-9\-]+)\s+\((PRE|POST)\)",
+                                msg,
+                                flags=re.IGNORECASE,
+                            )
+                            m_lt = re.search(
+                                r"Course\s+([A-Z0-9/]+)\s+has\s+lecture\+tutorial\s+on\s+same\s+day\s+(\w+)\s+in\s+section\s+([A-Za-z0-9\-]+)\s+\((PRE|POST)\)",
+                                msg,
+                                flags=re.IGNORECASE,
+                            )
+                            if m_ll:
+                                tasks["one_day_course"].append({
+                                    "kind": "LL",
+                                    "course_code": _base_code_of(m_ll.group(1)),
+                                    "day": str(m_ll.group(2)).strip(),
+                                    "section": str(m_ll.group(3)).strip(),
+                                    "period": normalize_period(m_ll.group(4)),
+                                })
+                            elif m_tt:
+                                tasks["one_day_course"].append({
+                                    "kind": "TT",
+                                    "course_code": _base_code_of(m_tt.group(1)),
+                                    "day": str(m_tt.group(2)).strip(),
+                                    "section": str(m_tt.group(3)).strip(),
+                                    "period": normalize_period(m_tt.group(4)),
+                                })
+                            elif m_lt:
+                                tasks["one_day_course"].append({
+                                    "kind": "LT",
+                                    "course_code": _base_code_of(m_lt.group(1)),
+                                    "day": str(m_lt.group(2)).strip(),
+                                    "section": str(m_lt.group(3)).strip(),
+                                    "period": normalize_period(m_lt.group(4)),
+                                })
+                        if "phase 4 synchronization" in rule:
+                            m_sync = re.search(
+                                r"Within-group combined course desync for\s+([A-Z0-9/]+)\s+\(group\s+(\d+),\s*(PRE|POST),\s*([LTP])\):\s+(.+?)\s+slots\s+!=\s+(.+?)\s+slots",
+                                msg,
+                                flags=re.IGNORECASE,
+                            )
+                            if m_sync:
+                                tasks["phase4_sync"].append({
+                                    "course_code": _base_code_of(m_sync.group(1)),
+                                    "group": int(m_sync.group(2)),
+                                    "period": normalize_period(m_sync.group(3)),
+                                    "session_type": str(m_sync.group(4)).strip().upper(),
+                                    "section_a": str(m_sync.group(5)).strip(),
+                                    "section_b": str(m_sync.group(6)).strip(),
                                 })
                     return tasks
 
@@ -5410,6 +5467,220 @@ def generate_24_sheets(sessions_from_log: List[Dict] = None, is_re_render: bool 
                                         return 1
                     return 0
 
+                def _has_same_day_l_or_t(sec: str, base: str, per: str, day: str, exclude_idx: Optional[int] = None) -> bool:
+                    for idx, r in enumerate(final_ui_sessions):
+                        if exclude_idx is not None and idx == exclude_idx:
+                            continue
+                        if str(r.get("section", "") or "").strip() != sec:
+                            continue
+                        if _base_code_of(r.get("course_code")) != base:
+                            continue
+                        if normalize_period(r.get("period")) != normalize_period(per):
+                            continue
+                        if str(r.get("day", "") or "").strip() != str(day or "").strip():
+                            continue
+                        rk = str(r.get("session_type", "L") or "L").strip().upper()
+                        if rk in ("L", "T"):
+                            return True
+                    return False
+
+                def _atomic_fix_one_day_course(tasks: Dict[str, List[Dict]]) -> int:
+                    for t in tasks.get("one_day_course", []):
+                        base = str(t.get("course_code", "") or "").strip().upper()
+                        sec = str(t.get("section", "") or "").strip()
+                        day = str(t.get("day", "") or "").strip()
+                        per = normalize_period(t.get("period"))
+                        if not (base and sec and day):
+                            continue
+
+                        candidates = []
+                        for idx, row in enumerate(final_ui_sessions):
+                            if str(row.get("section", "") or "").strip() != sec:
+                                continue
+                            if _base_code_of(row.get("course_code")) != base:
+                                continue
+                            if normalize_period(row.get("period")) != per:
+                                continue
+                            if str(row.get("day", "") or "").strip() != day:
+                                continue
+                            k = str(row.get("session_type", "L") or "L").strip().upper()
+                            if k not in ("L", "T"):
+                                continue
+                            candidates.append((idx, row))
+                        if len(candidates) < 2:
+                            continue
+
+                        # Prefer moving T when LT same-day violation exists.
+                        idx_move = None
+                        if str(t.get("kind", "")).upper() == "LT":
+                            t_rows = [p for p in candidates if str(p[1].get("session_type", "L") or "L").strip().upper() == "T"]
+                            if t_rows:
+                                idx_move = sorted(t_rows, key=lambda p: (str(p[1].get("start_time") or ""), p[0]))[-1][0]
+                        if idx_move is None:
+                            idx_move = sorted(candidates, key=lambda p: (str(p[1].get("start_time") or ""), p[0]))[-1][0]
+
+                        row = final_ui_sessions[idx_move]
+                        kind = str(row.get("session_type", "L") or "L").strip().upper()
+                        fac = str(row.get("faculty", "") or "").strip()
+                        st, et = row.get("start_time"), row.get("end_time")
+                        if not (st and et):
+                            continue
+                        dur = _dur_minutes(st, et)
+
+                        sem = 0
+                        for s0 in sections or []:
+                            if str(getattr(s0, "label", "") or "") == sec:
+                                sem = int(getattr(s0, "semester", 0) or 0)
+                                break
+                        lw = LUNCH_WINDOWS.get(sem)
+
+                        # Keep synchronized combined rows aligned when moving this row.
+                        orig_day = str(row.get("day", "") or "").strip()
+                        orig_st = row.get("start_time")
+                        orig_code = str(row.get("course_code", "") or "").strip()
+                        orig_per = normalize_period(row.get("period"))
+                        sync_siblings = []
+                        if str(row.get("phase", "") or "").strip().lower().startswith("phase 4"):
+                            for sidx, sib in enumerate(final_ui_sessions):
+                                if sidx == idx_move:
+                                    continue
+                                if str(sib.get("course_code", "") or "").strip() != orig_code:
+                                    continue
+                                if normalize_period(sib.get("period")) != orig_per:
+                                    continue
+                                if str(sib.get("day", "") or "").strip() != orig_day:
+                                    continue
+                                if sib.get("start_time") != orig_st:
+                                    continue
+                                sync_siblings.append((sidx, sib))
+
+                        for d0 in WORKING_DAYS:
+                            if d0 == day:
+                                continue
+                            if _has_same_day_l_or_t(sec, base, per, d0, exclude_idx=idx_move):
+                                continue
+                            for hh in range(9, 18):
+                                for mm in (0, 15, 30, 45):
+                                    ns = time(hh, mm)
+                                    end_m = hh * 60 + mm + dur
+                                    eh, em = divmod(end_m, 60)
+                                    if eh > 18 or (eh == 18 and em > 0):
+                                        continue
+                                    ne = time(eh, em)
+                                    if lw and _t_overlap(ns, ne, lw[0], lw[1]):
+                                        continue
+                                    if _slot_conflicts_for_section(sec, per, d0, ns, ne, exclude_idx=idx_move):
+                                        continue
+                                    if fac and kind != "P" and _faculty_slot_busy(fac, per, d0, ns, ne, idx_move):
+                                        continue
+
+                                    sib_ok = True
+                                    for sidx, sib in sync_siblings:
+                                        sib_sec = str(sib.get("section", "") or "").strip()
+                                        if _slot_conflicts_for_section(sib_sec, per, d0, ns, ne, exclude_idx=sidx):
+                                            sib_ok = False
+                                            break
+                                        if _has_same_day_l_or_t(sib_sec, base, per, d0, exclude_idx=sidx):
+                                            sib_ok = False
+                                            break
+                                    if not sib_ok:
+                                        continue
+
+                                    rn = _pick_room_for_slot(
+                                        kind, sec, per, d0, ns, ne,
+                                        exclude_idx=idx_move,
+                                        faculty_raw=fac,
+                                        allow_faculty_fallback=False,
+                                    )
+                                    if not rn:
+                                        continue
+
+                                    row["day"] = d0
+                                    row["start_time"] = ns
+                                    row["end_time"] = ne
+                                    row["time_block"] = TimeBlock(d0, ns, ne)
+                                    row["room"] = rn
+
+                                    for sidx, sib in sync_siblings:
+                                        sib["day"] = d0
+                                        sib["start_time"] = ns
+                                        sib["end_time"] = ne
+                                        sib["time_block"] = TimeBlock(d0, ns, ne)
+                                        sib_sec = str(sib.get("section", "") or "").strip()
+                                        sib_room = _pick_room_for_slot(
+                                            kind, sib_sec, per, d0, ns, ne,
+                                            exclude_idx=sidx,
+                                            faculty_raw=fac,
+                                            allow_faculty_fallback=False,
+                                        )
+                                        if sib_room:
+                                            sib["room"] = sib_room
+                                    return 1
+                    return 0
+
+                def _atomic_fix_phase4_sync(tasks: Dict[str, List[Dict]]) -> int:
+                    for t in tasks.get("phase4_sync", []):
+                        base = str(t.get("course_code", "") or "").strip().upper()
+                        per = normalize_period(t.get("period"))
+                        stype = str(t.get("session_type", "L") or "L").strip().upper()
+                        sec_from = str(t.get("section_a", "") or "").strip()
+                        sec_ref = str(t.get("section_b", "") or "").strip()
+                        if not (base and sec_from and sec_ref):
+                            continue
+
+                        ref_rows = []
+                        from_rows = []
+                        for idx, row in enumerate(final_ui_sessions):
+                            if not str(row.get("phase", "") or "").strip().lower().startswith("phase 4"):
+                                continue
+                            if _base_code_of(row.get("course_code")) != base:
+                                continue
+                            if normalize_period(row.get("period")) != per:
+                                continue
+                            if str(row.get("session_type", "L") or "L").strip().upper() != stype:
+                                continue
+                            sec_now = str(row.get("section", "") or "").strip()
+                            if sec_now == sec_ref:
+                                ref_rows.append((idx, row))
+                            elif sec_now == sec_from:
+                                from_rows.append((idx, row))
+                        if not ref_rows or not from_rows:
+                            continue
+
+                        ref_rows = sorted(ref_rows, key=lambda p: (_day_order.get(str(p[1].get("day", "") or ""), 99), str(p[1].get("start_time") or ""), p[0]))
+                        from_rows = sorted(from_rows, key=lambda p: (_day_order.get(str(p[1].get("day", "") or ""), 99), str(p[1].get("start_time") or ""), p[0]))
+                        m = min(len(ref_rows), len(from_rows))
+                        for k in range(m):
+                            idx_m, row_m = from_rows[k]
+                            _, row_r = ref_rows[k]
+                            rday = str(row_r.get("day", "") or "").strip()
+                            rst, ret = row_r.get("start_time"), row_r.get("end_time")
+                            if not (rday and rst and ret):
+                                continue
+                            if (
+                                str(row_m.get("day", "") or "").strip() == rday
+                                and row_m.get("start_time") == rst
+                                and row_m.get("end_time") == ret
+                            ):
+                                continue
+                            if _slot_conflicts_for_section(sec_from, per, rday, rst, ret, exclude_idx=idx_m):
+                                continue
+                            rn = _pick_room_for_slot(
+                                stype, sec_from, per, rday, rst, ret,
+                                exclude_idx=idx_m,
+                                faculty_raw=str(row_m.get("faculty") or ""),
+                                allow_faculty_fallback=False,
+                            )
+                            if not rn:
+                                continue
+                            row_m["day"] = rday
+                            row_m["start_time"] = rst
+                            row_m["end_time"] = ret
+                            row_m["time_block"] = TimeBlock(rday, rst, ret)
+                            row_m["room"] = rn
+                            return 1
+                    return 0
+
                 for _pass in range(10):
                     occ = {}  # (period, room, day) -> [(start,end)]
                     moved = 0
@@ -5715,6 +5986,8 @@ def generate_24_sheets(sessions_from_log: List[Dict] = None, is_re_render: bool 
                     _has_duration = bool(_tasks.get("session_duration")) or _count_errors_with("session duration", ver_errors) > 0
                     _has_section_overlap = bool(_tasks.get("section_overlaps")) or _count_errors_with("section overlap", ver_errors) > 0
                     _has_lab_doublebook = _count_errors_with("classroom conflict", ver_errors) > 0
+                    _has_one_day_course = bool(_tasks.get("one_day_course")) or _count_errors_with("1 day 1 course", ver_errors) > 0
+                    _has_phase4_sync = bool(_tasks.get("phase4_sync")) or _count_errors_with("phase 4 synchronization", ver_errors) > 0
                     _step = 0
                     _step_tag = ""
                     _before = None
@@ -5765,6 +6038,14 @@ def generate_24_sheets(sessions_from_log: List[Dict] = None, is_re_render: bool 
                         _step += _atomic_fix_parsed_duration(_tasks)
                         if _step:
                             _step_tag = "duration"
+                    if (not _step) and _has_one_day_course:
+                        _step += _atomic_fix_one_day_course(_tasks)
+                        if _step:
+                            _step_tag = "one_day"
+                    if (not _step) and _has_phase4_sync:
+                        _step += _atomic_fix_phase4_sync(_tasks)
+                        if _step:
+                            _step_tag = "phase4_sync"
                     if (not _step) and _has_room:
                         _step += _force_resolve_one_room_conflict()
                         if _step:
@@ -5781,7 +6062,7 @@ def generate_24_sheets(sessions_from_log: List[Dict] = None, is_re_render: bool 
                         _step += _atomic_ltpsc_one(_tasks)
                         if _step:
                             _step_tag = "ltpsc"
-                    if (not _step) and (not _has_lunch) and (not _has_duration):
+                    if (not _step) and (not _has_lunch) and (not _has_duration) and (not _has_one_day_course) and (not _has_phase4_sync):
                         # Last-resort deterministic nudge only when typed tasks cannot progress.
                         _step += _force_resolve_one_room_conflict()
                         if _step:
