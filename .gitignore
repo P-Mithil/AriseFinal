@@ -16,6 +16,34 @@ node_modules/
 
 # Generated output (timetables, logs)
 DATA/OUTPUT/
+DATA/DEBUG/
+DATA/EDITED OUTPUT/
+
+# Local diagnostics, temp logs, and ad-hoc run artifacts
+*.log
+*.tmp
+*_err.txt
+*_error.txt
+debug_output*.txt
+gen_out*.txt
+verif*.txt
+verify_*.txt
+temp_verify.txt
+resolver_log.txt
+error_log.txt
+clean*.txt
+diag_*.txt
+*_run_*.log
+*_verify_*.log
+
+# Frontend temporary local dumps
+frontend/_tsc_err.txt
+frontend/build_err.txt
+
+# Local diagnostic/archive folders
+artifacts/debug/
+artifacts/logs/
+artifacts/exports/
 
 # Optional: keep INPUT data tracked
 # DATA/INPUT/*.xlsx

@@ -1,0 +1,206 @@
+﻿
+
+Course Code : CS161
+Faculty     : Sunil P 
+              V
+Day         : Tuesday
+Start Time  : 15:45
+Section     : CSE-A-Se
+              m1
+Phase       : Phase 7
+Period      : PRE
+
+Course Code : CS161
+Faculty     : Sunil P 
+              V
+Day         : Thursday
+Start Time  : 10:30
+Section     : CSE-A-Se
+              m1
+Phase       : Phase 7
+Period      : POST
+
+Course Code : CS262-LA
+              B
+Faculty     : Sunil P 
+              V
+Day         : Tuesday
+Start Time  : 13:45
+Section     : CSE-A-Se
+              m3
+Phase       : Phase 5
+Period      : PRE
+
+Course Code : CS262
+Faculty     : Sunil P 
+              V
+Day         : Tuesday
+Start Time  : 09:00
+Section     : CSE-A-Se
+              m3
+Phase       : Phase 7
+Period      : POST
+
+Course Code : CS262
+Faculty     : Sunil P 
+              V
+Day         : Thursday
+Start Time  : 14:00
+Section     : CSE-A-Se
+              m3
+Phase       : Phase 7
+Period      : POST
+
+Course Code : CS303-TU
+              T
+Faculty     : Animesh 
+              Roy
+Day         : Wednesda
+              y
+Start Time  : 14:15
+Section     : CSE-A-Se
+              m5
+Phase       : Phase 5
+Period      : PRE
+
+Course Code : CS303
+Faculty     : Animesh 
+              Roy
+Day         : Wednesda
+              y
+Start Time  : 11:30
+Section     : CSE-A-Se
+              m5
+Phase       : Phase 7
+Period      : POST
+
+Course Code : CS303-LA
+              B
+Faculty     : Animesh 
+              Roy
+Day         : Wednesda
+              y
+Start Time  : 14:30
+Section     : CSE-A-Se
+              m5
+Phase       : Phase 5
+Period      : POST
+
+Course Code : CS262
+Faculty     : Sunil P 
+              V
+Day         : Tuesday
+Start Time  : 15:00
+Section     : CSE-B-Se
+              m3
+Phase       : Phase 7
+Period      : PRE
+
+Course Code : CS262
+Faculty     : Sunil P 
+              V
+Day         : Tuesday
+Start Time  : 09:15
+Section     : CSE-B-Se
+              m3
+Phase       : Phase 7
+Period      : POST
+
+Course Code : CS262
+Faculty     : Sunil P 
+              V
+Day         : Thursday
+Start Time  : 15:00
+Section     : CSE-B-Se
+              m3
+Phase       : Phase 7
+Period      : POST
+
+Course Code : CS303-TU
+              T
+Faculty     : Animesh 
+              Roy
+Day         : Wednesda
+              y
+Start Time  : 11:00
+Section     : CSE-B-Se
+              m5
+Phase       : Phase 5
+Period      : PRE
+
+Course Code : CS303-LA
+              B
+Faculty     : Animesh 
+              Roy
+Day         : Wednesda
+              y
+Start Time  : 14:15
+Section     : CSE-B-Se
+              m5
+Phase       : Phase 5
+Period      : PRE
+
+Course Code : CS303
+Faculty     : Animesh 
+              Roy
+Day         : Wednesda
+              y
+Start Time  : 09:30
+Section     : CSE-B-Se
+              m5
+Phase       : Phase 7
+Period      : POST
+
+Course Code : CS161
+Faculty     : Sunil P 
+              V
+Day         : Tuesday
+Start Time  : 10:30
+Section     : DSAI-A-S
+              em1
+Phase       : Phase 7
+Period      : POST
+
+Course Code : CS161
+Faculty     : Sunil P 
+              V
+Day         : Thursday
+Start Time  : 08:00
+Section     : ECE-A-Se
+              m1
+Phase       : Phase 7
+Period      : PRE
+
+Course Code : CS161
+Faculty     : Sunil P 
+              V
+Day         : Tuesday
+Start Time  : 13:30
+Section     : ECE-A-Se
+              m1
+Phase       : Phase 7
+Period      : POST
+
+Course Code : CS161-LA
+              B
+Faculty     : Sunil P 
+              V
+Day         : Tuesday
+Start Time  : 15:00
+Section     : ECE-A-Se
+              m1
+Phase       : Phase 5
+Period      : POST
+
+Course Code : CS161
+Faculty     : Sunil P 
+              V
+Day         : Thursday
+Start Time  : 16:00
+Section     : ECE-A-Se
+              m1
+Phase       : Phase 7
+Period      : POST
+
+
+

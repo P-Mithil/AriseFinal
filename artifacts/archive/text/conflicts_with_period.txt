@@ -1,0 +1,15 @@
+﻿Sunil P V: CS161 (PRE,CSE-A-Sem1) vs CS262 (PRE,CSE-B-Sem3) on Tuesday 15:45
+Sunil P V: CS262-LAB (PRE,CSE-A-Sem3) vs CS262 (PRE,CSE-B-Sem3) on Tuesday 13:45
+Sunil P V: CS262 (PRE,CSE-A-Sem3) vs CS262-LAB (PRE,CSE-B-Sem3) on Wednesday 14:30
+Sunil P V: CS262-LAB (POST,CSE-A-Sem3) vs CS161 (POST,DSAI-A-Sem1) on Friday 09:00
+Animesh Roy: CS303-TUT (PRE,CSE-A-Sem5) vs CS303-LAB (PRE,CSE-B-Sem5) on Wednesday 14:15
+Krishnendu: CS304-TUT (POST,CSE-A-Sem5) vs CS304 (POST,CSE-B-Sem5) on Tuesday 09:15
+Krishnendu: CS304-TUT (POST,CSE-A-Sem5) vs CS304 (POST,DSAI-A-Sem3) on Tuesday 09:15
+Sunil C K: CS309 (POST,CSE-A-Sem5) vs CS309-TUT (POST,CSE-B-Sem5) on Thursday 10:00
+Sunil C K: CS309-TUT (POST,CSE-A-Sem5) vs CS309 (POST,CSE-B-Sem5) on Friday 12:00
+Sunil P V: CS262 (POST,CSE-B-Sem3) vs CS161 (POST,DSAI-A-Sem1) on Tuesday 09:15
+Sunil P V: CS262 (POST,CSE-B-Sem3) vs CS161 (POST,ECE-A-Sem1) on Thursday 15:00
+Krishnendu: CS304 (PRE,CSE-B-Sem5) vs CS304 (PRE,DSAI-A-Sem3) on Thursday 09:30
+Krishnendu: CS304 (POST,CSE-B-Sem5) vs CS304 (POST,DSAI-A-Sem3) on Tuesday 09:30
+Utkarsh K: CS307 (POST,DSAI-A-Sem5) vs CS307-LAB (POST,ECE-A-Sem3) on Tuesday 11:00
+

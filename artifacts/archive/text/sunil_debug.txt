@@ -1,0 +1,20 @@
+DEBUG: Found 16 sessions for Sunil P V in all_phase5_sessions before resolution
+  - CS161 CSE-A-Sem1 PRE Tuesday 14:30:00-16:00:00
+  - CS161 CSE-A-Sem1 PRE Thursday 15:30:00-17:00:00
+  - CS161 CSE-A-Sem1 POST Friday 15:15:00-16:45:00
+  - CS161 CSE-A-Sem1 POST Monday 15:30:00-17:00:00
+  - CS161 DSAI-A-Sem1 PRE Friday 09:00:00-10:30:00
+  - CS161 DSAI-A-Sem1 PRE Wednesday 13:45:00-15:15:00
+  - CS161 DSAI-A-Sem1 POST Thursday 13:30:00-15:00:00
+  - CS161 DSAI-A-Sem1 POST Wednesday 16:00:00-17:30:00
+  - CS161 ECE-A-Sem1 PRE Monday 13:45:00-15:15:00
+  - CS161 ECE-A-Sem1 PRE Thursday 10:15:00-11:45:00
+  - CS161 ECE-A-Sem1 POST Friday 13:30:00-15:00:00
+  - CS161 ECE-A-Sem1 POST Wednesday 10:45:00-12:15:00
+  - CS262 CSE-A-Sem3 PRE Friday 10:45:00-12:15:00
+  - CS262 CSE-A-Sem3 PRE Tuesday 11:00:00-12:30:00
+  - CS262 CSE-A-Sem3 POST Wednesday 09:00:00-10:30:00
+  - CS262 CSE-A-Sem3 POST Monday 11:15:00-12:45:00
+
+=== RESOLVING FACULTY CONFLICTS ===
+Found 0 real faculty conflicts to resolve (same period, overlapping times)
